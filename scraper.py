@@ -393,7 +393,7 @@ class XueqiuDB:
             self._log_msg = f"增量导出（自 {last_export} 起）"
 
         # 按板块组织，过滤无意义评论
-        sections = {"recommend": [], "following": [], "hot": []}
+        sections = {"recommend": [], "hot": []}
         comments_by_post = {}
         skipped_comments = 0
         for cr in comments_rows:
@@ -541,8 +541,6 @@ class XueqiuDB:
         total_comments = c.fetchone()["cnt"]
         c.execute("SELECT COUNT(*) as cnt FROM posts WHERE section='recommend'")
         rec = c.fetchone()["cnt"]
-        c.execute("SELECT COUNT(*) as cnt FROM posts WHERE section='following'")
-        foll = c.fetchone()["cnt"]
         c.execute("SELECT COUNT(*) as cnt FROM posts WHERE section='hot'")
         hot = c.fetchone()["cnt"]
         c.execute("SELECT COUNT(*) as cnt FROM scrape_runs")
@@ -551,7 +549,6 @@ class XueqiuDB:
             "total_posts": total_posts,
             "total_comments": total_comments,
             "recommend": rec,
-            "following": foll,
             "hot": hot,
             "runs": runs,
         }
@@ -807,7 +804,7 @@ class XueqiuScraper:
             except Exception:
                 pass
 
-        self._log("\n  ⚠ 登录等待超时，将尝试继续抓取（关注板块可能无法获取）\n")
+        self._log("\n  ⚠ 登录等待超时，将尝试继续抓取\n")
         return False
 
     # ──────────────────────────────────────────────
@@ -1022,148 +1019,6 @@ class XueqiuScraper:
             return all_posts
         return self._scrape_section(page, "hot", "热门", fetch_fn)
 
-    def _scrape_following(self, page):
-        def fetch_fn(p):
-            all_posts = []
-
-            # 方法 1: 导航到 /follow 并拦截 API
-            self._log("  方法 1: 导航到 /follow 并拦截 API…")
-            captured_posts = []
-            api_urls_seen = []
-
-            def on_response(response):
-                try:
-                    if response.status != 200:
-                        return
-                    u = response.url
-                    if "xueqiu.com" not in u:
-                        return
-                    ct = response.headers.get("content-type", "")
-                    if "json" not in ct and ".json" not in u:
-                        return
-                    skip = ["config", "analytics", "upload", "csrf", "behavior",
-                            "security", "quote.json", "hot_event", "hot_stock",
-                            "searchFund", "qrcode", "taichi", "minute.json",
-                            "fundx/public/list"]
-                    if any(s in u for s in skip):
-                        return
-                    api_urls_seen.append(u[:150])
-                    data = response.json()
-                    posts = self._extract_posts_from_response(data)
-                    if posts:
-                        captured_posts.extend(posts)
-                        self._log(f"    [拦截] {u[:80]} -> {len(posts)} 帖")
-                except Exception:
-                    pass
-
-            p.on("response", on_response)
-            try:
-                p.goto("https://xueqiu.com/follow", wait_until="domcontentloaded")
-                self._rsleep(5, 8)
-                self._log(f"  当前 URL: {p.url}")
-                self._simulate_browsing(p)
-                self._human_scroll(p, 4)
-                self._rsleep(2, 4)
-            except Exception as e:
-                self._log(f"  /follow 页面出错: {e}")
-            finally:
-                try:
-                    p.remove_listener("response", on_response)
-                except Exception:
-                    pass
-
-            if api_urls_seen:
-                self._log(f"  拦截到 {len(api_urls_seen)} 个 API 请求:")
-                for u in api_urls_seen[:5]:
-                    self._log(f"    -> {u}")
-
-            if captured_posts:
-                all_posts.extend(captured_posts)
-
-            # 方法 2: 直接 API
-            if not all_posts:
-                self._log("  方法 2: 直接调用关注 API…")
-                follow_apis = [
-                    "/v4/statuses/follow_timeline.json?page=1",
-                    "/statuses/follow_timeline.json?page=1",
-                    "/v4/statuses/follow_timeline_by_category.json?source=all&page=1",
-                ]
-                for ep in follow_apis:
-                    url = "https://xueqiu.com" + ep
-                    self._log(f"    尝试: {ep[:60]}")
-                    data = self._fetch_api(p, url)
-                    if data:
-                        posts = self._extract_posts_from_response(data)
-                        self._log(f"    -> {len(posts)} 条帖子")
-                        if posts:
-                            all_posts.extend(posts)
-                            break
-                    self._rsleep(2, 4)
-
-            # 方法 3: 首页 tab 点击
-            if not all_posts:
-                self._log("  方法 3: 在首页查找并点击'关注'标签…")
-                try:
-                    p.goto("https://xueqiu.com/", wait_until="domcontentloaded")
-                    self._rsleep(3, 5)
-
-                    tab_captured = []
-                    def on_resp2(resp):
-                        try:
-                            if resp.status != 200:
-                                return
-                            u = resp.url
-                            if "xueqiu.com" not in u:
-                                return
-                            ct = resp.headers.get("content-type", "")
-                            if "json" not in ct and ".json" not in u:
-                                return
-                            skip = ["config", "analytics", "upload", "csrf", "behavior",
-                                    "security", "quote.json", "hot_event", "hot_stock",
-                                    "searchFund", "qrcode", "taichi", "minute.json",
-                                    "fundx/public/list"]
-                            if any(s in u for s in skip):
-                                return
-                            data = resp.json()
-                            posts = self._extract_posts_from_response(data)
-                            if posts:
-                                tab_captured.extend(posts)
-                                self._log(f"    [拦截] {u[:80]} -> {len(posts)} 帖")
-                        except Exception:
-                            pass
-
-                    p.on("response", on_resp2)
-
-                    # 模拟点击"关注"标签
-                    clicked = p.evaluate("""
-                        () => {
-                            let allEls = document.querySelectorAll('*');
-                            for (let el of allEls) {
-                                if (el.textContent.trim() === '关注') {
-                                    el.click();
-                                    return true;
-                                }
-                            }
-                            return false;
-                        }
-                    """)
-                    if clicked:
-                        self._log("  点击了'关注'标签")
-                    self._rsleep(4, 6)
-                    self._human_scroll(p, 3)
-                    p.remove_listener("response", on_resp2)
-
-                    if tab_captured:
-                        all_posts.extend(tab_captured)
-                except Exception as e:
-                    self._log(f"  首页查找出错: {e}")
-
-            if not all_posts:
-                self._log("  ⚠ 关注板块未获取到帖子（可能需要登录或无关注内容）")
-
-            return all_posts
-        return self._scrape_section(page, "following", "关注", fetch_fn)
-
     # ──────────────────────────────────────────────
     #  评论抓取
     # ──────────────────────────────────────────────
@@ -1317,12 +1172,8 @@ class XueqiuScraper:
             pass
         self._rsleep(2, 4)
 
-        # 抓取三个板块
+        # 抓取两个板块
         self._scrape_recommend(page)
-        self._rsleep(5, 10)
-        self._simulate_browsing(page)
-
-        self._scrape_following(page)
         self._rsleep(5, 10)
         self._simulate_browsing(page)
 
@@ -1374,7 +1225,6 @@ class XueqiuScraper:
         self._log(f"  累计评论: {stats['total_comments']}")
         self._log(f"  累计轮次: {stats['runs']}")
         self._log(f"    推荐: {stats['recommend']}")
-        self._log(f"    关注: {stats['following']}")
         self._log(f"    热门: {stats['hot']}")
 
         return run_id

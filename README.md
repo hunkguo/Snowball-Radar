@@ -1,10 +1,10 @@
 # 雪球爬虫 (Xueqiu Spider)
 
-> 自动抓取[雪球网](https://xueqiu.com)推荐、热门、关注三个板块的帖子和评论，支持持续运行、SQLite 去重存储、定时 JSON 导出，可打包为独立 EXE。
+> 自动抓取[雪球网](https://xueqiu.com)推荐和热门两个板块的帖子和评论，支持持续运行、SQLite 去重存储、定时 JSON 导出，可打包为独立 EXE。
 
 ## 功能特性
 
-- **三板块抓取**：推荐 (fundx API)、热门 (hot API)、关注 (需登录)
+- **双板块抓取**：推荐 (fundx API)、热门 (hot API)
 - **评论抓取**：自动抓取每篇帖子的评论，支持翻页
 - **持续运行**：登录后自动循环抓取，每 30-45 分钟一轮，`Ctrl+C` 优雅退出
 - **SQLite 存储**：所有数据存入本地数据库，按帖子/评论 ID 去重 (Upsert)
@@ -132,7 +132,6 @@ python build_exe.py
   "db_total_comments": 810,
   "sections": {
     "recommend": [ { "id": "...", "title": "...", "comments": [...] } ],
-    "following": [ ... ],
     "hot": [ ... ]
   },
   "recent_runs": [ ... ]
@@ -149,7 +148,6 @@ python build_exe.py
 |------|-----|------|------|
 | 推荐 | `/statuses/fundx/public/list.json?source=fund_public&page=N` | 公开 | 每页 10 条，支持翻页 |
 | 热门 | `/statuses/hot/listV2.json?since=-1&max_id=-1&size=15` | 公开 | 一次性返回约 15 条 |
-| 关注 | `/statuses/follow_timeline.json?page=1` | 需登录 | 需要有效的 `xq_a_token` cookie |
 | 评论 | `/statuses/comments.json?id=<post_id>&page=N&count=20` | 公开 | 每页 20 条，支持翻页 |
 
 API 调用方式：通过 `page.evaluate()` 在浏览器上下文中执行 `fetch()`，携带浏览器 cookie。
@@ -195,12 +193,11 @@ Chrome 127+ 引入了 App-Bound Encryption (v20 cookie)，导致复制的 Profil
 3. **持久化保存**：登录态写入 `data/chrome_profile/`，后续运行直接复用
 4. **Cookie 路径检测**：兼容 Chrome 115+ 的 `Default/Network/Cookies` 路径
 
-> 推荐和热门板块使用公开 API，不需要登录。关注板块需要登录态。
+> 推荐和热门板块使用公开 API，不需要登录。
 
 ## 已知限制
 
 - **Chrome v20 加密**：无法通过复制 cookie 绕过登录，必须手动登录首次
-- **关注板块**：依赖登录态，cookie 过期后需重新登录
 - **推荐 API**：每页 10 条，翻页深度有限
 - **热门 API**：一次性返回约 15 条，无翻页
 - **反爬风险**：尽管采用了多种反检测策略，高频请求仍可能触发风控
