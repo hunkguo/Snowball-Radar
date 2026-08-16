@@ -8,7 +8,7 @@
 - **评论抓取**：自动抓取每篇帖子的评论，支持翻页
 - **持续运行**：登录后自动循环抓取，每 30-45 分钟一轮，`Ctrl+C` 优雅退出
 - **SQLite 存储**：所有数据存入本地数据库，按帖子/评论 ID 去重 (Upsert)
-- **定时 JSON 导出**：每 6 小时从数据库导出带时间戳的 JSON 文件
+- **定时 JSON 导出**：每 6 小时增量导出（首次全量，后续只导出新数据），文件控制在 1MB 以内
 - **反自动化检测**：stealth JS 隐藏 webdriver、模拟插件列表、模拟人类鼠标行为
 - **模拟鼠标点击**：`_human_click()` 实现移动→停顿→点击，带随机偏移
 - **慢速模式**：页间间隔 5-10 秒，评论间间隔 3-6 秒，降低被封风险
@@ -118,21 +118,24 @@ python build_exe.py
 
 ### JSON 导出 (`data/exports/xueqiu_export_YYYYMMDD_HHMMSS.json`)
 
-每 6 小时自动导出，包含数据库中所有去重数据：
+每 6 小时自动导出。首次导出为全量，后续为增量（只导出上次导出后新增的帖子和评论）：
 
 ```json
 {
-  "export_time": "2026-08-04T15:00:00",
+  "export_time": "2026-08-04 15:00:00",
   "platform": "xueqiu",
-  "total_unique_posts": 43,
-  "total_comments": 810,
-  "total_runs": 5,
+  "export_type": "incremental",
+  "since": "2026-08-04T09:00:00",
+  "exported_posts": 12,
+  "exported_comments": 45,
+  "db_total_posts": 156,
+  "db_total_comments": 810,
   "sections": {
     "recommend": [ { "id": "...", "title": "...", "comments": [...] } ],
     "following": [ ... ],
     "hot": [ ... ]
   },
-  "scrape_runs": [ ... ]
+  "recent_runs": [ ... ]
 }
 ```
 

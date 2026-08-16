@@ -173,6 +173,13 @@ class XueqiuDB:
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_posts_section ON posts(section)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id)")
+        # meta 表：存储上次导出时间等元数据
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS _meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
         self.conn.commit()
 
     def upsert_post(self, post, section):
@@ -289,44 +296,56 @@ class XueqiuDB:
         ))
         self.conn.commit()
 
-    def export_to_json(self, output_path, hours_back=48, max_comments_per_post=10):
-        """从 SQLite 导出最近数据到 JSON（控制在 1MB 以内）
+    def get_last_export_time(self):
+        """获取上次 JSON 导出时间（ISO 字符串），无记录返回 None"""
+        c = self.conn.cursor()
+        c.execute("SELECT value FROM _meta WHERE key='last_export_time'")
+        row = c.fetchone()
+        return row["value"] if row else None
 
-        优化策略:
-        - 只导出最近 hours_back 小时内的帖子
-        - 去掉冗余字段（description 与 text 相同时只保留 text）
-        - 去掉空值字段
-        - 每帖最多导出 max_comments_per_post 条评论
-        - 紧凑 JSON 序列化（无缩进）
+    def set_last_export_time(self, ts_str):
+        """记录本次导出时间"""
+        c = self.conn.cursor()
+        c.execute("""
+            INSERT INTO _meta (key, value) VALUES ('last_export_time', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (ts_str,))
+        self.conn.commit()
+
+    def export_to_json(self, output_path, max_comments_per_post=10):
+        """增量导出：只导出上次导出之后新增的帖子/评论
+
+        - 首次导出（无 last_export_time）：导出全部数据
+        - 后续导出：只导出 first_seen > last_export_time 的新帖子和新评论
+        - 紧凑 JSON 序列化，1MB 安全阀自动裁剪
         """
         c = self.conn.cursor()
 
-        # 计算时间 cutoff（created_at 是秒级时间戳）
-        cutoff_ts = 0
-        if hours_back and hours_back > 0:
-            cutoff_ts = int((datetime.now() - timedelta(hours=hours_back)).timestamp())
+        last_export = self.get_last_export_time()
+        is_first_export = last_export is None
 
-        # 导出帖子（仅最近 hours_back 小时）
-        if cutoff_ts > 0:
-            c.execute(
-                "SELECT * FROM posts WHERE created_at >= ? ORDER BY created_at DESC",
-                (cutoff_ts,)
-            )
-        else:
+        if is_first_export:
+            # 首次导出：全部数据
             c.execute("SELECT * FROM posts ORDER BY created_at DESC")
-        posts_rows = c.fetchall()
-
-        # 收集帖子 ID，只导出这些帖子的评论
-        post_ids = set(pr["id"] for pr in posts_rows)
-        if post_ids:
-            placeholders = ",".join("?" * len(post_ids))
-            c.execute(
-                f"SELECT * FROM comments WHERE post_id IN ({placeholders}) ORDER BY created_at ASC",
-                tuple(post_ids)
-            )
+            posts_rows = c.fetchall()
+            c.execute("SELECT * FROM comments ORDER BY created_at ASC")
+            comments_rows = c.fetchall()
+            self._log_msg = "首次导出（全量）"
         else:
-            c.execute("SELECT * FROM comments WHERE 0")
-        comments_rows = c.fetchall()
+            # 增量导出：只取 first_seen > last_export 的新数据
+            c.execute(
+                "SELECT * FROM posts WHERE first_seen > ? ORDER BY created_at DESC",
+                (last_export,)
+            )
+            posts_rows = c.fetchall()
+
+            # 新帖子对应的评论 + 新评论（针对已有帖子的新评论）
+            c.execute(
+                "SELECT * FROM comments WHERE first_seen > ? ORDER BY created_at ASC",
+                (last_export,)
+            )
+            comments_rows = c.fetchall()
+            self._log_msg = f"增量导出（自 {last_export} 起）"
 
         # 按板块组织
         sections = {"recommend": [], "following": [], "hot": []}
@@ -349,7 +368,6 @@ class XueqiuDB:
             if section not in sections:
                 sections[section] = []
 
-            # 精简字段：去掉空值
             post_dict = {
                 "id": pr["id"],
                 "title": pr["title"] or "",
@@ -361,7 +379,6 @@ class XueqiuDB:
                 "url": pr["url"] or "",
                 "comments": comments_by_post.get(pr["id"], [])[:max_comments_per_post],
             }
-            # 只在有内容时添加可选字段
             if pr["view_count"]:
                 post_dict["view_count"] = pr["view_count"]
             if pr["retweet_count"]:
@@ -369,7 +386,6 @@ class XueqiuDB:
             if pr["source"]:
                 post_dict["source"] = pr["source"]
 
-            # 转发内容（精简）
             if pr["retweeted_id"]:
                 rt_text = pr["retweeted_text"] or pr["retweeted_title"] or ""
                 if rt_text:
@@ -378,7 +394,6 @@ class XueqiuDB:
                         "user": pr["retweeted_screen_name"] or "",
                     }
 
-            # target（如有）
             if pr["target"]:
                 try:
                     post_dict["target"] = json.loads(pr["target"])
@@ -406,10 +421,12 @@ class XueqiuDB:
         c.execute("SELECT COUNT(*) FROM comments")
         db_total_comments = c.fetchone()[0]
 
+        export_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         output = {
-            "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "export_time": export_time_str,
             "platform": "xueqiu",
-            "window_hours": hours_back,
+            "export_type": "full" if is_first_export else "incremental",
+            "since": last_export or "",
             "exported_posts": len(all_ids),
             "exported_comments": len(comments_rows),
             "db_total_posts": db_total_posts,
@@ -422,15 +439,13 @@ class XueqiuDB:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
 
-        # 检查文件大小，如仍超 1MB 则进一步裁剪
+        # 1MB 安全阀
         file_size = os.path.getsize(output_path)
         if file_size > 1024 * 1024:
-            # 裁剪策略：每帖只保留 3 条评论 + 截断长文本
             for section_posts in sections.values():
                 for p in section_posts:
                     if len(p.get("comments", [])) > 3:
                         p["comments"] = p["comments"][:3]
-                    # 截断超长文本
                     for key in ("text", "title"):
                         val = p.get(key, "")
                         if len(val) > 500:
@@ -439,7 +454,11 @@ class XueqiuDB:
                 json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
             file_size = os.path.getsize(output_path)
 
+        # 记录导出时间
+        self.set_last_export_time(datetime.now().isoformat())
+
         output["_file_size_kb"] = round(file_size / 1024, 1)
+        output["_is_first_export"] = is_first_export
         return output
 
     def get_stats(self):
@@ -1289,16 +1308,18 @@ class XueqiuScraper:
         return run_id
 
     def _export_json(self):
-        """从 SQLite 导出 JSON 文件（最近 48 小时数据，控制在 1MB 以内）"""
+        """增量导出 JSON：只导出上次导出后的新数据"""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_path = os.path.join(JSON_EXPORT_DIR, f"xueqiu_export_{ts}.json")
-        result = self.db.export_to_json(export_path, hours_back=48)
+        result = self.db.export_to_json(export_path)
         self._log(f"\n{'='*60}")
         self._log(f"JSON 导出完成！")
         self._log(f"{'='*60}")
         self._log(f"  文件: {export_path}")
         self._log(f"  大小: {result.get('_file_size_kb', 0)} KB")
-        self._log(f"  时间窗口: 最近 {result.get('window_hours', 48)} 小时")
+        self._log(f"  类型: {result.get('export_type', 'unknown')} ({'首次全量' if result.get('_is_first_export') else '增量'})")
+        if result.get('since'):
+            self._log(f"  增量起始: {result['since']}")
         self._log(f"  导出帖子: {result.get('exported_posts', 0)}")
         self._log(f"  导出评论: {result.get('exported_comments', 0)}")
         self._log(f"  数据库累计: {result.get('db_total_posts', 0)} 帖 / {result.get('db_total_comments', 0)} 评")
