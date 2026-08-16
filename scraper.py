@@ -289,16 +289,43 @@ class XueqiuDB:
         ))
         self.conn.commit()
 
-    def export_to_json(self, output_path):
-        """从 SQLite 导出全部数据到 JSON"""
+    def export_to_json(self, output_path, hours_back=48, max_comments_per_post=10):
+        """从 SQLite 导出最近数据到 JSON（控制在 1MB 以内）
+
+        优化策略:
+        - 只导出最近 hours_back 小时内的帖子
+        - 去掉冗余字段（description 与 text 相同时只保留 text）
+        - 去掉空值字段
+        - 每帖最多导出 max_comments_per_post 条评论
+        - 紧凑 JSON 序列化（无缩进）
+        """
         c = self.conn.cursor()
 
-        # 导出帖子
-        c.execute("SELECT * FROM posts ORDER BY created_at DESC")
+        # 计算时间 cutoff（created_at 是秒级时间戳）
+        cutoff_ts = 0
+        if hours_back and hours_back > 0:
+            cutoff_ts = int((datetime.now() - timedelta(hours=hours_back)).timestamp())
+
+        # 导出帖子（仅最近 hours_back 小时）
+        if cutoff_ts > 0:
+            c.execute(
+                "SELECT * FROM posts WHERE created_at >= ? ORDER BY created_at DESC",
+                (cutoff_ts,)
+            )
+        else:
+            c.execute("SELECT * FROM posts ORDER BY created_at DESC")
         posts_rows = c.fetchall()
 
-        # 导出评论
-        c.execute("SELECT * FROM comments ORDER BY created_at ASC")
+        # 收集帖子 ID，只导出这些帖子的评论
+        post_ids = set(pr["id"] for pr in posts_rows)
+        if post_ids:
+            placeholders = ",".join("?" * len(post_ids))
+            c.execute(
+                f"SELECT * FROM comments WHERE post_id IN ({placeholders}) ORDER BY created_at ASC",
+                tuple(post_ids)
+            )
+        else:
+            c.execute("SELECT * FROM comments WHERE 0")
         comments_rows = c.fetchall()
 
         # 按板块组织
@@ -311,13 +338,9 @@ class XueqiuDB:
             comments_by_post[pid].append({
                 "id": cr["id"],
                 "text": cr["text"],
-                "created_at": cr["created_at"],
-                "time_str": cr["time_str"],
+                "time_str": cr["time_str"] or "",
                 "like_count": cr["like_count"],
-                "user": {
-                    "id": cr["user_id"],
-                    "screen_name": cr["user_screen_name"],
-                },
+                "user": cr["user_screen_name"] or "",
             })
 
         all_ids = set()
@@ -325,77 +348,98 @@ class XueqiuDB:
             section = pr["section"]
             if section not in sections:
                 sections[section] = []
+
+            # 精简字段：去掉空值
             post_dict = {
                 "id": pr["id"],
                 "title": pr["title"] or "",
-                "description": pr["description"] or "",
                 "text": pr["text"] or "",
-                "created_at": pr["created_at"],
                 "time_str": pr["time_str"] or "",
-                "reply_count": pr["reply_count"],
-                "retweet_count": pr["retweet_count"],
                 "like_count": pr["like_count"],
-                "view_count": pr["view_count"],
-                "source": pr["source"] or "",
-                "type": pr["type"] or "",
-                "mark": pr["mark"] or "",
-                "user": {
-                    "id": pr["user_id"] or "",
-                    "screen_name": pr["user_screen_name"] or "",
-                    "description": pr["user_description"] or "",
-                    "followers_count": pr["user_followers"],
-                    "friends_count": pr["user_friends"],
-                    "statuses_count": pr["user_statuses"],
-                },
+                "reply_count": pr["reply_count"],
+                "user": pr["user_screen_name"] or "",
                 "url": pr["url"] or "",
-                "comments": comments_by_post.get(pr["id"], []),
-                "first_seen": pr["first_seen"],
-                "last_updated": pr["last_updated"],
+                "comments": comments_by_post.get(pr["id"], [])[:max_comments_per_post],
             }
+            # 只在有内容时添加可选字段
+            if pr["view_count"]:
+                post_dict["view_count"] = pr["view_count"]
+            if pr["retweet_count"]:
+                post_dict["retweet_count"] = pr["retweet_count"]
+            if pr["source"]:
+                post_dict["source"] = pr["source"]
+
+            # 转发内容（精简）
             if pr["retweeted_id"]:
-                post_dict["retweeted"] = {
-                    "id": pr["retweeted_id"],
-                    "title": pr["retweeted_title"] or "",
-                    "text": pr["retweeted_text"] or "",
-                    "screen_name": pr["retweeted_screen_name"] or "",
-                }
+                rt_text = pr["retweeted_text"] or pr["retweeted_title"] or ""
+                if rt_text:
+                    post_dict["retweeted"] = {
+                        "text": rt_text,
+                        "user": pr["retweeted_screen_name"] or "",
+                    }
+
+            # target（如有）
             if pr["target"]:
                 try:
                     post_dict["target"] = json.loads(pr["target"])
                 except Exception:
                     pass
+
             sections[section].append(post_dict)
             all_ids.add(pr["id"])
 
-        # 导出 scrape_runs 摘要
-        c.execute("SELECT * FROM scrape_runs ORDER BY run_id DESC LIMIT 100")
+        # 导出 scrape_runs 摘要（最近 20 轮）
+        c.execute("SELECT * FROM scrape_runs ORDER BY run_id DESC LIMIT 20")
         runs = []
         for r in c.fetchall():
             runs.append({
                 "run_id": r["run_id"],
                 "start_time": r["start_time"],
                 "end_time": r["end_time"],
-                "recommend_count": r["recommend_count"],
-                "following_count": r["following_count"],
-                "hot_count": r["hot_count"],
-                "comment_count": r["comment_count"],
                 "new_posts": r["new_posts"],
                 "new_comments": r["new_comments"],
             })
 
+        # 数据库总量统计
+        c.execute("SELECT COUNT(*) FROM posts")
+        db_total_posts = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM comments")
+        db_total_comments = c.fetchone()[0]
+
         output = {
-            "export_time": datetime.now().isoformat(),
+            "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "platform": "xueqiu",
-            "total_unique_posts": len(all_ids),
-            "total_comments": len(comments_rows),
-            "total_runs": len(runs),
+            "window_hours": hours_back,
+            "exported_posts": len(all_ids),
+            "exported_comments": len(comments_rows),
+            "db_total_posts": db_total_posts,
+            "db_total_comments": db_total_comments,
             "sections": sections,
-            "scrape_runs": runs,
+            "recent_runs": runs,
         }
 
+        # 紧凑序列化（无缩进），减小文件体积
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, ensure_ascii=False, indent=2)
+            json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
 
+        # 检查文件大小，如仍超 1MB 则进一步裁剪
+        file_size = os.path.getsize(output_path)
+        if file_size > 1024 * 1024:
+            # 裁剪策略：每帖只保留 3 条评论 + 截断长文本
+            for section_posts in sections.values():
+                for p in section_posts:
+                    if len(p.get("comments", [])) > 3:
+                        p["comments"] = p["comments"][:3]
+                    # 截断超长文本
+                    for key in ("text", "title"):
+                        val = p.get(key, "")
+                        if len(val) > 500:
+                            p[key] = val[:500] + "..."
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
+            file_size = os.path.getsize(output_path)
+
+        output["_file_size_kb"] = round(file_size / 1024, 1)
         return output
 
     def get_stats(self):
@@ -1245,17 +1289,19 @@ class XueqiuScraper:
         return run_id
 
     def _export_json(self):
-        """从 SQLite 导出 JSON 文件"""
+        """从 SQLite 导出 JSON 文件（最近 48 小时数据，控制在 1MB 以内）"""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_path = os.path.join(JSON_EXPORT_DIR, f"xueqiu_export_{ts}.json")
-        result = self.db.export_to_json(export_path)
+        result = self.db.export_to_json(export_path, hours_back=48)
         self._log(f"\n{'='*60}")
         self._log(f"JSON 导出完成！")
         self._log(f"{'='*60}")
         self._log(f"  文件: {export_path}")
-        self._log(f"  帖子: {result['total_unique_posts']}")
-        self._log(f"  评论: {result['total_comments']}")
-        self._log(f"  轮次: {result['total_runs']}")
+        self._log(f"  大小: {result.get('_file_size_kb', 0)} KB")
+        self._log(f"  时间窗口: 最近 {result.get('window_hours', 48)} 小时")
+        self._log(f"  导出帖子: {result.get('exported_posts', 0)}")
+        self._log(f"  导出评论: {result.get('exported_comments', 0)}")
+        self._log(f"  数据库累计: {result.get('db_total_posts', 0)} 帖 / {result.get('db_total_comments', 0)} 评")
         return export_path
 
     # ──────────────────────────────────────────────
@@ -1348,8 +1394,10 @@ class XueqiuScraper:
                     break
 
                 wait_sec = random.randint(SCRAPE_INTERVAL_MIN, SCRAPE_INTERVAL_MAX)
-                self._log(f"\n  下一轮抓取在 {wait_sec//60} 分钟后开始…")
-                self._log(f"  (按 Ctrl+C 可退出程序)")
+                next_time = datetime.now() + timedelta(seconds=wait_sec)
+                next_time_str = next_time.strftime("%Y-%m-%d %H:%M:%S")
+                self._log(f"\n  本轮抓取已完成，下次执行时间: {next_time_str}")
+                self._log(f"  （约 {wait_sec // 60} 分钟后，按 Ctrl+C 可退出程序）")
 
                 # 分段等待，便于响应 Ctrl+C
                 waited = 0
