@@ -99,6 +99,50 @@ def clean_html(text):
     return text.strip()
 
 
+# 无意义评论灌水关键词
+_MEANINGLESS_PATTERNS = {
+    "", "顶", "沙发", "板凳", "地板", "前排", "插眼", "马克", "留名",
+    "mark", "m", "mm", "dddd", "好的", "嗯", "哦", "啊", "哈", "哈哈",
+    "666", "6", "111", "。。", "...", "。。。", "？", "!",
+    "支持", "赞", "好", "对", "是", "否",
+}
+
+
+def _is_meaningless_comment(text):
+    """判断评论是否无意义（灌水/空/纯表情/极短）
+
+    返回 True 表示该评论应被过滤掉。
+    """
+    if not text:
+        return True
+    t = text.strip()
+    if not t:
+        return True
+
+    # 去掉所有空白和标点后的纯内容
+    stripped = re.sub(r'[\s\W_]+', '', t, flags=re.UNICODE)
+
+    # 纯表情/纯标点（去标点后为空或只剩 1 个字符）
+    if len(stripped) <= 1:
+        return True
+
+    # 去标点后少于 2 个字符（如 "。。。" "！！！""??" 等）
+    if len(stripped) < 2:
+        return True
+
+    # 匹配灌水关键词（不区分大小写）
+    if t.lower() in _MEANINGLESS_PATTERNS:
+        return True
+
+    # 纯数字（如 "111" "666"）或纯重复字符（如 "哈哈哈哈哈" "。。。。。"）
+    if stripped.isdigit() and len(stripped) <= 3:
+        return True
+    if len(set(stripped)) == 1 and len(stripped) <= 10:
+        return True
+
+    return False
+
+
 class XueqiuDB:
     """SQLite 数据库管理 — 帖子/评论存储与去重"""
 
@@ -312,11 +356,12 @@ class XueqiuDB:
         """, (ts_str,))
         self.conn.commit()
 
-    def export_to_json(self, output_path, max_comments_per_post=10):
+    def export_to_json(self, output_path):
         """增量导出：只导出上次导出之后新增的帖子/评论
 
         - 首次导出（无 last_export_time）：导出全部数据
         - 后续导出：只导出 first_seen > last_export_time 的新帖子和新评论
+        - 过滤无意义评论（空、纯表情、灌水），保留所有有内容评论
         - 紧凑 JSON 序列化，1MB 安全阀自动裁剪
         """
         c = self.conn.cursor()
@@ -347,16 +392,21 @@ class XueqiuDB:
             comments_rows = c.fetchall()
             self._log_msg = f"增量导出（自 {last_export} 起）"
 
-        # 按板块组织
+        # 按板块组织，过滤无意义评论
         sections = {"recommend": [], "following": [], "hot": []}
         comments_by_post = {}
+        skipped_comments = 0
         for cr in comments_rows:
             pid = cr["post_id"]
             if pid not in comments_by_post:
                 comments_by_post[pid] = []
+            comment_text = cr["text"] or ""
+            if _is_meaningless_comment(comment_text):
+                skipped_comments += 1
+                continue
             comments_by_post[pid].append({
                 "id": cr["id"],
-                "text": cr["text"],
+                "text": comment_text.strip(),
                 "time_str": cr["time_str"] or "",
                 "like_count": cr["like_count"],
                 "user": cr["user_screen_name"] or "",
@@ -377,7 +427,7 @@ class XueqiuDB:
                 "reply_count": pr["reply_count"],
                 "user": pr["user_screen_name"] or "",
                 "url": pr["url"] or "",
-                "comments": comments_by_post.get(pr["id"], [])[:max_comments_per_post],
+                "comments": comments_by_post.get(pr["id"], []),
             }
             if pr["view_count"]:
                 post_dict["view_count"] = pr["view_count"]
@@ -422,13 +472,16 @@ class XueqiuDB:
         db_total_comments = c.fetchone()[0]
 
         export_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 统计实际导出的评论数（过滤后）
+        actual_comments = sum(len(comments_by_post.get(pid, [])) for pid in all_ids)
         output = {
             "export_time": export_time_str,
             "platform": "xueqiu",
             "export_type": "full" if is_first_export else "incremental",
             "since": last_export or "",
             "exported_posts": len(all_ids),
-            "exported_comments": len(comments_rows),
+            "exported_comments": actual_comments,
+            "filtered_comments": skipped_comments,
             "db_total_posts": db_total_posts,
             "db_total_comments": db_total_comments,
             "sections": sections,
@@ -439,13 +492,12 @@ class XueqiuDB:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
 
-        # 1MB 安全阀
+        # 1MB 安全阀：优先截断长文本，尽量保留评论
         file_size = os.path.getsize(output_path)
         if file_size > 1024 * 1024:
+            # 第一轮：截断超长帖子文本至 500 字符
             for section_posts in sections.values():
                 for p in section_posts:
-                    if len(p.get("comments", [])) > 3:
-                        p["comments"] = p["comments"][:3]
                     for key in ("text", "title"):
                         val = p.get(key, "")
                         if len(val) > 500:
@@ -453,6 +505,26 @@ class XueqiuDB:
             with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
             file_size = os.path.getsize(output_path)
+
+            # 第二轮：如仍超限，每帖只保留最新 20 条评论
+            if file_size > 1024 * 1024:
+                for section_posts in sections.values():
+                    for p in section_posts:
+                        if len(p.get("comments", [])) > 20:
+                            p["comments"] = p["comments"][-20:]
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
+                file_size = os.path.getsize(output_path)
+
+            # 第三轮：如仍超限，每帖只保留 5 条评论
+            if file_size > 1024 * 1024:
+                for section_posts in sections.values():
+                    for p in section_posts:
+                        if len(p.get("comments", [])) > 5:
+                            p["comments"] = p["comments"][-5:]
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
+                file_size = os.path.getsize(output_path)
 
         # 记录导出时间
         self.set_last_export_time(datetime.now().isoformat())
@@ -1322,6 +1394,8 @@ class XueqiuScraper:
             self._log(f"  增量起始: {result['since']}")
         self._log(f"  导出帖子: {result.get('exported_posts', 0)}")
         self._log(f"  导出评论: {result.get('exported_comments', 0)}")
+        if result.get('filtered_comments', 0):
+            self._log(f"  过滤灌水: {result['filtered_comments']} 条")
         self._log(f"  数据库累计: {result.get('db_total_posts', 0)} 帖 / {result.get('db_total_comments', 0)} 评")
         return export_path
 
