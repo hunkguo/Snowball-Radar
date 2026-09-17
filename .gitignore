@@ -34,5 +34,8 @@ data/
 Thumbs.db
 desktop.ini
 
+# ── Windows 保留设备名（异常产生的不可删文件，忽略以免污染 git status）──
+/nul
+
 # ── 日志 ──
 *.log
