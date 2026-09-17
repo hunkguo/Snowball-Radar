@@ -122,6 +122,24 @@ python hashtag_comments.py
 
 修改 `hashtag_comments.py` 顶部的 `HASHTAG_URL` / `HASHTAG_NAME` / `HASHTAG_SHORT` 即可抓取其他话题。
 
+## 价值提取 (insight_extractor.py, Layer 1)
+
+从 `data/hashtag_comments.db` 中**筛选有投资参考价值的评论**，整理成可直接发给大模型分析的文档。
+
+```bash
+python insight_extractor.py
+```
+
+工作流程：
+1. 读取已抓取的评论，逐条**规则打分**（股票代码 +3、已知标的名 +2/个、方向/事件关键词加权、信息密度、点赞加权）
+2. **剔除灌水**（顶/沙发/666/纯表情/纯重复字符等）
+3. 按分数阈值（默认 ≥5）筛选候选池，按**标的**和**分数**双重整理
+4. 生成两份产出：
+   - `data/exports/insight_<标识>_<时间戳>.md` —— 按标的分组的候选评论 + **可直接复制给大模型的提示词区块**
+   - `data/exports/insight_<标识>_<时间戳>.json` —— 结构化候选数据（含分数、标签、标的，供程序消费）
+
+> 提示词区块已内置【话题背景】与任务指令（价值评估 / 结构化抽取 / 去重合并 / 生成小道消息日报），复制后粘贴到任意大模型即可获得分析报告。如需进一步精排与结构化，可在 `insight_extractor.py` 顶部接入大模型 API（Layer 2，待实现）。
+
 ## 数据说明
 
 ### SQLite 数据库 (`data/xueqiu.db`)
