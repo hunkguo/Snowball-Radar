@@ -14,6 +14,8 @@
 - **慢速模式**：页间间隔 5-10 秒，评论间间隔 3-6 秒，降低被封风险
 - **EXE 打包**：支持 PyInstaller 打包为独立可执行文件，自带自定义图标
 - **话题评论抓取**：`hashtag_comments.py` 针对指定雪球话题页，提取帖子并抓取全部评论（小道消息/有价值信息主要集中在此）
+- **持续运行 (话题版)**：每 45-60 分钟随机抓取一轮，每轮生成独立增量 JSON（仅新评论，不重复），`Ctrl+C` 退出
+- **独立增量文件**：每轮导出带时间戳的 JSON，数据库按评论 ID 去重，文件内容不重复
 
 ## 项目结构
 
@@ -89,6 +91,8 @@ python scraper.py
 
 ## 使用 EXE (无需 Python 环境)
 
+当前 `build_exe.py` 打包**话题评论抓取器**（`hashtag_comments.py`）：
+
 ### 打包
 
 ```bash
@@ -96,29 +100,56 @@ pip install pyinstaller
 python build_exe.py
 ```
 
-输出：`dist/xueqiu_scraper/xueqiu_scraper.exe`
+输出：`dist/xueqiu_comments/xueqiu_comments.exe`
 
 ### 运行
 
-1. 将 `dist/xueqiu_scraper/` 整个文件夹复制到目标机器
-2. 双击 `xueqiu_scraper.exe`
-3. 首次运行在弹出的 Chrome 窗口中手动登录雪球
-4. 程序自动持续抓取，`Ctrl+C` 退出
+1. 将 `dist/xueqiu_comments/` 整个文件夹复制到目标机器
+2. 双击 `xueqiu_comments.exe`
+3. 程序持续抓取评论，每轮生成独立增量 JSON，`Ctrl+C` 退出
+4. 结果保存在 EXE 同目录的 `data/`（数据库 + 每轮增量 JSON + 价值候选）
+
+> 如需打包主爬虫 `scraper.py`（推荐/热门板块），将 `build_exe.py` 中的 `SCRAPER_FILE` 改为 `scraper.py` 即可。
 
 ## 话题评论抓取 (hashtag_comments.py)
 
-针对**单个雪球话题页**深度抓取评论（推荐/热门板块的帖子评论较水，而有价值的小道消息往往集中在特定话题的评论区）：
+针对**单个雪球话题页**深度抓取评论（推荐/热门板块的帖子评论较水，而有价值的小道消息往往集中在特定话题的评论区）。
+
+### 持续运行模式（默认）
+
+程序启动后**持续运行**：每 45-60 分钟（随机）抓取一轮，每轮生成独立增量 JSON，数据库按评论 ID 去重，文件内容不重复。`Ctrl+C` 优雅退出。
 
 ```bash
 python hashtag_comments.py
 ```
 
-工作流程：
-1. 打开配置的话题页（默认 `#沃什：加息25基点至4%，通胀难降但就业不伤#`）
-2. 滚动加载帖子，提取所有 `article.timeline__item` 中的帖子 ID
-3. 逐条调用 `/statuses/comments.json` 抓取评论（支持翻页，最多 15 页/帖）
-4. SQLite 去重存储到 `data/hashtag_comments.db`
-5. 增量导出 JSON 到 `data/exports/hashtag_comments_<标识>_<时间戳>.json`（首次全量，后续只导出新评论）
+行为：
+- 打开配置的话题页（默认 `#沃什：加息25基点至4%，通胀难降但就业不伤#`）
+- 滚动加载帖子，提取所有 `article.timeline__item` 中的帖子 ID
+- 逐条调用 `/statuses/comments.json` 抓取评论（支持翻页，最多 15 页/帖）
+- SQLite 去重存储到 `data/hashtag_comments.db`
+- **每轮生成独立增量 JSON** `data/exports/hashtag_comments_<标识>_<时间戳>.json`（首次全量，后续只含本轮新评论）
+- 每轮同时生成 Layer1 价值候选 `data/exports/insight_<标识>_<时间戳>.md`
+- 每轮结束打印**下次执行时间**，等待 45-60 分钟后自动开始下一轮
+
+### 单次模式
+
+如需只抓一次就退出，将文件顶部 `CONTINUOUS = True` 改为 `False`。
+
+### 打包为 EXE
+
+```bash
+pip install pyinstaller
+python build_exe.py
+```
+
+输出：`dist/xueqiu_comments/xueqiu_comments.exe`
+
+1. 将 `dist/xueqiu_comments/` 整个文件夹复制到目标机器
+2. 双击 `xueqiu_comments.exe`
+3. 程序持续运行，结果保存在 `data/` 目录（数据库 + 每轮增量 JSON + 价值候选）
+
+> 话题页与评论 API 均为公开接口，默认无头模式即可抓取，无需登录。
 
 修改 `hashtag_comments.py` 顶部的 `HASHTAG_URL` / `HASHTAG_NAME` / `HASHTAG_SHORT` 即可抓取其他话题。
 

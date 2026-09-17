@@ -46,6 +46,11 @@ POST_DELAY = (3, 6)        # 帖子间随机停顿（秒）
 COMMENT_PAGE_DELAY = (1, 3)
 HEADLESS = True            # 无头模式（可后台运行）；需看登录过程改为 False
 
+# ── 持续运行参数 ──
+CONTINUOUS = True               # True=持续运行; False=单次运行后退出
+RUN_INTERVAL_MIN = 45           # 抓取间隔下限（分钟）
+RUN_INTERVAL_MAX = 60           # 抓取间隔上限（分钟）
+GEN_INSIGHT_EACH_ROUND = True   # 每轮同时生成 Layer1 价值候选(insight_*.md/.json)
 
 # ── 工具函数 ──
 def _strip_tags(html):
@@ -61,7 +66,11 @@ def _strip_tags(html):
 
 def _log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    line = f"[{ts}] {msg}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("utf-8", "replace").decode("utf-8"), flush=True)
 
 
 # ── 数据库 ──
@@ -194,6 +203,7 @@ class XueqiuHashtagScraper:
         self.headless = headless
         self.scroll_rounds = scroll_rounds
         self.max_comment_pages = max_comment_pages
+        self._running = True
 
     def _extract_post_ids(self, page):
         return page.evaluate("""
@@ -233,7 +243,7 @@ class XueqiuHashtagScraper:
             }
         """ % self.max_comment_pages, post_id)
 
-    def run(self):
+    def scrape_once(self):
         with sync_playwright() as pw:
             browser = pw.chromium.launch_persistent_context(
                 user_data_dir=os.path.join(DATA_DIR, "chrome_profile"),
@@ -295,13 +305,70 @@ class XueqiuHashtagScraper:
             page.wait_for_timeout(1500)
             browser.close()
 
-        # 导出 JSON
+        return total_new
+
+
+    def _export_round(self):
+        """每轮生成独立增量 JSON 文件（仅含本轮新评论，数据不重复）"""
         os.makedirs(EXPORT_DIR, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_path = os.path.join(EXPORT_DIR, f"hashtag_comments_{HASHTAG_SHORT}_{ts}.json")
         res = self.db.export_incremental(export_path)
         size_kb = os.path.getsize(export_path) / 1024
-        _log(f"JSON 导出: {export_path}  ({size_kb:.1f} KB, 类型={res['export_type']}, 评论={res['comment_count']}条)")
+        _log(f"  本轮 JSON 导出: {export_path}  ({size_kb:.1f} KB, 类型={res['export_type']}, 评论={res['comment_count']}条)")
+        return export_path
+
+    def _gen_insight(self):
+        """每轮同时生成 Layer1 价值候选（可选，需 insight_extractor.py）"""
+        try:
+            import insight_extractor
+            insight_extractor.main()
+        except Exception as e:
+            _log(f"  生成价值候选失败(可忽略): {e}")
+
+    def _interruptible_sleep(self, seconds):
+        """可中断的等待（Ctrl+C 立即响应）"""
+        step = 1.0
+        waited = 0.0
+        while waited < seconds and self._running:
+            time.sleep(step)
+            waited += step
+
+    def run_forever(self):
+        from datetime import timedelta
+        _log("=" * 60)
+        _log(f"  持续运行模式启动：每 {RUN_INTERVAL_MIN}-{RUN_INTERVAL_MAX} 分钟抓取一轮")
+        _log("  数据增量去重存储，每轮生成独立 JSON 文件（不重复）")
+        _log("  按 Ctrl+C 可退出程序")
+        _log("=" * 60)
+        round_no = 0
+        try:
+            while self._running:
+                round_no += 1
+                _log(f"\n{'='*60}")
+                _log(f"  第 {round_no} 轮抓取  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                _log(f"{'='*60}")
+                try:
+                    new_count = self.scrape_once()
+                except Exception as e:
+                    _log(f"  ⚠ 本轮抓取异常: {e}")
+                    new_count = 0
+                self._export_round()
+                if GEN_INSIGHT_EACH_ROUND:
+                    self._gen_insight()
+                if not self._running:
+                    break
+                wait_min = random.randint(RUN_INTERVAL_MIN, RUN_INTERVAL_MAX)
+                next_t = datetime.now() + timedelta(minutes=wait_min)
+                _log(f"\n  本轮结束，新增评论 {new_count} 条")
+                _log(f"  下次执行时间: {next_t.strftime('%Y-%m-%d %H:%M:%S')}（约 {wait_min} 分钟后）")
+                _log(f"  按 Ctrl+C 退出程序\n")
+                self._interruptible_sleep(wait_min * 60)
+        except KeyboardInterrupt:
+            _log("\n收到 Ctrl+C，准备退出…")
+        finally:
+            _log("数据库已关闭")
+            self.db.close()
 
 
 def main():
@@ -314,11 +381,25 @@ def main():
         scroll_rounds=SCROLL_ROUNDS,
         max_comment_pages=MAX_COMMENT_PAGES,
     )
-    try:
-        scraper.run()
-    finally:
+
+    # 信号处理：Ctrl+C 优雅退出（本轮结束后停止）
+    import signal
+    def _handler(signum, frame):
+        _log("\n收到退出信号，将在本轮结束后退出…")
+        scraper._running = False
+    signal.signal(signal.SIGINT, _handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handler)
+
+    if CONTINUOUS:
+        scraper.run_forever()
+    else:
+        new_count = scraper.scrape_once()
+        scraper._export_round()
+        if GEN_INSIGHT_EACH_ROUND:
+            scraper._gen_insight()
+        _log(f"单次运行完成，新增评论 {new_count} 条")
         db.close()
-        _log("数据库已关闭")
 
 
 if __name__ == "__main__":
