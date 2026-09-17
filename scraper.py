@@ -32,6 +32,40 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
+
+
+def _profile_has_login(p):
+    """判断某个 Chrome profile 目录是否存在且已登录（含 Cookies）。"""
+    if not os.path.isdir(p):
+        return False
+    default = os.path.join(p, "Default")
+    if not os.path.isdir(default):
+        return False
+    return (os.path.exists(os.path.join(default, "Cookies")) or
+            os.path.exists(os.path.join(default, "Network", "Cookies")))
+
+
+def resolve_profile_dir():
+    """返回 Chrome 持久化 profile 目录。
+
+    - 默认：DATA_DIR/chrome_profile
+    - 若为 EXE(frozen) 且自身目录无登录态，则向上查找项目目录 / 用户级固定目录里的
+      已登录 profile，让 EXE 自动复用 python 运行时的登录态。
+      否则 EXE 会以未登录的全新 profile 打开雪球，导致右侧「热门话题」列表不渲染、
+      自动发现失败（no hashtag links）。
+    """
+    default = os.path.join(DATA_DIR, "chrome_profile")
+    if getattr(sys, "frozen", False):
+        candidates = [
+            default,
+            os.path.join(BASE_DIR, "..", "..", "data", "chrome_profile"),
+            os.path.join(os.path.expanduser("~"), ".xueqiu_spider", "chrome_profile"),
+        ]
+        for c in candidates:
+            c = os.path.abspath(c)
+            if _profile_has_login(c):
+                return c
+    return default
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 DB_PATH = os.path.join(DATA_DIR, "xueqiu.db")
 JSON_EXPORT_DIR = os.path.join(DATA_DIR, "exports")
@@ -1138,7 +1172,8 @@ class XueqiuScraper:
     # ──────────────────────────────────────────────
 
     def _connect_via_copy(self, playwright):
-        persistent_profile = os.path.join(DATA_DIR, "chrome_profile")
+        persistent_profile = resolve_profile_dir()
+        self._log(f"  Chrome profile: {persistent_profile}")
 
         # 检查持久化 Profile 是否已有 cookie（Chrome 115+ 存放在 Network/ 子目录）
         has_cookies = (

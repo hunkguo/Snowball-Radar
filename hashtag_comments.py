@@ -31,6 +31,40 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
+
+
+def _profile_has_login(p):
+    """判断某个 Chrome profile 目录是否存在且已登录（含 Cookies）。"""
+    if not os.path.isdir(p):
+        return False
+    default = os.path.join(p, "Default")
+    if not os.path.isdir(default):
+        return False
+    return (os.path.exists(os.path.join(default, "Cookies")) or
+            os.path.exists(os.path.join(default, "Network", "Cookies")))
+
+
+def resolve_profile_dir():
+    """返回 Chrome 持久化 profile 目录。
+
+    - 默认：DATA_DIR/chrome_profile
+    - 若为 EXE(frozen) 且自身目录无登录态，则向上查找项目目录 / 用户级固定目录里的
+      已登录 profile，让 EXE 自动复用 python 运行时的登录态。
+      否则 EXE 会以未登录的全新 profile 打开雪球，导致右侧「热门话题」列表不渲染、
+      自动发现失败（no hashtag links）。
+    """
+    default = os.path.join(DATA_DIR, "chrome_profile")
+    if getattr(sys, "frozen", False):
+        candidates = [
+            default,
+            os.path.join(BASE_DIR, "..", "..", "data", "chrome_profile"),
+            os.path.join(os.path.expanduser("~"), ".xueqiu_spider", "chrome_profile"),
+        ]
+        for c in candidates:
+            c = os.path.abspath(c)
+            if _profile_has_login(c):
+                return c
+    return default
 DB_PATH = os.path.join(DATA_DIR, "hashtag_comments.db")
 EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 
@@ -259,42 +293,52 @@ class XueqiuHashtagScraper:
         """ % self.max_comment_pages, post_id)
 
     def _discover_hot_topic(self, page):
-        """打开雪球首页，从右侧「热门话题」框取第一个（最热）话题的链接与标题。
+        """打开雪球首页，从右侧「热门话题」盒子取第一个（最热）话题。
 
-        返回 (url, title)；解析失败时返回 (None, None)。
+        返回 (url, title)；解析/超时失败时返回 (None, None)，交由调用方回退到写死配置。
+
+        关键事实（2026-09-17 实测）：热门话题盒子的真实 DOM 结构为
+            div.board.board__topic  >  h3「热门话题」  >  table.topic-hot__list  >  tr > td > a
+        话题链接是「话题搜索页」链接，形如  /k?q=%23话题名%23  （即 /k?q=#话题#），
+        并不是 /hashtag/ 链接。这些搜索页与话题页共用 article.timeline__item 帖子结构
+        和 comments 评论接口，因此抓取逻辑完全通用。
+
+        之前的实现误以为话题是 /hashtag/ 链接，导致整页只有 footer 的两条 /hashtag/
+        链接（#我给雪球提建议# / #防诈骗举报专区#）被过滤词挡掉，于是报 no hashtag links。
         """
-        page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
-        page.wait_for_timeout(6000)  # 等右侧栏异步加载
+        try:
+            page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
+        except Exception as e:
+            _log(f"  打开首页失败: {e}")
+            return None, None
+        try:
+            page.wait_for_selector("div.board.board__topic a[href*='/k?q=']", timeout=20000)
+            page.wait_for_timeout(800)  # 让列表完全渲染
+        except Exception as e:
+            _log(f"  等待热门话题盒子超时（首页布局可能变化）: {e}")
+            return None, None
         res = page.evaluate("""() => {
-            const els = Array.from(document.querySelectorAll('*'));
-            let container = null;
-            for (const el of els) {
-                const t = (el.textContent || '').trim();
-                if (t && t.indexOf('热门话题') !== -1 && t.length <= 20) {
-                    let node = el;
-                    for (let i = 0; i < 5; i++) {
-                        node = node.parentElement;
-                        if (!node) break;
-                        if (node.querySelector('a[href*="/hashtag/"]')) { container = node; break; }
-                    }
-                    if (container) break;
-                }
-            }
-            if (!container) return {error: 'no 热门话题 container'};
-            const links = Array.from(container.querySelectorAll('a[href*="/hashtag/"]'))
-                .filter(a => !/查看|更多|全部|话题榜|换一换/.test(a.textContent || ''));
-            if (!links.length) return {error: 'no hashtag links'};
-            const a = links[0];
-            return {url: a.href, title: (a.getAttribute('title') || a.textContent || '').trim()};
+            const box = document.querySelector('div.board.board__topic') || document;
+            const a = box.querySelector("a[href*='/k?q=']");
+            if (!a) return {error: 'no topic link'};
+            const href = a.getAttribute('href') || '';
+            const title = (a.textContent || '').trim();
+            return {href, title};
         }""")
-        if isinstance(res, dict) and res.get("url"):
-            return res["url"], res.get("title") or ""
+        if isinstance(res, dict) and res.get("href") and res.get("title"):
+            url = res["href"]
+            if url.startswith("/"):
+                url = "https://xueqiu.com" + url
+            return url, res["title"]
+        _log(f"  热门话题解析失败: {res}")
         return None, None
 
     def scrape_once(self):
         with sync_playwright() as pw:
+            profile_dir = resolve_profile_dir()
+            _log(f"  Chrome profile: {profile_dir}")
             browser = pw.chromium.launch_persistent_context(
-                user_data_dir=os.path.join(DATA_DIR, "chrome_profile"),
+                user_data_dir=profile_dir,
                 channel="chrome",
                 headless=self.headless,
                 args=["--disable-blink-features=AutomationControlled"],
@@ -307,6 +351,7 @@ class XueqiuHashtagScraper:
                         self.url = url
                         if title:
                             self.name = title
+                            self.short = _slugify(title)  # 按话题独立 seen 文件，避免串味
                         _log(f"自动发现最新热门话题: {self.name}")
                     else:
                         _log("  自动发现未返回链接，沿用配置话题")
