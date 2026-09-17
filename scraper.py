@@ -21,6 +21,10 @@ import tempfile
 from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright
 
+# 通用价值线索提取（Layer 1 规则打分，单一来源，scraper 与 insight_extractor 共用）
+import clue_extractor
+from clue_extractor import extract_clues, render_clues_markdown, render_clues_json, generate_clue_files
+
 # ── 路径配置（支持 EXE 打包）──
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -31,6 +35,8 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 DB_PATH = os.path.join(DATA_DIR, "xueqiu.db")
 JSON_EXPORT_DIR = os.path.join(DATA_DIR, "exports")
+# 已分析评论 id 记录（增量分析：分析过的评论下轮不再重复）
+CLUE_SEEN_PATH = os.path.join(DATA_DIR, "seen_recommend_comments.json")
 
 
 def _detect_chrome_user_data():
@@ -52,6 +58,13 @@ CHROME_USER_DATA = _detect_chrome_user_data()
 SCRAPE_INTERVAL_MIN = 30 * 60   # 30 分钟（最小间隔）
 SCRAPE_INTERVAL_MAX = 45 * 60   # 45 分钟（最大间隔）
 JSON_EXPORT_INTERVAL = 6 * 3600  # 6 小时导出一次 JSON
+EXPORT_JSON = False            # 是否导出原始抓取数据 JSON（默认关闭，只产出价值线索 md）
+
+# ── 价值线索提取（Layer 1）──
+GEN_CLUES = True               # 每轮导出时同时生成价值线索文件
+CLUE_THRESHOLD = 5             # 进入候选池的最低分
+CLUE_MAX_CANDIDATES = 80       # 发给大模型的候选上限（按分数截取）
+CLUE_INCREMENTAL = True        # True=只分析新出现的评论（分析过的不再重复）
 
 # ── API 端点 ──
 API_RECOMMEND = "https://xueqiu.com/statuses/fundx/public/list.json?source=fund_public&page={page}"
@@ -99,7 +112,24 @@ def clean_html(text):
     return text.strip()
 
 
-# 无意义评论灌水关键词
+def norm_comment(text):
+    """优化评论正文：去 HTML、剥离「回复 @某人」前缀、压缩多余空白。
+
+    相比 clean_html，额外处理雪球评论常见的转发/回复前缀，
+    让正文更聚焦于实质内容，便于后续价值打分与阅读。
+    """
+    if not text:
+        return ""
+    t = clean_html(text)
+    # 剥离「回复 @用户：」等转发前缀
+    t = re.sub(r"^\s*回复\s*@?[\w\u4e00-\u9fff.\-]+[\s:：]*", "", t)
+    # 压缩多余空白
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+# 无意义评论灌水关键词（保留以兼容历史调用；过滤口径已统一走 clue_extractor）
 _MEANINGLESS_PATTERNS = {
     "", "顶", "沙发", "板凳", "地板", "前排", "插眼", "马克", "留名",
     "mark", "m", "mm", "dddd", "好的", "嗯", "哦", "啊", "哈", "哈哈",
@@ -111,36 +141,9 @@ _MEANINGLESS_PATTERNS = {
 def _is_meaningless_comment(text):
     """判断评论是否无意义（灌水/空/纯表情/极短）
 
-    返回 True 表示该评论应被过滤掉。
+    返回 True 表示该评论应被过滤掉。口径与 clue_extractor.is_meaningless 一致。
     """
-    if not text:
-        return True
-    t = text.strip()
-    if not t:
-        return True
-
-    # 去掉所有空白和标点后的纯内容
-    stripped = re.sub(r'[\s\W_]+', '', t, flags=re.UNICODE)
-
-    # 纯表情/纯标点（去标点后为空或只剩 1 个字符）
-    if len(stripped) <= 1:
-        return True
-
-    # 去标点后少于 2 个字符（如 "。。。" "！！！""??" 等）
-    if len(stripped) < 2:
-        return True
-
-    # 匹配灌水关键词（不区分大小写）
-    if t.lower() in _MEANINGLESS_PATTERNS:
-        return True
-
-    # 纯数字（如 "111" "666"）或纯重复字符（如 "哈哈哈哈哈" "。。。。。"）
-    if stripped.isdigit() and len(stripped) <= 3:
-        return True
-    if len(set(stripped)) == 1 and len(stripped) <= 10:
-        return True
-
-    return False
+    return clue_extractor.is_meaningless(text)
 
 
 class XueqiuDB:
@@ -552,6 +555,30 @@ class XueqiuDB:
             "hot": hot,
             "runs": runs,
         }
+
+    def get_all_comments_for_clues(self):
+        """取出全部评论并附带所属板块(section)，供 Layer 1 价值提取使用"""
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT c.id, c.post_id, c.text, c.like_count,
+                   c.user_screen_name, c.time_str, p.section
+            FROM comments c
+            LEFT JOIN posts p ON c.post_id = p.id
+            ORDER BY c.like_count DESC
+        """)
+        rows = c.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "post_id": r["post_id"],
+                "text": r["text"] or "",
+                "like_count": r["like_count"] or 0,
+                "user_name": r["user_screen_name"] or "",
+                "time_str": r["time_str"] or "",
+                "section": r["section"] or "",
+            })
+        return out
 
     def close(self):
         self.conn.close()
@@ -1063,7 +1090,7 @@ class XueqiuScraper:
                 cu = c.get("user") or {}
                 comments.append({
                     "id":          str(c.get("id", "")),
-                    "text":        clean_html(c.get("text") or ""),
+                    "text":        norm_comment(c.get("text") or ""),
                     "created_at":  c.get("created_at", 0),
                     "time_str":    self._ts_to_str(c.get("created_at", 0)),
                     "like_count":  c.get("like_count", 0),
@@ -1230,7 +1257,10 @@ class XueqiuScraper:
         return run_id
 
     def _export_json(self):
-        """增量导出 JSON：只导出上次导出后的新数据"""
+        """增量导出 JSON：只导出上次导出后的新数据（默认关闭，见 EXPORT_JSON）"""
+        if not EXPORT_JSON:
+            self._log("  已跳过原始 JSON 导出（EXPORT_JSON=False，只产出价值线索 md）")
+            return None
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_path = os.path.join(JSON_EXPORT_DIR, f"xueqiu_export_{ts}.json")
         result = self.db.export_to_json(export_path)
@@ -1248,6 +1278,106 @@ class XueqiuScraper:
             self._log(f"  过滤灌水: {result['filtered_comments']} 条")
         self._log(f"  数据库累计: {result.get('db_total_posts', 0)} 帖 / {result.get('db_total_comments', 0)} 评")
         return export_path
+
+    def extract_and_save_clues(self):
+        """Layer 1 价值线索提取：扫描全部评论，筛选有价值线索并保存成品文件。
+
+        产出（data/exports/ 下，带时间戳，不覆盖历史）：
+          - clues_<ts>.md     按标的分组 + Top 排名 + 可直接复制的大模型提示词（默认只产出 md）
+          - clues_<ts>.json   结构化候选（仅当 EXPORT_JSON=True）
+        返回生成的 md 路径；失败返回 None。
+
+        统一走 clue_extractor.generate_clue_files（与话题版/统一入口同一产出函数）。
+        """
+        if not GEN_CLUES:
+            return None
+        try:
+            comment_dicts = self.db.get_all_comments_for_clues()
+        except Exception as e:
+            self._log(f"  读取评论失败(跳过线索提取): {e}")
+            return None
+
+        total = len(comment_dicts)
+        meta = {
+            "title": "雪球 推荐/热门 板块评论 · 价值线索（Layer 1 规则）",
+            "context_desc": (
+                "雪球「推荐 / 热门」板块帖子下的用户评论，经规则筛选出的「可能有价值」线索"
+                "（含小道消息、产业链、业绩/订单、多空方向等信号）。"
+            ),
+            "threshold": CLUE_THRESHOLD,
+            "total_comments": total,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "max_llm_candidates": CLUE_MAX_CANDIDATES,
+        }
+
+        md_path, json_path, candidates = generate_clue_files(
+            comment_dicts, meta, JSON_EXPORT_DIR, "clues",
+            write_json=EXPORT_JSON, seen_path=CLUE_SEEN_PATH,
+            incremental=CLUE_INCREMENTAL)
+
+        self._log(f"\n{'='*60}")
+        self._log(f"价值线索提取完成（Layer 1）！")
+        self._log(f"{'='*60}")
+        skipped_note = ""
+        if CLUE_INCREMENTAL:
+            try:
+                seen_n = len(__import__("clue_extractor")._load_seen(CLUE_SEEN_PATH))
+                skipped_note = f"  增量分析（累计已分析 {seen_n} 条，不重复）"
+            except Exception:
+                skipped_note = "  增量分析（只分析新评论）"
+        self._log(f"  扫描评论: {total}  候选(≥{CLUE_THRESHOLD}分): {len(candidates)}")
+        if skipped_note:
+            self._log(skipped_note)
+        self._log(f"  MD   : {md_path}  (含可直接复制的大模型提示词)")
+        if json_path:
+            self._log(f"  JSON : {json_path}")
+        return md_path
+
+    def scrape_once(self):
+        """单次抓取一轮（推荐/热门），自带浏览器生命周期，供统一调度器(xueqiu.py)调用。
+
+        每轮独立打开并关闭 Chrome（持久化 Profile 保存登录态），
+        因此可与话题版(xueqiu.py --mode all)顺序调用而互不干扰。
+        返回本轮 run_id；异常向上抛出由调用方处理。
+        """
+        with sync_playwright() as p:
+            # 确保 Chrome 已关闭
+            if self._is_chrome_running():
+                self._log("  检测到残留 Chrome 进程，正在清理…")
+                subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
+                               capture_output=True, timeout=15)
+                time.sleep(3)
+
+            self._log("--- 启动 Chrome（智能复制 Profile）---")
+            context = self._connect_via_copy(p)
+            if context is None:
+                raise RuntimeError("无法启动浏览器（Profile 复制/启动失败）")
+
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(60000)
+            self._page = page
+
+            try:
+                self._log("正在访问雪球首页 …")
+                try:
+                    page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                self._rsleep(5, 8)
+                self._human_move(page)
+                self._rsleep(2, 4)
+
+                # 登录检测（仅在无登录态时等待人工登录；有持久化 Profile 则秒过）
+                self._ensure_login(page)
+
+                run_id = self._do_one_scrape(page)
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                self._page = None
+        return run_id if 'run_id' in dir() else None
 
     # ──────────────────────────────────────────────
     #  主流程 — 持续运行
@@ -1333,6 +1463,10 @@ class XueqiuScraper:
                         last_export_time = now
                     except Exception as e:
                         self._log(f"  JSON 导出出错: {e}")
+                    try:
+                        self.extract_and_save_clues()
+                    except Exception as e:
+                        self._log(f"  价值线索提取出错: {e}")
 
                 # 等待下一轮
                 if not self._running:
@@ -1360,6 +1494,11 @@ class XueqiuScraper:
                 self._export_json()
             except Exception as e:
                 self._log(f"  最终导出出错: {e}")
+            # 最终再提取一次价值线索
+            try:
+                self.extract_and_save_clues()
+            except Exception as e:
+                self._log(f"  最终线索提取出错: {e}")
 
             # 关闭浏览器
             try:
@@ -1390,12 +1529,37 @@ class XueqiuScraper:
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="雪球爬虫 v7 — 推荐/热门 板块抓取 + 价值线索提取")
+    parser.add_argument(
+        "--clues", action="store_true",
+        help="仅执行 Layer 1 价值线索提取（基于已抓取的评论，不启动浏览器/不抓取）")
+    parser.add_argument(
+        "--no-clues", action="store_true",
+        help="持续运行时跳过价值线索文件生成")
+    args = parser.parse_args()
+
+    # 仅提取价值线索：复用已抓取的评论，无需登录或爬取
+    if args.clues:
+        scraper = XueqiuScraper(
+            max_pages=1, max_comment_pages=1, max_comment_posts=1, login_wait=0)
+        md = scraper.extract_and_save_clues()
+        scraper.db.close()
+        if md:
+            print(f"[完成] 价值线索已生成：{md}")
+        else:
+            print("[提示] 未生成线索文件（可能没有评论数据或已关闭 GEN_CLUES）。")
+        sys.exit(0)
+
     scraper = XueqiuScraper(
         max_pages=3,
         max_comment_pages=2,
         max_comment_posts=15,
         login_wait=300,
     )
+    if args.no_clues:
+        GEN_CLUES = False
     scraper.run()
 
     # EXE 打包后，窗口不会自动关闭

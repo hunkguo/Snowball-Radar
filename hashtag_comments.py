@@ -37,7 +37,9 @@ EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 # ── 抓取目标配置 ──
 HASHTAG_URL = "https://xueqiu.com/hashtag/I-ayg-S7gO-8muWKoOaBrzI15Z-654K56IezNCXvvIzpgJrog4Dpmr7pmY3kvYblsLHkuJrkuI3kvKQj"
 HASHTAG_NAME = "沃什：加息25基点至4%，通胀难降但就业不伤"  # 话题标题(用于标注/检索)
-HASHTAG_SHORT = "walsh_rate_hike"  # 导出文件名用的短标识
+HASHTAG_SHORT = "walsh_rate_hike"  # 导出文件名用的短标识（仅兜底；自动发现启用后会被最新话题名覆盖）
+# 是否自动从雪球首页右侧「热门话题」取当前最热话题来抓（False 则始终抓上面写死的 HASHTAG_URL）
+AUTO_DISCOVER_HOT_TOPIC = True
 
 # ── 行为参数 ──
 SCROLL_ROUNDS = 8          # 滚动加载帖子次数
@@ -50,7 +52,8 @@ HEADLESS = True            # 无头模式（可后台运行）；需看登录过
 CONTINUOUS = True               # True=持续运行; False=单次运行后退出
 RUN_INTERVAL_MIN = 45           # 抓取间隔下限（分钟）
 RUN_INTERVAL_MAX = 60           # 抓取间隔上限（分钟）
-GEN_INSIGHT_EACH_ROUND = True   # 每轮同时生成 Layer1 价值候选(insight_*.md/.json)
+GEN_INSIGHT_EACH_ROUND = True   # 每轮同时生成 Layer1 价值候选(insight_*.md)
+EXPORT_JSON = False             # 是否导出每轮原始评论 JSON（默认关闭，只产出价值线索 md）
 
 # ── 工具函数 ──
 def _strip_tags(html):
@@ -62,6 +65,15 @@ def _strip_tags(html):
               .replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'"))
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     return txt.strip()
+
+
+def _slugify(text, max_len=24):
+    """把话题标题转成可用于文件名的安全短标识（中文保留，其他替换为下划线）。"""
+    if not text:
+        return "topic"
+    s = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", "_", text)
+    s = s.strip("_")
+    return s[:max_len] or "topic"
 
 
 def _log(msg):
@@ -115,11 +127,11 @@ class HashtagDB:
         c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('last_export_time',?)", (t,))
         self.conn.commit()
 
-    def save_post(self, pid, author):
+    def save_post(self, pid, author, hashtag=HASHTAG_NAME):
         now = datetime.now().isoformat()
         self.conn.execute(
             "INSERT OR IGNORE INTO posts(id,author,hashtag,first_seen) VALUES(?,?,?,?)",
-            (pid, author, HASHTAG_NAME, now))
+            (pid, author, hashtag, now))
         self.conn.commit()
 
     def save_comment(self, c):
@@ -130,7 +142,7 @@ class HashtagDB:
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
                  text=excluded.text, like_count=excluded.like_count, last_updated=excluded.last_updated""",
-            (c["id"], c["post_id"], c["post_author"], HASHTAG_NAME, c["text"],
+            (c["id"], c["post_id"], c["post_author"], c.get("hashtag", HASHTAG_NAME), c["text"],
              c["user_id"], c["user_name"], c["like_count"], c["created_at"],
              c["time_str"], now, now))
         self.conn.commit()
@@ -196,13 +208,16 @@ class HashtagDB:
 # ── 主抓取器 ──
 class XueqiuHashtagScraper:
     def __init__(self, db, hashtag_url, hashtag_name, headless=True,
-                 scroll_rounds=8, max_comment_pages=15):
+                 scroll_rounds=8, max_comment_pages=15,
+                 auto_discover=True, short=None):
         self.db = db
         self.url = hashtag_url
         self.name = hashtag_name
+        self.short = short or _slugify(hashtag_name)
         self.headless = headless
         self.scroll_rounds = scroll_rounds
         self.max_comment_pages = max_comment_pages
+        self.auto_discover = auto_discover
         self._running = True
 
     def _extract_post_ids(self, page):
@@ -243,6 +258,39 @@ class XueqiuHashtagScraper:
             }
         """ % self.max_comment_pages, post_id)
 
+    def _discover_hot_topic(self, page):
+        """打开雪球首页，从右侧「热门话题」框取第一个（最热）话题的链接与标题。
+
+        返回 (url, title)；解析失败时返回 (None, None)。
+        """
+        page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
+        page.wait_for_timeout(6000)  # 等右侧栏异步加载
+        res = page.evaluate("""() => {
+            const els = Array.from(document.querySelectorAll('*'));
+            let container = null;
+            for (const el of els) {
+                const t = (el.textContent || '').trim();
+                if (t && t.indexOf('热门话题') !== -1 && t.length <= 20) {
+                    let node = el;
+                    for (let i = 0; i < 5; i++) {
+                        node = node.parentElement;
+                        if (!node) break;
+                        if (node.querySelector('a[href*="/hashtag/"]')) { container = node; break; }
+                    }
+                    if (container) break;
+                }
+            }
+            if (!container) return {error: 'no 热门话题 container'};
+            const links = Array.from(container.querySelectorAll('a[href*="/hashtag/"]'))
+                .filter(a => !/查看|更多|全部|话题榜|换一换/.test(a.textContent || ''));
+            if (!links.length) return {error: 'no hashtag links'};
+            const a = links[0];
+            return {url: a.href, title: (a.getAttribute('title') || a.textContent || '').trim()};
+        }""")
+        if isinstance(res, dict) and res.get("url"):
+            return res["url"], res.get("title") or ""
+        return None, None
+
     def scrape_once(self):
         with sync_playwright() as pw:
             browser = pw.chromium.launch_persistent_context(
@@ -252,6 +300,18 @@ class XueqiuHashtagScraper:
                 args=["--disable-blink-features=AutomationControlled"],
             )
             page = browser.pages[0] if browser.pages else browser.new_page()
+            if self.auto_discover:
+                try:
+                    url, title = self._discover_hot_topic(page)
+                    if url:
+                        self.url = url
+                        if title:
+                            self.name = title
+                        _log(f"自动发现最新热门话题: {self.name}")
+                    else:
+                        _log("  自动发现未返回链接，沿用配置话题")
+                except Exception as e:
+                    _log(f"  自动发现热门话题失败，沿用配置: {e}")
             page.goto(self.url, wait_until="domcontentloaded")
             _log(f"已打开话题页: {self.name}")
             page.wait_for_timeout(5000)
@@ -269,7 +329,7 @@ class XueqiuHashtagScraper:
             for idx, p in enumerate(posts, 1):
                 pid = p["id"]
                 author = p.get("author", "")
-                self.db.save_post(pid, author)
+                self.db.save_post(pid, author, self.name)
                 _log(f"  ({idx}/{len(posts)}) 抓取帖子 {pid} 的评论…")
                 raw = self._fetch_comments(page, pid)
                 saved_this = 0
@@ -289,6 +349,7 @@ class XueqiuHashtagScraper:
                         "post_id": pid,
                         "post_author": author,
                         "text": text,
+                        "hashtag": self.name,
                         "user_id": str(user.get("id", "")),
                         "user_name": user.get("screen_name", ""),
                         "like_count": cm.get("like_count", 0) or 0,
@@ -309,7 +370,9 @@ class XueqiuHashtagScraper:
 
 
     def _export_round(self):
-        """每轮生成独立增量 JSON 文件（仅含本轮新评论，数据不重复）"""
+        """每轮生成独立增量 JSON 文件（默认关闭，见 EXPORT_JSON）"""
+        if not EXPORT_JSON:
+            return None
         os.makedirs(EXPORT_DIR, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_path = os.path.join(EXPORT_DIR, f"hashtag_comments_{HASHTAG_SHORT}_{ts}.json")
@@ -322,7 +385,7 @@ class XueqiuHashtagScraper:
         """每轮同时生成 Layer1 价值候选（可选，需 insight_extractor.py）"""
         try:
             import insight_extractor
-            insight_extractor.main()
+            insight_extractor.main(short=self.short, name=self.name)
         except Exception as e:
             _log(f"  生成价值候选失败(可忽略): {e}")
 
@@ -338,7 +401,7 @@ class XueqiuHashtagScraper:
         from datetime import timedelta
         _log("=" * 60)
         _log(f"  持续运行模式启动：每 {RUN_INTERVAL_MIN}-{RUN_INTERVAL_MAX} 分钟抓取一轮")
-        _log("  数据增量去重存储，每轮生成独立 JSON 文件（不重复）")
+        _log("  数据增量去重存储，每轮生成独立的价值线索 md 文件（不重复）")
         _log("  按 Ctrl+C 可退出程序")
         _log("=" * 60)
         round_no = 0

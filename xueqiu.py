@@ -1,0 +1,336 @@
+# -*- coding: utf-8 -*-
+"""
+雪球抓取 · 统一入口 (xueqiu.py)
+
+把两个抓取引擎整合到一个程序，运行时用参数区分抓什么：
+  - 推荐/热门 板块帖子下的评论   (原 scraper.py)
+  - 指定话题(hashtag) 下的评论    (原 hashtag_comments.py)
+  - 两者同时抓取                   (--mode all)
+
+无论哪种模式，策略一致：抓到的评论经 Layer 1 规则打分，剔除灌水，
+筛选「可能有价值」的线索，输出
+    - data/exports/clues_*.md       整理内容 + 可直接复制的大模型提示词（默认只产出 md）
+    - data/exports/insight_*.md     话题版同上
+
+用法:
+    python xueqiu.py                         # 默认：推荐/热门 + 话题 都抓
+    python xueqiu.py --mode recommend        # 仅抓 推荐/热门
+    python xueqiu.py --mode hashtag          # 仅抓 话题
+    python xueqiu.py --mode all              # 两者都抓（默认，每轮顺序执行）
+    python xueqiu.py --once                  # 两者各抓一轮后退出
+    python xueqiu.py --clues                 # 仅基于已抓评论提取线索，不抓取
+    python xueqiu.py --json                  # 额外产出结构化 JSON（默认不产）
+    python xueqiu.py --mode hashtag --url "..." --name "..." --short "xxx"
+    python xueqiu.py --interval-min 30 --interval-max 45
+"""
+
+import argparse
+import os
+import signal
+import sys
+import time
+import random
+from datetime import datetime, timedelta
+
+# ── 路径配置（支持 EXE 打包）──
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── 引擎与共用模块 ──
+import clue_extractor  # noqa: E402
+from clue_extractor import generate_clue_files  # noqa: E402
+
+from scraper import (  # noqa: E402
+    XueqiuScraper,
+    XueqiuDB,
+    DB_PATH as RECOMMEND_DB,
+    JSON_EXPORT_DIR as RECOMMEND_EXPORT,
+    GEN_CLUES,
+    CLUE_THRESHOLD,
+    CLUE_MAX_CANDIDATES,
+    CLUE_SEEN_PATH,
+)
+import hashtag_comments as hm  # noqa: E402
+from hashtag_comments import (  # noqa: E402
+    HashtagDB,
+    XueqiuHashtagScraper,
+    DB_PATH as HASH_DB,
+    EXPORT_DIR as HASH_EXPORT,
+    HASHTAG_URL,
+    HASHTAG_NAME,
+    HASHTAG_SHORT,
+    SCROLL_ROUNDS,
+    MAX_COMMENT_PAGES,
+    HEADLESS as HASH_HEADLESS,
+    AUTO_DISCOVER_HOT_TOPIC,
+)
+import insight_extractor  # noqa: E402
+from insight_extractor import load_comments, build_comment_dicts  # noqa: E402
+
+
+# ──────────────────────────────────────────────
+#  价值线索提取（统一产出）
+# ──────────────────────────────────────────────
+def gen_recommend_clues(write_json=False, incremental=True):
+    """读取 推荐/热门 评论库，生成 clues_<ts>.md（可选 .json）。
+
+    incremental=True 时只分析「上次之后新出现」的评论，避免每小时观点雷同。
+    """
+    db = XueqiuDB(RECOMMEND_DB)
+    try:
+        comments = db.get_all_comments_for_clues()
+    finally:
+        db.close()
+    total = len(comments)
+    meta = {
+        "title": "雪球 推荐/热门 板块评论 · 价值线索（Layer 1 规则）",
+        "context_desc": (
+            "雪球「推荐 / 热门」板块帖子下的用户评论，经规则筛选出的「可能有价值」线索"
+            "（含小道消息、产业链、业绩/订单、多空方向等信号）。"
+        ),
+        "threshold": CLUE_THRESHOLD,
+        "total_comments": total,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "max_llm_candidates": CLUE_MAX_CANDIDATES,
+    }
+    md_path, json_path, candidates = generate_clue_files(
+        comments, meta, RECOMMEND_EXPORT, "clues", write_json=write_json,
+        seen_path=CLUE_SEEN_PATH, incremental=incremental)
+    return md_path, json_path, candidates
+
+
+def gen_hashtag_clues(name=HASHTAG_NAME, short=HASHTAG_SHORT, write_json=False,
+                      incremental=True, seen_path=None):
+    """读取 话题 评论库，生成 insight_<short>_<ts>.md（可选 .json）。
+
+    incremental=True 时只分析「上次之后新出现」的评论，避免每小时观点雷同。
+    """
+    # 确保库表结构存在（首次运行/空库时不报错）
+    _hdb = HashtagDB(HASH_DB)
+    _hdb.close()
+    rows = load_comments()
+    comments = build_comment_dicts(rows)
+    total = len(comments)
+    meta = {
+        "title": "雪球话题评论 · 价值候选提炼（Layer 1 规则）",
+        "context_desc": f"雪球用户讨论：{name}。以下评论集中于相关题材的个股联动与产业链消息。",
+        "threshold": insight_extractor.SCORE_THRESHOLD,
+        "total_comments": total,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "max_llm_candidates": insight_extractor.MAX_LLM_CANDIDATES,
+    }
+    prefix = f"insight_{short}"
+    sp = seen_path or insight_extractor.seen_path_for(short)
+    md_path, json_path, candidates = generate_clue_files(
+        comments, meta, HASH_EXPORT, prefix, write_json=write_json,
+        seen_path=sp, incremental=incremental)
+    return md_path, json_path, candidates
+
+
+# ──────────────────────────────────────────────
+#  参数
+# ──────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="雪球抓取统一入口：推荐/热门 + 话题，统一参数驱动")
+    p.add_argument("--mode", choices=["recommend", "hashtag", "all"],
+                   default="all",
+                   help="抓取模式：recommend=推荐/热门, hashtag=话题, all=两者都抓（默认）")
+    p.add_argument("--once", action="store_true",
+                   help="只抓一轮即退出（不进入持续循环）")
+    p.add_argument("--clues", action="store_true",
+                   help="仅提取价值线索（基于已抓评论，不启动浏览器/不抓取）")
+    p.add_argument("--no-clues", action="store_true",
+                   help="跳过每轮的价值线索生成")
+    p.add_argument("--json", dest="write_json", action="store_true",
+                   help="额外导出结构化 JSON（默认只产出 md）")
+    p.add_argument("--full", dest="full", action="store_true",
+                   help="全量分析（默认增量：只分析新出现的评论，分析过的不再重复）")
+    p.add_argument("--reset-seen", dest="reset_seen", action="store_true",
+                   help="清空「已分析评论」记录（下次运行重新全量分析一遍，然后恢复增量）")
+    p.add_argument("--headless", action="store_true",
+                   help="话题抓取使用无头 Chrome（推荐模式始终需要可见窗口登录）")
+    p.add_argument("--no-headless", action="store_true",
+                   help="话题抓取使用可见 Chrome")
+    p.add_argument("--url", default=None, help="话题页 URL（覆盖默认）")
+    p.add_argument("--name", default=None, help="话题标题（覆盖默认，用于标注）")
+    p.add_argument("--short", default=None, help="文件名短标识（覆盖默认）")
+    p.add_argument("--interval-min", type=int, default=45,
+                   help="抓取间隔下限（分钟）")
+    p.add_argument("--interval-max", type=int, default=60,
+                   help="抓取间隔上限（分钟）")
+    return p.parse_args()
+
+
+def _print(msg):
+    """打印运行日志（对 Windows GBK 控制台做编码降级，避免特殊字符导致崩溃）"""
+    line = f"[{datetime.now():%H:%M:%S}] {msg}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        enc = (getattr(sys.stdout, "encoding", None) or "utf-8")
+        print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
+
+
+# ──────────────────────────────────────────────
+#  主流程
+# ──────────────────────────────────────────────
+def main():
+    args = parse_args()
+    mode = args.mode
+    do_recommend = mode in ("recommend", "all")
+    do_hashtag = mode in ("hashtag", "all")
+
+    # 同步两个引擎的开关
+    import scraper as _scraper_mod  # noqa: E402
+    _scraper_mod.EXPORT_JSON = args.write_json
+    hm.EXPORT_JSON = args.write_json
+    _scraper_mod.GEN_CLUES = not args.no_clues
+    _scraper_mod.CLUE_INCREMENTAL = not args.full
+    _do_incremental = not args.full
+
+    # 清空「已分析评论」记录（如需重新基线）
+    if args.reset_seen:
+        for p in (CLUE_SEEN_PATH, insight_extractor.SEEN_PATH):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+                    _print(f"  已清空已分析记录: {p}")
+            except Exception as e:
+                _print(f"  [!] 清空失败 {p}: {e}")
+        _do_incremental = False  # 本次强制全量，重建基线
+
+    _print(f"雪球统一抓取启动 | 模式={mode} | 仅线索={args.clues} | 单次={args.once} | 导出JSON={args.write_json} | 增量={_do_incremental}")
+
+    # ── 仅提取线索 ──
+    if args.clues:
+        if do_recommend and not args.no_clues:
+            try:
+                md, _, c = gen_recommend_clues(write_json=args.write_json)
+                _print(f"推荐线索: {len(c)} 条候选 -> {md}")
+            except Exception as e:
+                _print(f"推荐线索提取失败: {e}")
+        if do_hashtag and not args.no_clues:
+            try:
+                md, _, c = gen_hashtag_clues(write_json=args.write_json, incremental=_do_incremental)
+                _print(f"话题线索: {len(c)} 条候选 -> {md}")
+            except Exception as e:
+                _print(f"话题线索提取失败: {e}")
+        return
+
+    # ── 构建引擎 ──
+    hashtag_headless = HASH_HEADLESS
+    if args.headless:
+        hashtag_headless = True
+    if args.no_headless:
+        hashtag_headless = False
+
+    rec = None
+    htag = None
+    hdb = None
+    if do_recommend:
+        rec = XueqiuScraper(
+            max_pages=3, max_comment_pages=2, max_comment_posts=15, login_wait=300)
+    if do_hashtag:
+        hurl = args.url or HASHTAG_URL
+        hname = args.name or HASHTAG_NAME
+        hshort = args.short or HASHTAG_SHORT
+        # 未显式指定 --url 时，自动从首页「热门话题」取最新最热话题
+        auto_discover = AUTO_DISCOVER_HOT_TOPIC and not args.url
+        hdb = HashtagDB(HASH_DB)
+        htag = XueqiuHashtagScraper(
+            hdb, hurl, hname,
+            headless=hashtag_headless,
+            scroll_rounds=SCROLL_ROUNDS,
+            max_comment_pages=MAX_COMMENT_PAGES,
+            auto_discover=auto_discover,
+            short=hshort,
+        )
+        _print(f"话题目标: {hname}  (自动发现最新热门={auto_discover}, 无头={hashtag_headless})")
+
+    # ── 信号处理：Ctrl+C 优雅退出 ──
+    state = {"running": True}
+
+    def _handler(signum, frame):
+        _print(f"收到退出信号({signum})，将在本轮结束后退出…")
+        state["running"] = False
+
+    signal.signal(signal.SIGINT, _handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handler)
+
+    round_no = 0
+    try:
+        while state["running"]:
+            round_no += 1
+            _print(f"\n{'='*60}")
+            _print(f"  第 {round_no} 轮抓取  {datetime.now():%Y-%m-%d %H:%M:%S}")
+            _print(f"{'='*60}")
+
+            if do_recommend:
+                try:
+                    rid = rec.scrape_once()
+                    _print(f"  推荐/热门抓取完成 (run_id={rid})")
+                except Exception as e:
+                    _print(f"  [!] 推荐抓取异常: {e}")
+
+            if do_hashtag:
+                try:
+                    n = htag.scrape_once()
+                    _print(f"  话题抓取完成 (新增 {n} 条评论) -> {htag.name}")
+                    if not args.no_clues:
+                        md, _, c = gen_hashtag_clues(
+                            name=htag.name, short=htag.short,
+                            write_json=args.write_json, incremental=_do_incremental)
+                        _print(f"  话题线索 {len(c)} 条 -> {md}")
+                except Exception as e:
+                    _print(f"  [!] 话题抓取/线索异常: {e}")
+
+            # ── 价值线索提取（推荐侧，统一策略）──
+            if not args.no_clues and do_recommend:
+                try:
+                    md, _, c = gen_recommend_clues(write_json=args.write_json)
+                    _print(f"  推荐线索 {len(c)} 条 -> {md}")
+                except Exception as e:
+                    _print(f"  [!] 推荐线索提取失败: {e}")
+
+            if args.once or not state["running"]:
+                break
+
+            wait = random.randint(args.interval_min, args.interval_max)
+            next_t = datetime.now() + timedelta(minutes=wait)
+            _print(f"\n  本轮结束。下次执行: {next_t:%Y-%m-%d %H:%M:%S} "
+                   f"（约 {wait} 分钟后，Ctrl+C 退出）")
+
+            # 分段等待，便于响应 Ctrl+C
+            waited = 0
+            while waited < wait * 60 and state["running"]:
+                time.sleep(5)
+                waited += 5
+    finally:
+        if rec is not None:
+            try:
+                rec.db.close()
+            except Exception:
+                pass
+        if hdb is not None:
+            try:
+                hdb.close()
+            except Exception:
+                pass
+        _print("程序已退出。")
+
+
+if __name__ == "__main__":
+    main()
+
+    # EXE 打包后，窗口不会自动关闭
+    if getattr(sys, "frozen", False):
+        print("\n" + "=" * 60)
+        print("程序已退出。按 Enter 键关闭窗口...")
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            pass

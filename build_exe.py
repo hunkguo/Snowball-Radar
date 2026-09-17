@@ -1,7 +1,7 @@
 """
-PyInstaller build script for Xueqiu Hashtag Comments Scraper
+PyInstaller build script for Xueqiu unified scraper (xueqiu.py)
 Usage: python build_exe.py
-Output: dist/xueqiu_comments/xueqiu_comments.exe
+Output: dist/xueqiu/xueqiu.exe
 """
 
 import subprocess
@@ -9,10 +9,10 @@ import sys
 import os
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRAPER_FILE = os.path.join(PROJECT_DIR, "hashtag_comments.py")
+SCRAPER_FILE = os.path.join(PROJECT_DIR, "xueqiu.py")
 DIST_DIR = os.path.join(PROJECT_DIR, "dist")
 BUILD_DIR = os.path.join(PROJECT_DIR, "build")
-APP_NAME = "xueqiu_comments"
+APP_NAME = "xueqiu"
 ICON_FILE = os.path.join(PROJECT_DIR, "favicon.ico")
 
 # 使用当前 Python 解释器
@@ -87,6 +87,9 @@ def run():
         "--clean",
         *icon_arg,
         "--hidden-import", "insight_extractor",
+        "--hidden-import", "clue_extractor",
+        "--hidden-import", "scraper",
+        "--hidden-import", "hashtag_comments",
         SCRAPER_FILE,
     ]
 
@@ -112,11 +115,12 @@ def run():
         print(f"  Dir:  {os.path.join(DIST_DIR, APP_NAME)}")
         print(f"\n  Usage:")
         print(f"    1. Copy the '{APP_NAME}' folder to any location")
-        print(f"    2. Run {APP_NAME}.exe")
+        print(f"    2. Run {APP_NAME}.exe  (或: {APP_NAME}.exe --mode all)")
         print(f"    3. Results saved to 'data/' next to the EXE")
-        print(f"       - hashtag_comments.db (SQLite database, 去重存储)")
-        print(f"       - exports/hashtag_comments_<topic>_YYYYMMDD_HHMMSS.json (每轮增量导出)")
-        print(f"       - exports/insight_<topic>_YYYYMMDD_HHMMSS.md (Layer1 价值候选+提示词)")
+        print(f"       - xueqiu.db / hashtag_comments.db (SQLite, 去重存储)")
+        print(f"       - exports/xueqiu_export_*.json (推荐/热门 增量导出)")
+        print(f"       - exports/hashtag_comments_*.json (话题 增量导出)")
+        print(f"       - exports/clues_*.md / insight_*.md (Layer1 价值候选+提示词)")
     else:
         print(f"\nERROR: EXE not found at {exe_path}")
         print("Check build output above for errors.")
