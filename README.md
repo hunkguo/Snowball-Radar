@@ -13,6 +13,7 @@
 - **模拟鼠标点击**：`_human_click()` 实现移动→停顿→点击，带随机偏移
 - **慢速模式**：页间间隔 5-10 秒，评论间间隔 3-6 秒，降低被封风险
 - **EXE 打包**：支持 PyInstaller 打包为独立可执行文件，自带自定义图标
+- **话题评论抓取**：`hashtag_comments.py` 针对指定雪球话题页，提取帖子并抓取全部评论（小道消息/有价值信息主要集中在此）
 
 ## 项目结构
 
@@ -103,6 +104,23 @@ python build_exe.py
 2. 双击 `xueqiu_scraper.exe`
 3. 首次运行在弹出的 Chrome 窗口中手动登录雪球
 4. 程序自动持续抓取，`Ctrl+C` 退出
+
+## 话题评论抓取 (hashtag_comments.py)
+
+针对**单个雪球话题页**深度抓取评论（推荐/热门板块的帖子评论较水，而有价值的小道消息往往集中在特定话题的评论区）：
+
+```bash
+python hashtag_comments.py
+```
+
+工作流程：
+1. 打开配置的话题页（默认 `#沃什：加息25基点至4%，通胀难降但就业不伤#`）
+2. 滚动加载帖子，提取所有 `article.timeline__item` 中的帖子 ID
+3. 逐条调用 `/statuses/comments.json` 抓取评论（支持翻页，最多 15 页/帖）
+4. SQLite 去重存储到 `data/hashtag_comments.db`
+5. 增量导出 JSON 到 `data/exports/hashtag_comments_<标识>_<时间戳>.json`（首次全量，后续只导出新评论）
+
+修改 `hashtag_comments.py` 顶部的 `HASHTAG_URL` / `HASHTAG_NAME` / `HASHTAG_SHORT` 即可抓取其他话题。
 
 ## 数据说明
 
