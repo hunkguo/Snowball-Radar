@@ -15,7 +15,7 @@ database_id = "01af2cb4-51ea-41c5-b03d-698e2962050f"
 # 每日定时清理：删除 KEEP_DAYS(10) 天前的数据
 # Cron 语法：分 时 日 月 周；下方 = 每天 UTC 16:00（北京时间 00:00）执行
 # 免费版 Cloudflare 也支持 cron，但触发器数量有限；如免费版不可用，可改用 POST /api/cleanup 手动清理
-[[triggers]]
+[triggers]
 crons = ["0 16 * * *"]
 
 # 说明：
