@@ -19,7 +19,99 @@
 import os
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# 雪球时间均为北京时间（GMT+8）
+_BEIJING = timezone(timedelta(hours=8))
+
+
+def _epoch_to_str(epoch):
+    """epoch 秒 -> 北京时间 'YYYY-MM-DD HH:MM'；非法返回 ''。
+
+    兼容毫秒级时间戳（> 1e12 视为毫秒）。早于 2017 视为非法。
+    """
+    try:
+        epoch = float(epoch)
+    except (TypeError, ValueError):
+        return ""
+    if not epoch or epoch <= 0:
+        return ""
+    if epoch > 1e12:          # 毫秒 -> 秒
+        epoch /= 1000.0
+    if epoch < 1.48e9:        # 早于 2017-01-01，视为无效
+        return ""
+    try:
+        dt = datetime.fromtimestamp(epoch, tz=_BEIJING)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _anchor_dt(anchor_epoch):
+    """anchor_epoch 秒 -> 北京时间 datetime；无效则用当前北京时间。"""
+    if anchor_epoch and anchor_epoch > 0:
+        try:
+            return datetime.fromtimestamp(anchor_epoch, tz=_BEIJING)
+        except (OverflowError, OSError, ValueError):
+            pass
+    return datetime.now(_BEIJING)
+
+
+def normalize_time_str(raw, created_at=0, anchor_epoch=0):
+    """把雪球各种时间串规范为北京时间绝对串 'YYYY-MM-DD HH:MM'。
+
+    雪球 API 的时间表示混杂：'今天 14:13' / '昨天 09:15' / '28分钟前' /
+    'X小时前' / '刚刚' / '09-16 17:58'（缺年份）/ '2026-09-16 17:58'。
+    解析这些相对串极易出错且无法跨时间排序，故：
+
+    优先级：
+      1) created_at（epoch 秒，API 真实发布时间）-> 最可靠，直接转北京时间
+      2) '今天 HH:MM' / '昨天 HH:MM' -> 按 anchor_epoch 推算日期
+      3) 'X分钟前' / 'X小时前' / '刚刚' -> 按 anchor_epoch 回退
+      4) 'MM-DD HH:MM' -> 用 anchor_epoch 的年份补全年份
+      5) 'YYYY-MM-DD HH:MM' -> 原样
+    失败返回 ''（调用方再用品轮次 generated_at 兜底）。
+    """
+    s = (raw or "").strip()
+    # 1) 绝对 epoch 优先
+    abs_str = _epoch_to_str(created_at)
+    if abs_str:
+        return abs_str
+    if not s:
+        return ""
+    # 2) 今天 / 昨天
+    m = re.match(r"^今天[ T]?(\d{1,2}):(\d{1,2})", s)
+    if m:
+        dt = _anchor_dt(anchor_epoch).replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    m = re.match(r"^昨天[ T]?(\d{1,2}):(\d{1,2})", s)
+    if m:
+        dt = (_anchor_dt(anchor_epoch) - timedelta(days=1)).replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    # 3) X分钟前 / X小时前 / 刚刚
+    m = re.match(r"^(\d+)\s*分钟前", s)
+    if m:
+        dt = _anchor_dt(anchor_epoch) - timedelta(minutes=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    m = re.match(r"^(\d+)\s*小时前", s)
+    if m:
+        dt = _anchor_dt(anchor_epoch) - timedelta(hours=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    if s.startswith("刚刚"):
+        return _anchor_dt(anchor_epoch).strftime("%Y-%m-%d %H:%M")
+    # 4) MM-DD HH:MM（缺年份）
+    m = re.match(r"^(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})", s)
+    if m:
+        y = _anchor_dt(anchor_epoch).year
+        try:
+            dt = datetime(y, int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), tzinfo=_BEIJING)
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return ""
+    # 5) 已是 YYYY-MM-DD 开头 -> 取前 16 位
+    if re.match(r"^\d{4}-\d{1,2}-\d{1,2}", s):
+        return s[:16]
+    return ""
 
 # ──────────────────────────────────────────────
 # 已知标的（别名 -> 标准名），按需扩充
@@ -196,11 +288,15 @@ def extract_clues(comments, threshold=5, max_candidates=80):
         score, tags, stocks = score_comment(text, like, reply)
         if score < threshold:
             continue
+        cand_created_at = c.get("created_at", 0) or 0
         candidates.append({
             "id": c.get("id", ""),
             "user_name": c.get("user_name", "") or "",
             "post_author": c.get("post_author", "") or "",
-            "time_str": c.get("time_str", "") or "",
+            # 用 created_at（API 真实发布时间）把混杂的相对/半截时间串
+            # 规范为北京时间绝对串 'YYYY-MM-DD HH:MM'，保证可按日期排序
+            "time_str": normalize_time_str(c.get("time_str", ""), cand_created_at),
+            "created_at": cand_created_at,
             "like_count": like,
             "reply_count": reply,
             "text": text,

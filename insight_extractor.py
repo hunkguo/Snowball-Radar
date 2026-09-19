@@ -84,6 +84,7 @@ def build_comment_dicts(rows):
             "user_name": _g(r, "user_name") or "",
             "post_author": _g(r, "post_author") or "",
             "time_str": _g(r, "time_str") or "",
+            "created_at": _g(r, "created_at") or 0,
             "like_count": _g(r, "like_count") or 0,
             "reply_count": _g(r, "reply_count") or 0,
             "text": _g(r, "text") or "",

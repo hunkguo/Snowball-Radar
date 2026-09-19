@@ -52,6 +52,8 @@ def read_comments(db_path, cols_of_interest):
             d["user_name"] = d["user_screen_name"]
         d["like_count"] = d.get("like_count") or 0
         d["reply_count"] = 0  # 老库无此列，回填记为 0
+        # created_at 为评论真实发布时间（epoch 秒），用于把 time_str 规范为绝对日期
+        d["created_at"] = d.get("created_at") or 0
         out.append(d)
     return out, cols
 
@@ -65,7 +67,7 @@ def row_to_group_key(d, group_by):
 def backfill(source, db_path, group_by, url, token, dry_run, threshold=5):
     cols_of_interest = [
         "id", "post_id", "post_author", "hashtag", "text",
-        "user_name", "user_screen_name", "like_count", "time_str",
+        "user_name", "user_screen_name", "like_count", "time_str", "created_at",
     ]
     comments, cols = read_comments(db_path, cols_of_interest)
     if not comments:
@@ -86,10 +88,15 @@ def backfill(source, db_path, group_by, url, token, dry_run, threshold=5):
         candidates, _ = ce.extract_clues(
             gcomments, threshold=threshold, max_candidates=5000
         )
+        # 用该组最新评论的真实发布时间作为轮次时间（便于 rounds 视图展示与兜底）
+        gen_at = "2026-09-19 12:00:00"
+        valid_ts = [c["created_at"] for c in gcomments if c.get("created_at")]
+        if valid_ts:
+            gen_at = ce._epoch_to_str(max(valid_ts)) + ":00"
         meta = {
             "title": gkey,
             "hashtag": gkey if group_by == "hashtag" else "",
-            "generated_at": "2026-09-19 12:00:00",
+            "generated_at": gen_at,
             "total_comments": len(gcomments),
         }
         payload = uploader.build_payload(meta, candidates, gcomments, source=source)
@@ -97,7 +104,9 @@ def backfill(source, db_path, group_by, url, token, dry_run, threshold=5):
         total_uploads += 1
 
         if dry_run:
-            print(f"    话题「{gkey}」: 评论 {len(gcomments)} 条 -> 候选 {len(candidates)} 条 | round_id={payload['round_id'][:40]}…")
+            sample_ts = sorted({c["time_str"] for c in candidates if c.get("time_str")})[:4]
+            print(f"    话题「{gkey}」: 评论 {len(gcomments)} 条 -> 候选 {len(candidates)} 条")
+            print(f"       时间样本(规范化后): {sample_ts}")
         else:
             code, body = uploader.upload_round(payload, url, token)
             ok = "OK" if code == 200 else f"FAIL({code})"
