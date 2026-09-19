@@ -50,6 +50,13 @@ HASHTAG_NAME = "沃什：加息25基点至4%，通胀难降但就业不伤"
 SCORE_THRESHOLD = 5          # 进入候选池的最低分
 MAX_LLM_CANDIDATES = 80      # 发给大模型的候选上限（按分数截取）
 INCREMENTAL = True           # True=只分析新出现的评论（分析过的不再重复）
+INCLUDE_LLM_PROMPT = False   # False=只输出适合人工阅读的内容（默认自己看，不需要 AI 提示词区块）
+
+# ── 上传到 Cloudflare Worker（雪球雷达 · 线索台）──
+UPLOAD_ENABLED = False
+UPLOAD_URL = ""               # 如 https://xueqiu.你的域名.com/api/ingest
+UPLOAD_TOKEN = ""             # 与 Worker 端 INGEST_TOKEN 一致
+UPLOAD_SOURCE = "hashtag"
 
 
 def load_comments():
@@ -64,21 +71,31 @@ def load_comments():
 
 def build_comment_dicts(rows):
     """把 DB 行转换为 clue_extractor 期望的 comment dict 列表"""
+    # 兼容老库：个别字段（如 reply_count）可能尚未迁移，缺失时按默认值处理
+    cols = set(rows[0].keys()) if rows else set()
+
+    def _g(r, k, d=0):
+        return r[k] if k in cols else d
+
     out = []
     for r in rows:
         out.append({
-            "id": r["id"],
-            "user_name": r["user_name"] or "",
-            "post_author": r["post_author"] or "",
-            "time_str": r["time_str"] or "",
-            "like_count": r["like_count"] or 0,
-            "text": r["text"] or "",
-            "hashtag": r["hashtag"] or "",
+            "id": _g(r, "id"),
+            "user_name": _g(r, "user_name") or "",
+            "post_author": _g(r, "post_author") or "",
+            "time_str": _g(r, "time_str") or "",
+            "like_count": _g(r, "like_count") or 0,
+            "reply_count": _g(r, "reply_count") or 0,
+            "text": _g(r, "text") or "",
+            "hashtag": _g(r, "hashtag") or "",
         })
     return out
 
 
-def main(write_json=False, incremental=INCREMENTAL, short=None, name=None, seen_path=None):
+def main(write_json=False, incremental=INCREMENTAL, short=None, name=None,
+         seen_path=None, include_prompt=INCLUDE_LLM_PROMPT,
+         upload=UPLOAD_ENABLED, upload_url=UPLOAD_URL, upload_token=UPLOAD_TOKEN,
+         upload_source=UPLOAD_SOURCE):
     if not os.path.exists(DB_PATH):
         print(f"[错误] 未找到数据库：{DB_PATH}\n请先运行 hashtag_comments.py 抓取评论。")
         return
@@ -106,7 +123,10 @@ def main(write_json=False, incremental=INCREMENTAL, short=None, name=None, seen_
     prefix = f"insight_{short}"
     md_path, json_path, candidates = generate_clue_files(
         comment_dicts, meta, EXPORT_DIR, prefix,
-        write_json=write_json, seen_path=seen_path, incremental=incremental)
+        write_json=write_json, seen_path=seen_path, incremental=incremental,
+        include_prompt=include_prompt,
+        upload=upload, upload_url=upload_url, upload_token=upload_token,
+        upload_source=upload_source)
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Layer 1 提取完成"
           + ("（增量：只分析新评论）" if incremental else "（全量）"))

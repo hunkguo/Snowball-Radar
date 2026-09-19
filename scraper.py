@@ -99,6 +99,14 @@ GEN_CLUES = True               # 每轮导出时同时生成价值线索文件
 CLUE_THRESHOLD = 5             # 进入候选池的最低分
 CLUE_MAX_CANDIDATES = 80       # 发给大模型的候选上限（按分数截取）
 CLUE_INCREMENTAL = True        # True=只分析新出现的评论（分析过的不再重复）
+CLUE_INCLUDE_PROMPT = False    # False=只输出适合人工阅读的内容（默认自己看，不需要 AI 提示词区块）
+
+# ── 上传到 Cloudflare Worker（雪球雷达 · 线索台）──
+# 默认关闭；xueqiu.py 在 --upload 时统一开启并填充 URL/Token。
+UPLOAD_ENABLED = False
+UPLOAD_URL = ""                # 如 https://xueqiu.你的域名.com/api/ingest
+UPLOAD_TOKEN = ""              # 与 Worker 端 INGEST_TOKEN 一致
+UPLOAD_SOURCE = "recommend"    # 推荐/热门 来源标识
 
 # ── API 端点 ──
 API_RECOMMEND = "https://xueqiu.com/statuses/fundx/public/list.json?source=fund_public&page={page}"
@@ -236,9 +244,17 @@ class XueqiuDB:
                 user_screen_name TEXT,
                 first_seen TEXT,
                 last_updated TEXT,
+                reply_count INTEGER DEFAULT 0,
                 FOREIGN KEY (post_id) REFERENCES posts(id)
             )
         """)
+        # 迁移：老库 comments 表可能无 reply_count 列，补齐（评论收到的回复数，用于「有交互」打分）
+        try:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(comments)")]
+            if "reply_count" not in cols:
+                c.execute("ALTER TABLE comments ADD COLUMN reply_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
         c.execute("""
             CREATE TABLE IF NOT EXISTS scrape_runs (
                 run_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -333,22 +349,24 @@ class XueqiuDB:
             INSERT INTO comments (
                 id, post_id, text, created_at, time_str,
                 like_count, user_id, user_screen_name,
-                first_seen, last_updated
+                first_seen, last_updated, reply_count
             ) VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?,
-                ?, ?
+                ?, ?, ?
             )
             ON CONFLICT(id) DO UPDATE SET
                 text=excluded.text,
                 like_count=excluded.like_count,
+                reply_count=excluded.reply_count,
                 last_updated=excluded.last_updated
         """, (
             cid, post_id,
             comment.get("text", ""), comment.get("created_at", 0), comment.get("time_str", ""),
             comment.get("like_count", 0),
             str(u.get("id", "")), u.get("screen_name", ""),
-            now if not existed else None, now
+            now if not existed else None, now,
+            comment.get("reply_count", 0) or 0
         ))
         self.conn.commit()
         return not existed
@@ -446,6 +464,7 @@ class XueqiuDB:
                 "text": comment_text.strip(),
                 "time_str": cr["time_str"] or "",
                 "like_count": cr["like_count"],
+                "reply_count": cr["reply_count"] or 0,
                 "user": cr["user_screen_name"] or "",
             })
 
@@ -1128,6 +1147,7 @@ class XueqiuScraper:
                     "created_at":  c.get("created_at", 0),
                     "time_str":    self._ts_to_str(c.get("created_at", 0)),
                     "like_count":  c.get("like_count", 0),
+                    "reply_count": c.get("reply_count", 0) or 0,
                     "user": {
                         "id":          str(cu.get("id", "")),
                         "screen_name": cu.get("screen_name") or "",
@@ -1314,11 +1334,13 @@ class XueqiuScraper:
         self._log(f"  数据库累计: {result.get('db_total_posts', 0)} 帖 / {result.get('db_total_comments', 0)} 评")
         return export_path
 
-    def extract_and_save_clues(self):
+    def extract_and_save_clues(self, include_prompt=CLUE_INCLUDE_PROMPT,
+                               upload=UPLOAD_ENABLED, upload_url=UPLOAD_URL,
+                               upload_token=UPLOAD_TOKEN, upload_source=UPLOAD_SOURCE):
         """Layer 1 价值线索提取：扫描全部评论，筛选有价值线索并保存成品文件。
 
         产出（data/exports/ 下，带时间戳，不覆盖历史）：
-          - clues_<ts>.md     按标的分组 + Top 排名 + 可直接复制的大模型提示词（默认只产出 md）
+          - clues_<ts>.md     按标的分组（每条评论仅列一次，保留时间/作者，适合人工阅读）
           - clues_<ts>.json   结构化候选（仅当 EXPORT_JSON=True）
         返回生成的 md 路径；失败返回 None。
 
@@ -1348,7 +1370,9 @@ class XueqiuScraper:
         md_path, json_path, candidates = generate_clue_files(
             comment_dicts, meta, JSON_EXPORT_DIR, "clues",
             write_json=EXPORT_JSON, seen_path=CLUE_SEEN_PATH,
-            incremental=CLUE_INCREMENTAL)
+            incremental=CLUE_INCREMENTAL, include_prompt=include_prompt,
+            upload=upload, upload_url=upload_url, upload_token=upload_token,
+            upload_source=upload_source)
 
         self._log(f"\n{'='*60}")
         self._log(f"价值线索提取完成（Layer 1）！")
@@ -1363,7 +1387,7 @@ class XueqiuScraper:
         self._log(f"  扫描评论: {total}  候选(≥{CLUE_THRESHOLD}分): {len(candidates)}")
         if skipped_note:
             self._log(skipped_note)
-        self._log(f"  MD   : {md_path}  (含可直接复制的大模型提示词)")
+        self._log(f"  MD   : {md_path}  (按标的分组，每条评论仅列一次，适合直接阅读)")
         if json_path:
             self._log(f"  JSON : {json_path}")
         return md_path

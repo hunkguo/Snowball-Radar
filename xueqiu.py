@@ -73,10 +73,12 @@ from insight_extractor import load_comments, build_comment_dicts  # noqa: E402
 # ──────────────────────────────────────────────
 #  价值线索提取（统一产出）
 # ──────────────────────────────────────────────
-def gen_recommend_clues(write_json=False, incremental=True):
+def gen_recommend_clues(write_json=False, incremental=True, include_prompt=False,
+                        upload=False, upload_url=None, upload_token=None):
     """读取 推荐/热门 评论库，生成 clues_<ts>.md（可选 .json）。
 
     incremental=True 时只分析「上次之后新出现」的评论，避免每小时观点雷同。
+    include_prompt=True 时在文末追加「发给大模型的提示词」区块（默认 False，适合人工阅读）。
     """
     db = XueqiuDB(RECOMMEND_DB)
     try:
@@ -97,15 +99,20 @@ def gen_recommend_clues(write_json=False, incremental=True):
     }
     md_path, json_path, candidates = generate_clue_files(
         comments, meta, RECOMMEND_EXPORT, "clues", write_json=write_json,
-        seen_path=CLUE_SEEN_PATH, incremental=incremental)
+        seen_path=CLUE_SEEN_PATH, incremental=incremental,
+        include_prompt=include_prompt,
+        upload=upload, upload_url=upload_url, upload_token=upload_token,
+        upload_source="recommend")
     return md_path, json_path, candidates
 
 
 def gen_hashtag_clues(name=HASHTAG_NAME, short=HASHTAG_SHORT, write_json=False,
-                      incremental=True, seen_path=None):
+                      incremental=True, seen_path=None, include_prompt=False,
+                      upload=False, upload_url=None, upload_token=None):
     """读取 话题 评论库，生成 insight_<short>_<ts>.md（可选 .json）。
 
     incremental=True 时只分析「上次之后新出现」的评论，避免每小时观点雷同。
+    include_prompt=True 时在文末追加「发给大模型的提示词」区块（默认 False，适合人工阅读）。
     """
     # 确保库表结构存在（首次运行/空库时不报错）
     _hdb = HashtagDB(HASH_DB)
@@ -125,7 +132,9 @@ def gen_hashtag_clues(name=HASHTAG_NAME, short=HASHTAG_SHORT, write_json=False,
     sp = seen_path or insight_extractor.seen_path_for(short)
     md_path, json_path, candidates = generate_clue_files(
         comments, meta, HASH_EXPORT, prefix, write_json=write_json,
-        seen_path=sp, incremental=incremental)
+        seen_path=sp, incremental=incremental, include_prompt=include_prompt,
+        upload=upload, upload_url=upload_url, upload_token=upload_token,
+        upload_source="hashtag")
     return md_path, json_path, candidates
 
 
@@ -146,6 +155,8 @@ def parse_args():
                    help="跳过每轮的价值线索生成")
     p.add_argument("--json", dest="write_json", action="store_true",
                    help="额外导出结构化 JSON（默认只产出 md）")
+    p.add_argument("--prompt", dest="include_prompt", action="store_true",
+                   help="在文末追加「发给大模型的提示词」区块（默认关闭，适合自己直接阅读）")
     p.add_argument("--full", dest="full", action="store_true",
                    help="全量分析（默认增量：只分析新出现的评论，分析过的不再重复）")
     p.add_argument("--reset-seen", dest="reset_seen", action="store_true",
@@ -161,6 +172,13 @@ def parse_args():
                    help="抓取间隔下限（分钟）")
     p.add_argument("--interval-max", type=int, default=60,
                    help="抓取间隔上限（分钟）")
+    # ── 上传到 Cloudflare Worker（雪球雷达 · 线索台）──
+    p.add_argument("--upload", action="store_true",
+                   help="每轮自动上传线索到 Worker（默认关闭；也可用环境变量 WORKER_URL/ WORKER_TOKEN 配置）")
+    p.add_argument("--worker-url", default=None,
+                   help="Worker 接收地址，如 https://xueqiu.你的域名.com/api/ingest")
+    p.add_argument("--worker-token", default=None,
+                   help="上传鉴权 token（与 Worker 端 INGEST_TOKEN 一致）")
     return p.parse_args()
 
 
@@ -191,6 +209,21 @@ def main():
     _scraper_mod.CLUE_INCREMENTAL = not args.full
     _do_incremental = not args.full
 
+    # 上传到 Worker 的配置（命令行优先，其次环境变量 WORKER_URL / WORKER_TOKEN）
+    upload_enabled = args.upload
+    worker_url = args.worker_url or os.environ.get("WORKER_URL") or ""
+    worker_token = args.worker_token or os.environ.get("WORKER_TOKEN") or ""
+    if upload_enabled:
+        _scraper_mod.UPLOAD_ENABLED = True
+        _scraper_mod.UPLOAD_URL = worker_url
+        _scraper_mod.UPLOAD_TOKEN = worker_token
+        insight_extractor.UPLOAD_ENABLED = True
+        insight_extractor.UPLOAD_URL = worker_url
+        insight_extractor.UPLOAD_TOKEN = worker_token
+        _print(f"  [上传] 已开启 → {worker_url or '(未配置 WORKER_URL)'}")
+    else:
+        _print("  [上传] 未开启（如需上传请加 --upload 或设环境变量 WORKER_URL/ WORKER_TOKEN）")
+
     # 清空「已分析评论」记录（如需重新基线）
     if args.reset_seen:
         for p in (CLUE_SEEN_PATH, insight_extractor.SEEN_PATH):
@@ -208,13 +241,23 @@ def main():
     if args.clues:
         if do_recommend and not args.no_clues:
             try:
-                md, _, c = gen_recommend_clues(write_json=args.write_json)
+                md, _, c = gen_recommend_clues(write_json=args.write_json,
+                                               incremental=_do_incremental,
+                                               include_prompt=args.include_prompt,
+                                               upload=upload_enabled,
+                                               upload_url=worker_url,
+                                               upload_token=worker_token)
                 _print(f"推荐线索: {len(c)} 条候选 -> {md}")
             except Exception as e:
                 _print(f"推荐线索提取失败: {e}")
         if do_hashtag and not args.no_clues:
             try:
-                md, _, c = gen_hashtag_clues(write_json=args.write_json, incremental=_do_incremental)
+                md, _, c = gen_hashtag_clues(write_json=args.write_json,
+                                             incremental=_do_incremental,
+                                             include_prompt=args.include_prompt,
+                                             upload=upload_enabled,
+                                             upload_url=worker_url,
+                                             upload_token=worker_token)
                 _print(f"话题线索: {len(c)} 条候选 -> {md}")
             except Exception as e:
                 _print(f"话题线索提取失败: {e}")
@@ -283,7 +326,10 @@ def main():
                     if not args.no_clues:
                         md, _, c = gen_hashtag_clues(
                             name=htag.name, short=htag.short,
-                            write_json=args.write_json, incremental=_do_incremental)
+                            write_json=args.write_json, incremental=_do_incremental,
+                            include_prompt=args.include_prompt,
+                            upload=upload_enabled, upload_url=worker_url,
+                            upload_token=worker_token)
                         _print(f"  话题线索 {len(c)} 条 -> {md}")
                 except Exception as e:
                     _print(f"  [!] 话题抓取/线索异常: {e}")
@@ -291,7 +337,12 @@ def main():
             # ── 价值线索提取（推荐侧，统一策略）──
             if not args.no_clues and do_recommend:
                 try:
-                    md, _, c = gen_recommend_clues(write_json=args.write_json)
+                    md, _, c = gen_recommend_clues(write_json=args.write_json,
+                                                   incremental=_do_incremental,
+                                                   include_prompt=args.include_prompt,
+                                                   upload=upload_enabled,
+                                                   upload_url=worker_url,
+                                                   upload_token=worker_token)
                     _print(f"  推荐线索 {len(c)} 条 -> {md}")
                 except Exception as e:
                     _print(f"  [!] 推荐线索提取失败: {e}")

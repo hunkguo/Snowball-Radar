@@ -141,10 +141,18 @@ class HashtagDB:
                 like_count INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT 0,
                 time_str TEXT,
+                reply_count INTEGER DEFAULT 0,
                 first_seen TEXT,
                 last_updated TEXT
             )
         """)
+        # 迁移：老库 comments 表可能无 reply_count 列，补齐（评论收到的回复数，用于「有交互」打分）
+        try:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(comments)")]
+            if "reply_count" not in cols:
+                c.execute("ALTER TABLE comments ADD COLUMN reply_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
         c.execute("CREATE INDEX IF NOT EXISTS idx_hc_post ON comments(post_id)")
         c.execute("CREATE TABLE IF NOT EXISTS posts (id TEXT PRIMARY KEY, author TEXT, hashtag TEXT, first_seen TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -172,13 +180,14 @@ class HashtagDB:
         now = datetime.now().isoformat()
         self.conn.execute(
             """INSERT INTO comments(id,post_id,post_author,hashtag,text,user_id,user_name,
-               like_count,created_at,time_str,first_seen,last_updated)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+               like_count,created_at,time_str,reply_count,first_seen,last_updated)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
-                 text=excluded.text, like_count=excluded.like_count, last_updated=excluded.last_updated""",
+                 text=excluded.text, like_count=excluded.like_count,
+                 reply_count=excluded.reply_count, last_updated=excluded.last_updated""",
             (c["id"], c["post_id"], c["post_author"], c.get("hashtag", HASHTAG_NAME), c["text"],
              c["user_id"], c["user_name"], c["like_count"], c["created_at"],
-             c["time_str"], now, now))
+             c["time_str"], c.get("reply_count", 0) or 0, now, now))
         self.conn.commit()
 
     def count(self):
@@ -400,6 +409,7 @@ class XueqiuHashtagScraper:
                         "like_count": cm.get("like_count", 0) or 0,
                         "created_at": int(ca) // 1000 if ca > 10**12 else int(ca),
                         "time_str": cm.get("timeStr") or cm.get("timeBefore") or "",
+                        "reply_count": cm.get("reply_count", 0) or 0,
                     }
                     self.db.save_comment(row)
                     saved_this += 1

@@ -114,13 +114,16 @@ def is_meaningless(text):
     return False
 
 
-def score_comment(text, like_count=0):
+def score_comment(text, like_count=0, reply_count=0):
     """对单条评论做 Layer 1 规则打分。
 
     返回 (score, tags, stocks)：
       score  : 整数，越高越可能是有价值线索
-      tags   : 命中的标签列表，如 ["code:600xxx", "stock:澜起科技", "event:合作"]
+      tags   : 命中的标签列表，如 ["code:600xxx", "stock:澜起科技", "event:合作", "interact:replies(3)"]
       stocks : 命中的标准标的名列表
+
+    reply_count: 该评论收到的回复数（雪球评论对象标准字段），代表「引发了互动/讨论」，
+                 是社区对一条评论的二次认可信号，与点赞互补（高赞未必有讨论，有讨论未必高赞）。
     """
     if is_meaningless(text):
         return -100, [], []
@@ -164,6 +167,14 @@ def score_comment(text, like_count=0):
     elif like_count >= 10:
         s += 1
 
+    # 6) 互动加权（该评论引发了回复/讨论）
+    if reply_count >= 5:
+        s += 3
+        tags.append("interact:replies(%d)" % reply_count)
+    elif reply_count >= 1:
+        s += 2
+        tags.append("interact:replies(%d)" % reply_count)
+
     return s, tags, stocks
 
 
@@ -181,7 +192,8 @@ def extract_clues(comments, threshold=5, max_candidates=80):
     for c in comments:
         text = c.get("text", "") or ""
         like = c.get("like_count", 0) or 0
-        score, tags, stocks = score_comment(text, like)
+        reply = c.get("reply_count", 0) or 0
+        score, tags, stocks = score_comment(text, like, reply)
         if score < threshold:
             continue
         candidates.append({
@@ -190,6 +202,7 @@ def extract_clues(comments, threshold=5, max_candidates=80):
             "post_author": c.get("post_author", "") or "",
             "time_str": c.get("time_str", "") or "",
             "like_count": like,
+            "reply_count": reply,
             "text": text,
             "score": score,
             "tags": tags,
@@ -199,16 +212,30 @@ def extract_clues(comments, threshold=5, max_candidates=80):
             "hashtag": c.get("hashtag", "") or "",
         })
 
+    # 防御性去重：同一评论 id 只保留首次出现，避免同一条评论被重复计入
+    _seen = set()
+    _uniq = []
+    for c in candidates:
+        cid = str(c.get("id", ""))
+        if cid and cid in _seen:
+            continue
+        if cid:
+            _seen.add(cid)
+        _uniq.append(c)
+    candidates = _uniq
+
     candidates.sort(key=lambda x: (x["score"], x["like_count"]), reverse=True)
     if max_candidates:
         candidates = candidates[:max_candidates]
 
-    # 按标的分组；未识别标的归入「（未识别标的/综合）」
+    # 按标的分组：每条评论只归入「首个标的」组（primary group），
+    # 避免一条跨标的评论在多个标的组里重复出现；其提及的其他标的
+    # 会在行首以【标的1/标的2】标签标注，便于跨标的检索，但不重复罗列。
     groups = {}
     for c in candidates:
         keys = c["stocks"] if c["stocks"] else ["（未识别标的/综合）"]
-        for k in keys:
-            groups.setdefault(k, []).append(c)
+        primary = keys[0]
+        groups.setdefault(primary, []).append(c)
     groups = dict(sorted(groups.items(),
                          key=lambda kv: max(x["score"] for x in kv[1]),
                          reverse=True))
@@ -232,64 +259,77 @@ def split_new_comments(comments, seen_ids):
     return new, len(comments) - len(new)
 
 
-def render_clues_markdown(candidates, groups, meta):
-    """生成可直接阅读的 markdown 价值线索日报，含可复制的大模型提示词。"""
+def render_clues_markdown(candidates, groups, meta, include_prompt=False):
+    """生成**适合人工直接阅读**的价值线索日报。
+
+    设计目标（2026-09-18 优化）：
+      - 每条评论**只出现一次**（按首个标的分组，跨标的以行首【...】标签标注，不重复罗列）
+      - 去掉原先重复的「Top 30 表格」与「发给大模型提示词」区块（后者仅 include_prompt=True 时保留）
+      - 保留每条评论的 **时间** 与 **作者**，以及点赞/回复数，便于人工判断信息时效与可信度
+      - 增量模式在头部明确标注「本轮新增」，跳过/累计已分析数，强调不重复
+
+    include_prompt=True 时，文末追加「可直接复制给大模型」的提示词区块
+    （少数想交给 AI 做深度分析的场景用）。
+    """
     title = meta.get("title", "雪球评论 · 价值线索（Layer 1 规则）")
     context_desc = meta.get("context_desc", "雪球用户评论，经规则筛选出的「可能有价值」线索。")
     threshold = meta.get("threshold", 5)
     total = meta.get("total_comments", 0)
     n = len(candidates)
-    max_llm = meta.get("max_llm_candidates", 80)
 
     L = []
     L.append(f"# {title}\n")
     L.append(f"> 生成时间：{meta.get('generated_at', '')}")
-    L.append(f"> 候选评论：**{n}** 条 / 本轮分析 {total} 条（规则打分 ≥ {threshold}，已剔除灌水）")
+    L.append(f"> 本轮**新增**候选：**{n}** 条（规则打分 ≥ {threshold}，已剔除灌水）")
     if meta.get("incremental"):
         skipped = meta.get("skipped_count", 0)
         seen_total = meta.get("seen_total", 0)
-        L.append(f"> 模式：**增量分析**（本轮只分析新出现的评论）"
-                 f"｜跳过已分析 {skipped} 条｜累计已分析 {seen_total} 条")
-    L.append(f"> 说明：{context_desc}复制文末【提示词】区块发给任意大模型，即可获得结构化分析与小道消息日报。\n")
+        L.append(f"> 增量分析：跳过已分析 {skipped} 条，累计已分析 {seen_total} 条（历史已分析内容不再重复列出）")
+    else:
+        L.append(f"> 全量分析：本轮扫描 {total} 条评论")
+    L.append("")
 
     if not candidates:
         L.append("## 本轮无新增价值线索\n")
         if meta.get("incremental"):
-            L.append("本轮没有新出现的评论（或新评论未达打分阈值），"
-                     "说明社区观点与上一轮雷同，**无需重复分析**。\n")
+            L.append("本轮没有新出现的评论达到阈值，社区观点与上一轮雷同，**无需重复阅读**。\n")
         else:
             L.append("（本轮未筛出达到阈值的候选评论）\n")
+        if include_prompt:
+            L.append(_render_prompt_block(candidates, meta, context_desc))
+        return "\n".join(L)
 
-    # 一、按标的分组
-    L.append("## 一、按标的分组\n")
+    # 一、按标的分组（每条评论仅列一次，组内按分数降序）
+    L.append("## 按标的分组（每条评论仅列一次，组内按分数降序）\n")
     if not groups:
         L.append("（本轮未筛出达到阈值的候选评论）\n")
     for stock, items in groups.items():
         L.append(f"### {stock}（{len(items)} 条）\n")
         for i, c in enumerate(items, 1):
-            like = c["like_count"]
             who = c["user_name"]
             when = c["time_str"]
-            sec = f" [{c['section']}]" if c.get("section") else ""
-            L.append(f"{i}. 【赞{like}】{who}{sec}（{when}）：{c['text']}")
+            like = c["like_count"]
+            rcnt = c.get("reply_count") or 0
+            # 行首标注该评论提及的全部标的（跨标的评论可见归属，不重复罗列正文）
+            stock_tag = "【" + "/".join(c["stocks"]) + "】" if c["stocks"] else ""
+            eng = f"赞{like}"
+            if rcnt:
+                eng += f" · 回{rcnt}"
+            who_disp = f"**{who}**" if who else "（匿名）"
+            L.append(f"{i}. {stock_tag}{who_disp}（{when} · {eng}）：{c['text']}")
         L.append("")
 
-    # 二、按分数排名 Top 30
-    L.append("## 二、按分数排名（Top 30）\n")
-    L.append("| 分数 | 标的 | 事件标签 | 用户 | 板块 | 赞 | 内容 |")
-    L.append("|------|------|----------|------|------|----|------|")
-    for c in candidates[:30]:
-        stocks = ",".join(c["stocks"]) or "—"
-        ev = ",".join(t.replace("event:", "") for t in c["tags"] if t.startswith("event:")) or "—"
-        sec = c.get("section", "") or "—"
-        text = c["text"].replace("|", "丨").replace("\n", " ")
-        if len(text) > 40:
-            text = text[:40] + "…"
-        L.append(f"| {c['score']} | {stocks} | {ev} | {c['user_name']} | {sec} | {c['like_count']} | {text} |")
-    L.append("")
+    if include_prompt:
+        L.append(_render_prompt_block(candidates, meta, context_desc))
 
-    # 三、发给大模型的提示词
-    L.append("## 三、发给大模型的提示词（复制此区块）\n")
+    return "\n".join(L)
+
+
+def _render_prompt_block(candidates, meta, context_desc):
+    """（可选）文末追加「可直接复制给大模型」的提示词区块。"""
+    max_llm = meta.get("max_llm_candidates", 80)
+    L = []
+    L.append("## 发给大模型的提示词（复制此区块）\n")
     L.append("```text")
     L.append("你是一名 A 股题材与小道消息分析助手。下面是雪球评论中、")
     L.append("经规则筛选出的「可能有价值」评论候选池（已剔除灌水）。")
@@ -326,7 +366,6 @@ def render_clues_markdown(candidates, groups, meta):
     L.append("- 无法核实或明显臆测的内容，单独归入「存疑/待验证」，并说明理由。")
     L.append("- 文末附「一句话总结」与「风险提示」（注明信息来自社区评论，非投资建议）。")
     L.append("```\n")
-
     return "\n".join(L)
 
 
@@ -376,13 +415,18 @@ def _save_seen(path, seen):
 
 
 def generate_clue_files(comments, meta, export_dir, prefix="clues",
-                        write_json=False, seen_path=None, incremental=True):
+                        write_json=False, seen_path=None, incremental=True,
+                        include_prompt=False,
+                        upload=False, upload_url=None, upload_token=None,
+                        upload_source="unknown"):
     """价值线索成品的「单一产出入口」：筛选 + 渲染 + 落盘。
 
     两个抓取程序（推荐/热门、话题）与统一入口 xueqiu.py 都走这里，
     保证输出格式完全一致。
 
-    默认**只产出 md**（整理内容 + 可直接复制的大模型提示词，供人工发给大模型）；
+    默认**只产出 md**（整理内容，适合人工直接阅读）；
+    include_prompt=True 时在文末追加「可直接复制给大模型」的提示词区块
+    （用于想把候选池交给 AI 做深度分析的少数场景）；
     结构化 JSON 仅在 write_json=True 时额外产出（可通过 --json 开启）。
 
     增量分析（incremental=True 且给了 seen_path 时）：
@@ -397,6 +441,7 @@ def generate_clue_files(comments, meta, export_dir, prefix="clues",
         write_json : 是否同时写出结构化 JSON（默认 False）
         seen_path  : 已分析 id 记录文件路径（None 则不做增量记忆）
         incremental: 是否启用增量分析（False = 每次都分析全量）
+        include_prompt: 是否在文末追加「发给大模型的提示词」区块（默认 False，人工阅读不需要）
     返回: (md_path, json_path, candidates)；未写 JSON 时 json_path 为 None
     """
     os.makedirs(export_dir, exist_ok=True)
@@ -439,12 +484,22 @@ def generate_clue_files(comments, meta, export_dir, prefix="clues",
 
     md_path = os.path.join(export_dir, f"{prefix}_{ts}.md")
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write(render_clues_markdown(candidates, groups, meta))
+        f.write(render_clues_markdown(candidates, groups, meta, include_prompt=include_prompt))
 
     # 标记本轮分析过的评论（含未达阈值的），下轮不再重复分析
     if use_incremental:
         seen |= {str(c.get("id", "")) for c in comments}
         seen.discard("")
         _save_seen(seen_path, seen)
+
+    # 上传到 Cloudflare Worker（雪球雷达 · 线索台）。失败不影响本地落盘。
+    if upload and upload_url and upload_token:
+        try:
+            from uploader import build_payload, upload_round
+            payload = build_payload(meta, candidates, comments, source=upload_source)
+            code, body = upload_round(payload, upload_url, upload_token)
+            print(f"  [上传] Worker 返回 {code}：{body}")
+        except Exception as e:
+            print(f"  [上传][!] 上传失败（已忽略，不影响本地）: {e}")
 
     return md_path, json_path, candidates
