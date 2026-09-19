@@ -142,7 +142,8 @@ xueqiu-radar/
 ├─ migrations/
 │  ├─ 0001_init.sql         # D1 建表（rounds / clues）
 │  ├─ 0002_ts_and_cleanup.sql  # 增量：加 ts 列 + 清理索引
-│  └─ 0003_drop_raw_comments.sql  # 删除只写不读的 raw_comments 表
+│  ├─ 0003_drop_raw_comments.sql  # 删除只写不读的 raw_comments 表
+│  └─ 0004_add_date.sql      # 增量：clues 加 date 列（真实发布日期，北京时间），前台显示今天/昨天/X小时前
 ├─ worker/
 │  └─ index.js             # Worker 后端（ingest / rounds / clues / cleanup / 静态托管）
 └─ src/                    # Vue 前台

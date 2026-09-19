@@ -81,21 +81,60 @@ const roundMap = computed(() => {
   return m;
 });
 
-function pad(n) {
+function pad2(n) {
   return String(n).padStart(2, "0");
 }
-// ts（unix 秒）-> YYYY-MM-DD；缺 ts 归入「未知日期」
-function dayOf(c) {
-  if (!c.ts) return "未知日期";
-  const d = new Date(c.ts * 1000);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+// 今天 / 昨天的 YYYY-MM-DD（按浏览器本地日期；用户为北京时间，与评论日期口径一致）
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+function yesterdayStr() {
+  const d = new Date(Date.now() - 86400000);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+// 评论真实日期：优先用服务端存的 c.date（北京时间，YYYY-MM-DD）；
+// 旧行无 date 时从 time_str 解析（兼容 "YYYY-MM-DD ..." 与 "MM-DD ..." 两种格式）
+function dateStr(c) {
+  if (c.date) return c.date;
+  const t = c.time_str || "";
+  let m = t.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return `${m[1]}-${pad2(+m[2])}-${pad2(+m[3])}`;
+  m = t.match(/(\d{1,2})-(\d{1,2})/);
+  if (m) return `${new Date().getFullYear()}-${pad2(+m[1])}-${pad2(+m[2])}`;
+  return "";
+}
+
+// 日期分隔标题：今天 / 昨天 / YYYY-MM-DD（date 永远有值，理论上不再出现「未知日期」）
+function dayLabel(d) {
+  if (!d) return "未知日期";
+  if (d === todayStr()) return "今天";
+  if (d === yesterdayStr()) return "昨天";
+  return d;
+}
+
+// 卡片时间标签：刚刚 / X分钟前 / X小时前 / 今天 / 昨天 / 日期
+function relTime(c) {
+  const d = dateStr(c);
+  if (c.ts) {
+    const diff = Math.floor(Date.now() / 1000) - c.ts;
+    if (diff < 60) return "刚刚";
+    if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
+    // 仅当与今天同属一天才显示「X小时前」，避免跨天被误判为几小时前
+    if (d === todayStr() && diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
+  }
+  if (!d) return "（时间未知）";
+  if (d === todayStr()) return "今天";
+  if (d === yesterdayStr()) return "昨天";
+  return d;
 }
 
 // 按「日期」分段（时间线视觉分隔，不做任何关联推算）
 const timeline = computed(() => {
   const map = {};
   for (const c of clues.value) {
-    const day = dayOf(c);
+    const day = dateStr(c) || "未知日期";
     (map[day] = map[day] || []).push(c);
   }
   return Object.entries(map).sort((a, b) =>
@@ -147,10 +186,10 @@ function scoreClass(s) {
       </div>
 
       <div v-for="[day, items] in timeline" :key="day">
-        <div class="day-divider">{{ day }}</div>
+        <div class="day-divider">{{ dayLabel(day) }}</div>
         <div v-for="c in items" :key="c.round_id + '_' + c.clue_id" class="clue">
           <div class="head">
-            <span class="time">{{ c.time_str || "（时间未知）" }}</span>
+            <span class="time" :title="c.time_str">{{ relTime(c) }}</span>
             <span class="who">{{ c.user_name || "（匿名）" }}</span>
             <span
               v-if="roundMap[c.round_id] && roundMap[c.round_id].source"

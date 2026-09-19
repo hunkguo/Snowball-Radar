@@ -39,16 +39,39 @@ function makeRoundId(meta) {
   return `${g}__${(slug || "").slice(0, 24)}`;
 }
 
-// 把 "MM-DD HH:MM" + 年份 解析成 unix 秒；解析失败返回 0（未知时间）
-function parseTs(timeStr, yearHint) {
-  const m = (timeStr || "").match(/(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})/);
-  if (!m) return 0;
-  const y = Number(yearHint) || new Date().getFullYear();
-  const mo = Number(m[1]), d = Number(m[2]), h = Number(m[3]), mi = Number(m[4]);
-  if (mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
-  const dt = new Date(y, mo - 1, d, h, mi);
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+// 把「年/月/日/时/分」按北京时间（GMT+8）转成真实 unix 秒，并返回 YYYY-MM-DD 日期串。
+// 雪球时间均为北京时间，故用 Date.UTC 构造后再减 8 小时，得到与绝对时刻一致的 epoch，
+// 这样前端「X小时前」的相对计算才准确（不受 Worker 运行时所在时区影响）。
+function toDateTs(y, mo, d, h, mi) {
+  const date = `${y}-${pad2(mo)}-${pad2(d)}`;
+  const dt = new Date(Date.UTC(y, mo - 1, d, h - 8, mi));
   const t = Math.floor(dt.getTime() / 1000);
-  return isNaN(t) ? 0 : t;
+  return { ts: isNaN(t) ? 0 : t, date };
+}
+
+// 解析评论时间字符串，返回 { ts, date }：
+//   支持 "YYYY-MM-DD HH:MM" 或 "MM-DD HH:MM"（缺年份时用 yearHint 兜底）
+function parseTs(timeStr, yearHint) {
+  const s = timeStr || "";
+  let m = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})/);
+  if (m) return toDateTs(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]));
+  m = s.match(/(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})/);
+  if (m) {
+    const y = Number(yearHint) || new Date().getUTCFullYear();
+    return toDateTs(y, Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]));
+  }
+  return { ts: 0, date: "" };
+}
+
+// 解析轮次 generated_at（"YYYY-MM-DD HH:MM:SS"，抓取/上传时间），作为评论时间缺失时的兜底
+function parseGeneratedAt(g) {
+  const m = (g || "").match(/(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})/);
+  if (!m) return { ts: 0, date: "" };
+  return toDateTs(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]));
 }
 
 async function ingest(body, env) {
@@ -65,6 +88,7 @@ async function ingest(body, env) {
   const totalComments = meta.total_comments != null ? meta.total_comments : comments.length;
   const createdAt = Date.now();
   const yearHint = (generatedAt || roundId).slice(0, 4);
+  const gen = parseGeneratedAt(generatedAt); // 评论时间缺失时兜底用上传时间
 
   const stmts = [];
 
@@ -77,14 +101,16 @@ async function ingest(body, env) {
     ).bind(roundId, source, title, hashtag, generatedAt, candidateCount, totalComments, createdAt)
   );
 
-  // 2) 候选线索（按 round_id + clue_id 覆盖），ts 用于时间线排序
+  // 2) 候选线索（按 round_id + clue_id 覆盖），ts 用于排序，date 为真实发布日期（北京时间）
   for (const c of candidates) {
-    const ts = parseTs(c.time_str, yearHint);
+    const p = parseTs(c.time_str, yearHint);
+    const ts = p.ts || gen.ts;        // 时间串解析不出则用上传时间兜底
+    const date = p.date || gen.date;  // 避免出现未知日期
     stmts.push(
       env.DB.prepare(
         `INSERT OR REPLACE INTO clues
-           (round_id, clue_id, user_name, time_str, like_count, reply_count, text, score, tags, stocks, section, ts)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           (round_id, clue_id, user_name, time_str, like_count, reply_count, text, score, tags, stocks, section, ts, date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         roundId,
         String(c.id != null ? c.id : ""),
@@ -97,7 +123,8 @@ async function ingest(body, env) {
         JSON.stringify(c.tags || []),
         JSON.stringify(c.stocks || []),
         c.section || "",
-        ts
+        ts,
+        date
       )
     );
   }
