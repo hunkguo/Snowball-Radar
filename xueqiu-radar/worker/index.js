@@ -102,29 +102,8 @@ async function ingest(body, env) {
     );
   }
 
-  // 3) 原始评论（按 id 全局去重，重复时只更新所属轮次）
-  for (const c of comments) {
-    const ts = parseTs(c.time_str, yearHint);
-    stmts.push(
-      env.DB.prepare(
-        `INSERT OR REPLACE INTO raw_comments
-           (id, round_id, user_name, time_str, like_count, reply_count, text, hashtag, post_id, created_at, ts)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(
-        String(c.id != null ? c.id : ""),
-        roundId,
-        c.user_name || "",
-        c.time_str || "",
-        Number(c.like_count) || 0,
-        Number(c.reply_count) || 0,
-        c.text || "",
-        c.hashtag || "",
-        c.post_id || "",
-        Number(c.created_at) || 0,
-        ts
-      )
-    );
-  }
+  // 注：原始评论不再单独落库（raw_comments 已删除）。
+  // comments 仅用于本次统计 total_comments，候选线索已写入 clues。
 
   // 分批写入（D1 单次 batch 上限 100）
   for (let i = 0; i < stmts.length; i += BATCH_LIMIT) {
@@ -206,7 +185,6 @@ async function handleClues(env, url) {
 async function cleanup(env) {
   const cutoff = Date.now() - KEEP_DAYS * 24 * 3600 * 1000;
   const delClues = await env.DB.prepare("DELETE FROM clues WHERE ts > 0 AND ts < ?").bind(cutoff).run();
-  const delRaw = await env.DB.prepare("DELETE FROM raw_comments WHERE ts > 0 AND ts < ?").bind(cutoff).run();
   const delRounds = await env.DB.prepare("DELETE FROM rounds WHERE created_at > 0 AND created_at < ?").bind(cutoff).run();
   return {
     ok: true,
@@ -214,7 +192,6 @@ async function cleanup(env) {
     cutoff: new Date(cutoff).toISOString(),
     deleted: {
       clues: (delClues && delClues.meta && delClues.meta.changes) || 0,
-      raw_comments: (delRaw && delRaw.meta && delRaw.meta.changes) || 0,
       rounds: (delRounds && delRounds.meta && delRounds.meta.changes) || 0,
     },
   };

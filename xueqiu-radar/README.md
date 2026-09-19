@@ -92,7 +92,7 @@ python xueqiu.py --upload --worker-url https://xueqiu.你的域名.com/api/inges
 - `--upload` 默认**关闭**，需显式开启（没部署 Worker 时空跑也不会报错，只是跳过上传）。
 - 上传 payload：`{ round_id, meta, candidates, comments }`，其中：
   - `candidates` = Layer1 打分后的候选线索（前台**时间线**展示的就是它，按评论发布时间排序）
-  - `comments`   = 本轮实际分析的原始评论（去重累积进 D1 的 raw_comments，便于回看）
+  - `comments`   = 本轮实际分析的原始评论（仅用于统计总数，不再单独落库；候选线索已写入 clues）
 - 上传失败会被**静默吞掉并打印日志**，不影响本地抓取与落盘。
 - 重新打包 EXE 后，EXE 同样支持 `--upload` 等参数。
 
@@ -125,7 +125,7 @@ python xueqiu.py --upload --worker-url https://xueqiu.你的域名.com/api/inges
   ```bash
   curl -X POST https://xueqiu.你的域名.com/api/cleanup \
     -H "Authorization: Bearer <你的token>"
-  # 返回示例：{"ok":true,"keep_days":10,"deleted":{"clues":12,"raw_comments":30,"rounds":2}}
+  # 返回示例：{"ok":true,"keep_days":10,"deleted":{"clues":12,"rounds":2}}
   ```
 - 只删除有真实时间（`ts>0`/`created_at>0`）且早于 cutoff 的记录；无时间字段的遗留行不会被误删。
 
@@ -140,8 +140,9 @@ xueqiu-radar/
 ├─ vite.config.js
 ├─ index.html
 ├─ migrations/
-│  ├─ 0001_init.sql         # D1 建表（rounds / clues / raw_comments）
-│  └─ 0002_ts_and_cleanup.sql  # 增量：加 ts 列 + 清理索引
+│  ├─ 0001_init.sql         # D1 建表（rounds / clues）
+│  ├─ 0002_ts_and_cleanup.sql  # 增量：加 ts 列 + 清理索引
+│  └─ 0003_drop_raw_comments.sql  # 删除只写不读的 raw_comments 表
 ├─ worker/
 │  └─ index.js             # Worker 后端（ingest / rounds / clues / cleanup / 静态托管）
 └─ src/                    # Vue 前台
