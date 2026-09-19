@@ -1,0 +1,28 @@
+name = "xueqiu-radar"
+main = "worker/index.js"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 静态资源（Vue 构建产物）+ SPA 路由
+assets = { directory = "./dist", binding = "ASSETS", not_found_handling = "single-page-application" }
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "xueqiu-radar-db"
+database_id = "01af2cb4-51ea-41c5-b03d-698e2962050f"
+
+# 每日定时清理：删除 KEEP_DAYS(10) 天前的数据
+# Cron 语法：分 时 日 月 周；下方 = 每天 UTC 16:00（北京时间 00:00）执行
+# 免费版 Cloudflare 也支持 cron，但触发器数量有限；如免费版不可用，可改用 POST /api/cleanup 手动清理
+[[triggers]]
+crons = ["0 16 * * *"]
+
+# 说明：
+# 1) 先跑 `wrangler d1 create xueqiu-radar-db` 拿到 database_id 填到上面
+# 2) 建表：`wrangler d1 execute xueqiu-radar-db --local --file=./migrations/0001_init.sql`（本地）
+#          `wrangler d1 execute xueqiu-radar-db --remote --file=./migrations/0001_init.sql`（线上）
+# 3) 上传鉴权 token（务必用 secret，别写进仓库）：
+#          `wrangler secret put INGEST_TOKEN`
+#    然后粘贴 token（与 xueqiu.exe 配置里的 --worker-token 一致）
+# 4) 自定义域名 + 优选 IP 的访问方案见 README.md

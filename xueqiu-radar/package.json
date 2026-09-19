@@ -1,0 +1,23 @@
+{
+  "name": "xueqiu-radar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "雪球雷达 · 线索台：接收 xueqiu.exe 上传的雪球评论线索，前台展示",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "npm run build && wrangler deploy",
+    "db:local": "wrangler d1 migrations apply xueqiu-radar-db --local",
+    "db:remote": "wrangler d1 migrations apply xueqiu-radar-db --remote"
+  },
+  "dependencies": {
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "vite": "^8.3.0",
+    "wrangler": "^4.135.0"
+  }
+}
