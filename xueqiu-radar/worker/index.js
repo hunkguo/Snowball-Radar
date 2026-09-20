@@ -209,14 +209,18 @@ async function handleClues(env, url) {
 }
 
 // 清理 KEEP_DAYS 天前的数据（ts/created_at 早于 cutoff 的）
+// ⚠️ 单位陷阱：clues.ts 存的是「秒」，rounds.created_at 存的是「毫秒」。
+// cutoff 必须分别换算，否则拿毫秒级 cutoff 去比较秒级 ts，会让所有 clues 被误删
+// （这正是此前每天 00:00 Cron 把线索清空的原因）。
 async function cleanup(env) {
-  const cutoff = Date.now() - KEEP_DAYS * 24 * 3600 * 1000;
-  const delClues = await env.DB.prepare("DELETE FROM clues WHERE ts > 0 AND ts < ?").bind(cutoff).run();
-  const delRounds = await env.DB.prepare("DELETE FROM rounds WHERE created_at > 0 AND created_at < ?").bind(cutoff).run();
+  const cutoffMs = Date.now() - KEEP_DAYS * 24 * 3600 * 1000; // 毫秒（用于 rounds.created_at）
+  const cutoffSec = Math.floor(cutoffMs / 1000);              // 秒（用于 clues.ts）
+  const delClues = await env.DB.prepare("DELETE FROM clues WHERE ts > 0 AND ts < ?").bind(cutoffSec).run();
+  const delRounds = await env.DB.prepare("DELETE FROM rounds WHERE created_at > 0 AND created_at < ?").bind(cutoffMs).run();
   return {
     ok: true,
     keep_days: KEEP_DAYS,
-    cutoff: new Date(cutoff).toISOString(),
+    cutoff: new Date(cutoffMs).toISOString(),
     deleted: {
       clues: (delClues && delClues.meta && delClues.meta.changes) || 0,
       rounds: (delRounds && delRounds.meta && delRounds.meta.changes) || 0,
