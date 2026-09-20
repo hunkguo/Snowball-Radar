@@ -11,8 +11,9 @@ export async function fetchRounds() {
   return data.rounds || [];
 }
 
-// 拉取一页线索（分页 + 服务端筛选）
-// params: { stock, q, min, order, limit, offset }
+// 拉取一页线索（分页 + 服务端筛选 + 排序）
+// params: { stock, q, min, order, sort, limit, offset }
+//   sort: "ts"(默认，按时间) | "jev"(按 Jev 价值分降序)
 // 返回: { clues, total, has_more, limit, offset }
 export async function fetchCluesPage(params = {}) {
   const p = new URLSearchParams();
@@ -20,6 +21,7 @@ export async function fetchCluesPage(params = {}) {
   if (params.q) p.set("q", params.q);
   if (params.min != null) p.set("min", String(params.min));
   if (params.order) p.set("order", params.order);
+  if (params.sort) p.set("sort", params.sort);
   if (params.limit != null) p.set("limit", String(params.limit));
   if (params.offset != null) p.set("offset", String(params.offset));
   const data = await getJson("/api/clues?" + p.toString());
