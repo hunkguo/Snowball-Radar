@@ -74,8 +74,7 @@ from insight_extractor import load_comments, build_comment_dicts  # noqa: E402
 #  价值线索提取（统一产出）
 # ──────────────────────────────────────────────
 def gen_recommend_clues(write_json=False, incremental=True, include_prompt=False,
-                        upload=False, upload_url=None, upload_token=None,
-                        jev_api_key=None):
+                        upload=False, upload_url=None, upload_token=None):
     """读取 推荐/热门 评论库，生成 clues_<ts>.md（可选 .json）。
 
     incremental=True 时只分析「上次之后新出现」的评论，避免每小时观点雷同。
@@ -103,14 +102,13 @@ def gen_recommend_clues(write_json=False, incremental=True, include_prompt=False
         seen_path=CLUE_SEEN_PATH, incremental=incremental,
         include_prompt=include_prompt,
         upload=upload, upload_url=upload_url, upload_token=upload_token,
-        upload_source="recommend", jev_api_key=jev_api_key)
+        upload_source="recommend")
     return md_path, json_path, candidates
 
 
 def gen_hashtag_clues(name=HASHTAG_NAME, short=HASHTAG_SHORT, write_json=False,
                       incremental=True, seen_path=None, include_prompt=False,
-                      upload=False, upload_url=None, upload_token=None,
-                      jev_api_key=None):
+                      upload=False, upload_url=None, upload_token=None):
     """读取 话题 评论库，生成 insight_<short>_<ts>.md（可选 .json）。
 
     incremental=True 时只分析「上次之后新出现」的评论，避免每小时观点雷同。
@@ -136,7 +134,7 @@ def gen_hashtag_clues(name=HASHTAG_NAME, short=HASHTAG_SHORT, write_json=False,
         comments, meta, HASH_EXPORT, prefix, write_json=write_json,
         seen_path=sp, incremental=incremental, include_prompt=include_prompt,
         upload=upload, upload_url=upload_url, upload_token=upload_token,
-        upload_source="hashtag", jev_api_key=jev_api_key)
+        upload_source="hashtag")
     return md_path, json_path, candidates
 
 
@@ -181,12 +179,6 @@ def parse_args():
                    help="Worker 接收地址，如 https://xueqiu.你的域名.com/api/ingest")
     p.add_argument("--worker-token", default=None,
                    help="上传鉴权 token（与 Worker 端 INGEST_TOKEN 一致）")
-    # ── Jev 语义价值判断（opt-in，需 API Key，默认关闭）──
-    p.add_argument("--jev", action="store_true",
-                   help="启用 Jev（TypeSafe System One）对候选评论做投资价值打分；"
-                        "需同时提供 key（--jev-key 或环境变量 JEV_API_KEY / TYPESAFE_API_KEY）")
-    p.add_argument("--jev-key", default=None,
-                   help="Jev API Key（也可设环境变量 JEV_API_KEY 或 TYPESAFE_API_KEY）")
     return p.parse_args()
 
 
@@ -232,16 +224,6 @@ def main():
     else:
         _print("  [上传] 未开启（如需上传请加 --upload 或设环境变量 WORKER_URL/ WORKER_TOKEN）")
 
-    # Jev 语义价值判断（opt-in）：仅 --jev 且能拿到 key 才启用，否则保持离线
-    jev_key = (args.jev_key
-               or os.environ.get("JEV_API_KEY")
-               or os.environ.get("TYPESAFE_API_KEY") or "")
-    jev_api_key = jev_key if (args.jev and jev_key) else None
-    if args.jev and not jev_key:
-        _print("  [Jev] 已加 --jev 但未找到 key（--jev-key / 环境变量 JEV_API_KEY / TYPESAFE_API_KEY），将跳过 Jev 打分")
-    elif jev_api_key:
-        _print("  [Jev] 已开启 → 候选评论将经 TypeSafe Jev 做投资价值打分（仅规则高分候选）")
-
     # 清空「已分析评论」记录（如需重新基线）
     if args.reset_seen:
         for p in (CLUE_SEEN_PATH, insight_extractor.SEEN_PATH):
@@ -264,8 +246,7 @@ def main():
                                                include_prompt=args.include_prompt,
                                                upload=upload_enabled,
                                                upload_url=worker_url,
-                                               upload_token=worker_token,
-                                               jev_api_key=jev_api_key)
+                                               upload_token=worker_token)
                 _print(f"推荐线索: {len(c)} 条候选 -> {md}")
             except Exception as e:
                 _print(f"推荐线索提取失败: {e}")
@@ -276,8 +257,7 @@ def main():
                                              include_prompt=args.include_prompt,
                                              upload=upload_enabled,
                                              upload_url=worker_url,
-                                             upload_token=worker_token,
-                                             jev_api_key=jev_api_key)
+                                             upload_token=worker_token)
                 _print(f"话题线索: {len(c)} 条候选 -> {md}")
             except Exception as e:
                 _print(f"话题线索提取失败: {e}")
@@ -349,7 +329,7 @@ def main():
                             write_json=args.write_json, incremental=_do_incremental,
                             include_prompt=args.include_prompt,
                             upload=upload_enabled, upload_url=worker_url,
-                            upload_token=worker_token, jev_api_key=jev_api_key)
+                            upload_token=worker_token)
                         _print(f"  话题线索 {len(c)} 条 -> {md}")
                 except Exception as e:
                     _print(f"  [!] 话题抓取/线索异常: {e}")
@@ -362,8 +342,7 @@ def main():
                                                    include_prompt=args.include_prompt,
                                                    upload=upload_enabled,
                                                    upload_url=worker_url,
-                                                   upload_token=worker_token,
-                                                   jev_api_key=jev_api_key)
+                                                   upload_token=worker_token)
                     _print(f"  推荐线索 {len(c)} 条 -> {md}")
                 except Exception as e:
                     _print(f"  [!] 推荐线索提取失败: {e}")

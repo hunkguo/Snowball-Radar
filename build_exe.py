@@ -91,7 +91,6 @@ def run():
         "--hidden-import", "scraper",
         "--hidden-import", "hashtag_comments",
         "--hidden-import", "uploader",
-        "--hidden-import", "jev_client",
         SCRAPER_FILE,
     ]
 

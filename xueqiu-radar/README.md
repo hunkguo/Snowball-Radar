@@ -129,27 +129,6 @@ python xueqiu.py --upload --worker-url https://xueqiu.你的域名.com/api/inges
   ```
 - 只删除有真实时间（`ts>0`/`created_at>0`）且早于 cutoff 的记录；无时间字段的遗留行不会被误删。
 
-### Jev 价值打分（opt-in，默认关闭）
-
-用 [TypeSafe Jev](https://docs.typesafe.ai)（System One 模型）对**规则高分候选**逐条打「A股投资参考价值」分（0~1），作为排序辅助信号。它**只出分数、不替你改写/生成内容**，与你"自己读评论"的初衷不冲突。
-
-- **前置**：从 [console.typesafe.ai/keys](https://console.typesafe.ai/keys) 拿 API Key（目前 early access / waitlist）。价格约 `$0.042 / 1M input tokens`，历史全量回填约 `$0.002`，日常可忽略。
-- **启用方式**（二选一）：
-  ```bash
-  # 1) 命令行
-  python xueqiu.py --upload --jev --jev-key <你的JevKey>
-  # 或回填历史：
-  python backfill_d1.py --worker-url https://xueqiu.cn24.org/api/ingest --worker-token <token> --jev --jev-key <你的JevKey>
-
-  # 2) 环境变量（免每次传参）
-  export JEV_API_KEY=<你的JevKey>     # 也可用 TYPESAFE_API_KEY
-  python xueqiu.py --upload --jev
-  ```
-- **行为**：仅当 `--jev` 且能拿到 key 时才联网；否则完全离线。失败自动降级（`jev_value=0`，不中断抓取/上传）。
-- **网络**：`api.typesafe.ai` 在大陆可能不稳/被墙，脚本已内置读 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量；需要时先 `export HTTPS_PROXY=...` 再跑。
-- **结果落库**：`clues.jev_value`（REAL）。前台点「按价值 ↓」即按该分降序浏览；卡片显示「价值 N%」标签（仅已评估且分>0 时）。
-- **调用范围**：只对在 `clue_extractor.extract_clues` 里**已过规则阈值**（≥ threshold）的候选打分，聚焦高价值、控量。
-
 ---
 
 ## 六、目录结构
@@ -165,7 +144,6 @@ xueqiu-radar/
 │  ├─ 0002_ts_and_cleanup.sql  # 增量：加 ts 列 + 清理索引
 │  ├─ 0003_drop_raw_comments.sql  # 删除只写不读的 raw_comments 表
 │  └─ 0004_add_date.sql      # 增量：clues 加 date 列（真实发布日期，北京时间），前台显示今天/昨天/X小时前
-│  └─ 0005_add_jev_value.sql # 增量：clues 加 jev_value 列（Jev 投资参考价值分，0~1，opt-in）
 ├─ worker/
 │  └─ index.js             # Worker 后端（ingest / rounds / clues / cleanup / 静态托管）
 └─ src/                    # Vue 前台

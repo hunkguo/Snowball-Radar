@@ -64,7 +64,7 @@ def row_to_group_key(d, group_by):
     return None
 
 
-def backfill(source, db_path, group_by, url, token, dry_run, threshold=5, jev_api_key=None):
+def backfill(source, db_path, group_by, url, token, dry_run, threshold=5):
     cols_of_interest = [
         "id", "post_id", "post_author", "hashtag", "text",
         "user_name", "user_screen_name", "like_count", "time_str", "created_at",
@@ -86,7 +86,7 @@ def backfill(source, db_path, group_by, url, token, dry_run, threshold=5, jev_ap
 
     for gkey, gcomments in sorted(groups.items()):
         candidates, _ = ce.extract_clues(
-            gcomments, threshold=threshold, max_candidates=5000, jev_api_key=jev_api_key
+            gcomments, threshold=threshold, max_candidates=5000
         )
         # 用该组最新评论的真实发布时间作为轮次时间（便于 rounds 视图展示与兜底）
         gen_at = "2026-09-19 12:00:00"
@@ -122,15 +122,10 @@ def main():
     ap.add_argument("--worker-token", default=None, help="Bearer token")
     ap.add_argument("--threshold", type=int, default=0,
                     help="候选最低分（回填默认 0 = 收录所有非灌水评论；线上实时上传用 5）")
-    ap.add_argument("--jev", action="store_true",
-                   help="对候选评论启用 Jev（TypeSafe）投资价值打分；需 --jev-key 或环境变量 JEV_API_KEY / TYPESAFE_API_KEY")
-    ap.add_argument("--jev-key", default=None, help="Jev API Key")
     args = ap.parse_args()
 
     url = args.worker_url or os.environ.get("WORKER_URL") or ""
     token = args.worker_token or os.environ.get("WORKER_TOKEN") or ""
-    jev_key = args.jev_key or os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY") or ""
-    jev_api_key = jev_key if (args.jev and jev_key) else None
 
     if not args.dry_run and (not url or not token):
         print("[!] 非 dry-run 模式需要 --worker-url 与 --worker-token（或环境变量 WORKER_URL/WORKER_TOKEN）")
@@ -153,7 +148,7 @@ def main():
     n, c = backfill(
         "hashtag", os.path.join(BASE, "data", "hashtag_comments.db"),
         group_by="hashtag", url=url, token=token,
-        dry_run=args.dry_run, threshold=args.threshold, jev_api_key=jev_api_key,
+        dry_run=args.dry_run, threshold=args.threshold,
     )
     total_rounds += n
     total_cands += c
@@ -162,7 +157,7 @@ def main():
     n, c = backfill(
         "recommend", os.path.join(BASE, "data", "xueqiu.db"),
         group_by=None, url=url, token=token,
-        dry_run=args.dry_run, threshold=args.threshold, jev_api_key=jev_api_key,
+        dry_run=args.dry_run, threshold=args.threshold,
     )
     total_rounds += n
     total_cands += c

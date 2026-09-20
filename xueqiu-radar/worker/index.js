@@ -109,8 +109,8 @@ async function ingest(body, env) {
     stmts.push(
       env.DB.prepare(
         `INSERT OR REPLACE INTO clues
-           (round_id, clue_id, user_name, time_str, like_count, reply_count, text, score, tags, stocks, section, ts, date, jev_value)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           (round_id, clue_id, user_name, time_str, like_count, reply_count, text, score, tags, stocks, section, ts, date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         roundId,
         String(c.id != null ? c.id : ""),
@@ -124,8 +124,7 @@ async function ingest(body, env) {
         JSON.stringify(c.stocks || []),
         c.section || "",
         ts,
-        date,
-        Number(c.jev_value) || 0
+        date
       )
     );
   }
@@ -150,8 +149,7 @@ function parseQuery(url) {
   const q = (url.searchParams.get("q") || "").trim();
   const min = url.searchParams.get("min");
   const minScore = min != null && min !== "" ? Math.max(parseInt(min, 10) || 0, 0) : null;
-  const sort = url.searchParams.get("sort") === "jev" ? "jev" : "ts";
-  return { limit, offset, order, stock, q, minScore, sort };
+  return { limit, offset, order, stock, q, minScore };
 }
 
 // 组装 WHERE 与绑定参数
@@ -184,7 +182,7 @@ async function handleRounds(env, url) {
 }
 
 async function handleClues(env, url) {
-  const { limit, offset, order, stock, q, minScore, sort } = parseQuery(url);
+  const { limit, offset, order, stock, q, minScore } = parseQuery(url);
   const round = url.searchParams.get("round") || "";
   const { clause, binds } = buildWhere({ stock, q, minScore, round });
 
@@ -193,13 +191,8 @@ async function handleClues(env, url) {
   ).bind(...binds).all();
   const total = (t && t[0] && t[0].n) || 0;
 
-  // 排序：默认按时间(ts)；sort=jev 时按 Jev 价值分降序（价值优先浏览）
-  const orderBy = sort === "jev"
-    ? "jev_value DESC, ts DESC"
-    : `ts ${order}, score DESC`;
-
   const { results } = await env.DB.prepare(
-    `SELECT * FROM clues ${clause} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
+    `SELECT * FROM clues ${clause} ORDER BY ts ${order}, score DESC LIMIT ? OFFSET ?`
   ).bind(...binds, limit, offset).all();
   const clues = (results || []).map((r) => ({
     ...r,

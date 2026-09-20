@@ -1337,8 +1337,7 @@ class XueqiuScraper:
 
     def extract_and_save_clues(self, include_prompt=CLUE_INCLUDE_PROMPT,
                                upload=UPLOAD_ENABLED, upload_url=UPLOAD_URL,
-                               upload_token=UPLOAD_TOKEN, upload_source=UPLOAD_SOURCE,
-                               jev_api_key=None):
+                               upload_token=UPLOAD_TOKEN, upload_source=UPLOAD_SOURCE):
         """Layer 1 价值线索提取：扫描全部评论，筛选有价值线索并保存成品文件。
 
         产出（data/exports/ 下，带时间戳，不覆盖历史）：
@@ -1374,7 +1373,7 @@ class XueqiuScraper:
             write_json=EXPORT_JSON, seen_path=CLUE_SEEN_PATH,
             incremental=CLUE_INCREMENTAL, include_prompt=include_prompt,
             upload=upload, upload_url=upload_url, upload_token=upload_token,
-            upload_source=upload_source, jev_api_key=jev_api_key)
+            upload_source=upload_source)
 
         self._log(f"\n{'='*60}")
         self._log(f"价值线索提取完成（Layer 1）！")

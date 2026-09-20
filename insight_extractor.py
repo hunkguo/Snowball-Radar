@@ -96,7 +96,7 @@ def build_comment_dicts(rows):
 def main(write_json=False, incremental=INCREMENTAL, short=None, name=None,
          seen_path=None, include_prompt=INCLUDE_LLM_PROMPT,
          upload=UPLOAD_ENABLED, upload_url=UPLOAD_URL, upload_token=UPLOAD_TOKEN,
-         upload_source=UPLOAD_SOURCE, jev_api_key=None):
+         upload_source=UPLOAD_SOURCE):
     if not os.path.exists(DB_PATH):
         print(f"[错误] 未找到数据库：{DB_PATH}\n请先运行 hashtag_comments.py 抓取评论。")
         return
@@ -127,7 +127,7 @@ def main(write_json=False, incremental=INCREMENTAL, short=None, name=None,
         write_json=write_json, seen_path=seen_path, incremental=incremental,
         include_prompt=include_prompt,
         upload=upload, upload_url=upload_url, upload_token=upload_token,
-        upload_source=upload_source, jev_api_key=jev_api_key)
+        upload_source=upload_source)
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Layer 1 提取完成"
           + ("（增量：只分析新评论）" if incremental else "（全量）"))
