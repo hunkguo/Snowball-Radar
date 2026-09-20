@@ -270,12 +270,41 @@ def score_comment(text, like_count=0, reply_count=0):
     return s, tags, stocks
 
 
-def extract_clues(comments, threshold=5, max_candidates=80):
+def _enrich_with_jev(candidates, api_key, model="jev-latest", timeout=15):
+    """对候选列表逐条调用 Jev 打分，把结果写回各候选 dict。
+
+    失败（网络/解析/单条异常）的候选保持默认 0 值，不影响其余候选。
+    仅依赖 jev_client（零第三方依赖），首次调用时惰性 import，避免强耦合。
+    """
+    try:
+        from jev_client import judge_comment
+    except Exception:
+        # jev_client 缺失或导入失败：静默跳过，候选维持 jev 默认值
+        return
+    for c in candidates:
+        try:
+            res = judge_comment(c.get("text", ""), api_key, model=model, timeout=timeout)
+            c["jev_value"] = res.get("value", 0.0)
+            c["jev_has_signal"] = res.get("has_signal", 0.0)
+            c["jev_is_noise"] = res.get("is_noise", 0.0)
+            c["jev_model"] = res.get("model", "")
+            c["jev_ok"] = res.get("ok", False)
+        except Exception:
+            # 单条失败不影响整体
+            continue
+
+
+def extract_clues(comments, threshold=5, max_candidates=80, jev_api_key=None):
     """从评论列表中筛选有价值线索并按标的分组。
 
     comments: 元素为 dict，建议包含字段
         id, text, like_count, user_name, time_str,
         以及可选 section / post_id / post_author / hashtag 用于上下文。
+    jev_api_key: 可选。传入 TypeSafe Jev API Key 时，对**规则高分候选**（已通过
+        threshold 筛选）逐条调用 Jev 打「投资参考价值」分（0~1），结果写入候选的
+        jev_value / jev_has_signal / jev_is_noise / jev_model / jev_ok 字段。
+        为 None 或空字符串时完全跳过，保持离线、无网络依赖。调用失败自动降级
+        （jev_value=0, jev_ok=False），不中断主流程。
     返回 (candidates, groups)：
         candidates: 排序后的候选列表（分数降序 -> 点赞降序）
         groups    : { 标的名: [candidate,...] }，按组内最高分降序
@@ -306,7 +335,17 @@ def extract_clues(comments, threshold=5, max_candidates=80):
             "section": c.get("section", "") or "",
             "post_id": c.get("post_id", "") or "",
             "hashtag": c.get("hashtag", "") or "",
+            # Jev 语义打分（默认 0，启用后由 _enrich_with_jev 填充）
+            "jev_value": 0.0,
+            "jev_has_signal": 0.0,
+            "jev_is_noise": 0.0,
+            "jev_model": "",
+            "jev_ok": False,
         })
+
+    # Layer 2 语义判断（opt-in）：仅对规则高分候选调 Jev，控制调用量与聚焦高价值
+    if jev_api_key:
+        _enrich_with_jev(candidates, jev_api_key)
 
     # 防御性去重：同一评论 id 只保留首次出现，避免同一条评论被重复计入
     _seen = set()
@@ -514,7 +553,8 @@ def generate_clue_files(comments, meta, export_dir, prefix="clues",
                         write_json=False, seen_path=None, incremental=True,
                         include_prompt=False,
                         upload=False, upload_url=None, upload_token=None,
-                        upload_source="unknown"):
+                        upload_source="unknown",
+                        jev_api_key=None):
     """价值线索成品的「单一产出入口」：筛选 + 渲染 + 落盘。
 
     两个抓取程序（推荐/热门、话题）与统一入口 xueqiu.py 都走这里，
@@ -564,6 +604,7 @@ def generate_clue_files(comments, meta, export_dir, prefix="clues",
         comments,
         threshold=meta.get("threshold", 5),
         max_candidates=meta.get("max_llm_candidates", 80),
+        jev_api_key=jev_api_key,
     )
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 

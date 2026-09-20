@@ -19,6 +19,7 @@ const stockFilter = ref("");
 const minScore = ref(0);
 const search = ref("");
 const asc = ref(false); // false = 最新在前（倒序时间线）
+const sort = ref("ts"); // "ts"=按时间(默认) | "jev"=按 Jev 价值分降序
 
 onMounted(loadInitial);
 
@@ -27,6 +28,7 @@ const currentParams = computed(() => ({
   q: search.value.trim(),
   min: minScore.value || 0,
   order: asc.value ? "asc" : "desc",
+  sort: sort.value,
   limit: PAGE,
 }));
 
@@ -130,6 +132,13 @@ function relTime(c) {
   return d;
 }
 
+// Jev 投资参考价值标签：仅当已由 Jev 评估(jev_ok)且分>0 时显示「价值 N%」
+function jevLabel(c) {
+  const v = c.jev_value;
+  if (typeof v === "number" && v > 0 && c.jev_ok) return Math.round(v * 100) + "%";
+  return "";
+}
+
 // 按「日期」分段（时间线视觉分隔，不做任何关联推算）
 const timeline = computed(() => {
   const map = {};
@@ -162,6 +171,9 @@ function scoreClass(s) {
         </div>
       </div>
       <div class="topbar-actions">
+        <button @click="sort = (sort === 'jev' ? 'ts' : 'jev'); onFilterChange()">
+          {{ sort === "jev" ? "按时间 ↓" : "按价值 ↓" }}
+        </button>
         <button @click="asc = !asc; onFilterChange()">{{ asc ? "正序 ↑" : "倒序 ↓" }}</button>
         <button @click="loadInitial">刷新</button>
       </div>
@@ -202,6 +214,7 @@ function scoreClass(s) {
 
           <div class="meta">
             <span :class="['score', scoreClass(c.score)]">分 {{ c.score || 0 }}</span>
+            <span v-if="jevLabel(c)" class="jev" :title="`Jev 投资参考价值 ${jevLabel(c)}`">价值 {{ jevLabel(c) }}</span>
             <span>赞 {{ c.like_count || 0 }}</span>
             <span v-if="c.reply_count">· 回 {{ c.reply_count }}</span>
             <span v-for="(s, i) in (c.stocks || [])" :key="i" class="stock">{{ s }}</span>
