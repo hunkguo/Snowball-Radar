@@ -102,6 +102,16 @@ def _kill_stale_chrome(profile_dir, log=None):
         return 0
 
 
+def _is_waf_page_text(text):
+    """判断页面文本是否为雪球 WAF/风控挑战页（而非正常内容）。"""
+    if not text:
+        return False
+    t = text.lower()
+    return ("_waf" in t or "renderdata" in t or "人机验证" in text
+            or "请求过于频繁" in text or "访问验证" in text or "security challenge" in t
+            or "请完成安全验证" in text)
+
+
 DB_PATH = os.path.join(DATA_DIR, "hashtag_comments.db")
 EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 
@@ -349,34 +359,64 @@ class XueqiuHashtagScraper:
         并不是 /hashtag/ 链接。这些搜索页与话题页共用 article.timeline__item 帖子结构
         和 comments 评论接口，因此抓取逻辑完全通用。
 
-        之前的实现误以为话题是 /hashtag/ 链接，导致整页只有 footer 的两条 /hashtag/
-        链接（#我给雪球提建议# / #防诈骗举报专区#）被过滤词挡掉，于是报 no hashtag links。
+        鲁棒性（2026-09-22 增补）：
+        - 雪球首页现常被 WAF 挑战页拦截：真实浏览器导航后挑战 JS 会写入 cookie 再重定向，
+          因此最多重试 3 次，每次等挑战 JS 执行完（检测 _waf / renderData / 人机验证 等）。
+        - 话题盒子 class 可能随改版变化，故先等精准盒子；等不到则放宽到页面任意
+          a[href*='/k?q='] 链接（帖子正文里的 #话题# 也行，总比回退到失效配置强）。
         """
-        try:
-            page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
-        except Exception as e:
-            _log(f"  打开首页失败: {e}")
-            return None, None
-        try:
-            page.wait_for_selector("div.board.board__topic a[href*='/k?q=']", timeout=20000)
+        for attempt in range(3):
+            try:
+                page.goto("https://xueqiu.com/", wait_until="domcontentloaded", timeout=25000)
+            except Exception as e:
+                _log(f"  打开首页失败(尝试{attempt+1}): {e}")
+                return None, None
+            try:
+                # 优先等右侧热点话题盒子
+                page.wait_for_selector("div.board.board__topic a[href*='/k?q=']", timeout=12000)
+                sel = "div.board.board__topic a[href*='/k?q=']"
+            except Exception:
+                # 布局可能变化，退而求其次取页面任意 /k?q= 链接
+                try:
+                    page.wait_for_selector("a[href*='/k?q=']", timeout=8000)
+                    sel = "a[href*='/k?q=']"
+                except Exception:
+                    # 两者都没有：可能是 WAF 挑战页，检查后重试
+                    try:
+                        txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+                    except Exception:
+                        txt = ""
+                    if _is_waf_page_text(txt):
+                        _log(f"  首页仍处 WAF 挑战页(尝试{attempt+1})，等待挑战 JS 执行后重试…")
+                        page.wait_for_timeout(6000)
+                        continue
+                    if attempt == 2:
+                        _log("  等待热门话题链接超时（首页布局可能变化），放弃自动发现")
+                        return None, None
+                    page.wait_for_timeout(2000)
+                    continue
             page.wait_for_timeout(800)  # 让列表完全渲染
-        except Exception as e:
-            _log(f"  等待热门话题盒子超时（首页布局可能变化）: {e}")
-            return None, None
-        res = page.evaluate("""() => {
-            const box = document.querySelector('div.board.board__topic') || document;
-            const a = box.querySelector("a[href*='/k?q=']");
-            if (!a) return {error: 'no topic link'};
-            const href = a.getAttribute('href') || '';
-            const title = (a.textContent || '').trim();
-            return {href, title};
-        }""")
-        if isinstance(res, dict) and res.get("href") and res.get("title"):
-            url = res["href"]
-            if url.startswith("/"):
-                url = "https://xueqiu.com" + url
-            return url, res["title"]
-        _log(f"  热门话题解析失败: {res}")
+            res = page.evaluate("""(sel) => {
+                const box = document.querySelector('div.board.board__topic')
+                          || document.querySelector('.topic-hot__list')
+                          || document;
+                const a = box.querySelector(sel) || document.querySelector("a[href*='/k?q=']");
+                if (!a) return {error: 'no topic link'};
+                const href = a.getAttribute('href') || '';
+                const title = (a.textContent || '').trim();
+                return {href, title};
+            }""", sel)
+            if isinstance(res, dict) and res.get("href"):
+                url = res["href"]
+                if url.startswith("/"):
+                    url = "https://xueqiu.com" + url
+                title = res.get("title", "")
+                _log(f"  自动发现最新热门话题: {title or url}")
+                return url, title
+            if attempt == 2:
+                _log(f"  热门话题解析失败: {res}")
+                return None, None
+            page.wait_for_timeout(2000)
         return None, None
 
     def scrape_once(self):
@@ -403,9 +443,12 @@ class XueqiuHashtagScraper:
                             self.short = _slugify(title)  # 按话题独立 seen 文件，避免串味
                         _log(f"自动发现最新热门话题: {self.name}")
                     else:
-                        _log("  自动发现未返回链接，沿用配置话题")
+                        # 自动发现失败：清空 URL 干净跳过，不再去 goto 失效的写死配置
+                        self.url = None
+                        _log("  自动发现未返回链接，本轮跳过话题抓取（不回退失效配置）")
                 except Exception as e:
-                    _log(f"  自动发现热门话题失败，沿用配置: {e}")
+                    self.url = None
+                    _log(f"  自动发现热门话题异常，本轮跳过: {e}")
 
             # 防御：配置/回退的话题 URL 可能已失效（雪球改版/重定向到下载），
             # 打开失败时不要让它拖累整轮抓取，跳过话题、直接收尾。
