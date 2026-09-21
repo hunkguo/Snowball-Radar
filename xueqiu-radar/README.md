@@ -136,10 +136,10 @@ python xueqiu.py --upload --worker-url https://xueqiu.你的域名.com/api/inges
 - **前置**：从 [console.typesafe.ai/keys](https://console.typesafe.ai/keys) 拿 API Key（目前 early access / waitlist）。价格约 `$0.042 / 1M input tokens`，历史全量回填约 `$0.002`，日常可忽略。
 - **启用方式**（二选一）：
   ```bash
-  # 1) 命令行
-  python xueqiu.py --upload --jev --jev-key <你的JevKey>
+  # 1) 命令行（token 直接作为 --jev-token 参数传入；--jev-key 仍兼容）
+  python xueqiu.py --upload --jev --jev-token <你的JevToken>
   # 或回填历史：
-  python backfill_d1.py --worker-url https://xueqiu.cn24.org/api/ingest --worker-token <token> --jev --jev-key <你的JevKey>
+  python backfill_d1.py --worker-url https://xueqiu.cn24.org/api/ingest --worker-token <token> --jev --jev-token <你的JevToken>
 
   # 2) 环境变量（免每次传参）
   export JEV_API_KEY=<你的JevKey>     # 也可用 TYPESAFE_API_KEY

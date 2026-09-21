@@ -123,13 +123,14 @@ def main():
     ap.add_argument("--threshold", type=int, default=0,
                     help="候选最低分（回填默认 0 = 收录所有非灌水评论；线上实时上传用 5）")
     ap.add_argument("--jev", action="store_true",
-                   help="对候选评论启用 Jev（TypeSafe）投资价值打分；需 --jev-key 或环境变量 JEV_API_KEY / TYPESAFE_API_KEY")
-    ap.add_argument("--jev-key", default=None, help="Jev API Key")
+                   help="对候选评论启用 Jev（TypeSafe）投资价值打分；需 --jev-token 或环境变量 JEV_API_KEY / TYPESAFE_API_KEY")
+    ap.add_argument("--jev-token", "--jev-key", default=None, dest="jev_token",
+                   help="Jev API Token / Key（也可设环境变量 JEV_API_KEY 或 TYPESAFE_API_KEY）")
     args = ap.parse_args()
 
     url = args.worker_url or os.environ.get("WORKER_URL") or ""
     token = args.worker_token or os.environ.get("WORKER_TOKEN") or ""
-    jev_key = args.jev_key or os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY") or ""
+    jev_key = args.jev_token or os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY") or ""
     jev_api_key = jev_key if (args.jev and jev_key) else None
 
     if not args.dry_run and (not url or not token):

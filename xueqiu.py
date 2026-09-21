@@ -181,12 +181,12 @@ def parse_args():
                    help="Worker 接收地址，如 https://xueqiu.你的域名.com/api/ingest")
     p.add_argument("--worker-token", default=None,
                    help="上传鉴权 token（与 Worker 端 INGEST_TOKEN 一致）")
-    # ── Jev 语义价值判断（opt-in，需 API Key，默认关闭）──
+    # ── Jev 语义价值判断（opt-in，需 token，默认关闭）──
     p.add_argument("--jev", action="store_true",
                    help="启用 Jev（TypeSafe System One）对候选评论做投资价值打分；"
-                        "需同时提供 key（--jev-key 或环境变量 JEV_API_KEY / TYPESAFE_API_KEY）")
-    p.add_argument("--jev-key", default=None,
-                   help="Jev API Key（也可设环境变量 JEV_API_KEY 或 TYPESAFE_API_KEY）")
+                        "需同时提供 token（--jev-token 或环境变量 JEV_API_KEY / TYPESAFE_API_KEY）")
+    p.add_argument("--jev-token", "--jev-key", default=None, dest="jev_token",
+                   help="Jev API Token / Key（也可设环境变量 JEV_API_KEY 或 TYPESAFE_API_KEY）")
     return p.parse_args()
 
 
@@ -233,12 +233,12 @@ def main():
         _print("  [上传] 未开启（如需上传请加 --upload 或设环境变量 WORKER_URL/ WORKER_TOKEN）")
 
     # Jev 语义价值判断（opt-in）：仅 --jev 且能拿到 key 才启用，否则保持离线
-    jev_key = (args.jev_key
+    jev_key = (args.jev_token
                or os.environ.get("JEV_API_KEY")
                or os.environ.get("TYPESAFE_API_KEY") or "")
     jev_api_key = jev_key if (args.jev and jev_key) else None
     if args.jev and not jev_key:
-        _print("  [Jev] 已加 --jev 但未找到 key（--jev-key / 环境变量 JEV_API_KEY / TYPESAFE_API_KEY），将跳过 Jev 打分")
+        _print("  [Jev] 已加 --jev 但未找到 token（--jev-token / 环境变量 JEV_API_KEY / TYPESAFE_API_KEY），将跳过 Jev 打分")
     elif jev_api_key:
         _print("  [Jev] 已开启 → 候选评论将经 TypeSafe Jev 做投资价值打分（仅规则高分候选）")
 
