@@ -945,9 +945,9 @@ class XueqiuScraper:
                     self._waf_hit = True
                     self._log("    ⚠ 命中雪球风控/WAF 挑战页，改用浏览器导航方式重试…")
                 else:
-                    self._log(f"    API 错误: {result.get('error', '?')}")
-                    if prev:
-                        self._log(f"    响应预览: {prev[:120]}")
+                    # 多为雪球 CSP 拦截了页内 fetch（connect-src 限制），
+                    # 走路径2 的浏览器导航方式即可正常拉到 JSON，属预期降级，无需担心
+                    self._log(f"    [fetch 直连被拦: {result.get('error', '?')}，改浏览器导航重试]")
         except Exception as e:
             self._log(f"    fetch 异常: {e}")
 
@@ -965,9 +965,15 @@ class XueqiuScraper:
             text = ""
             while _t.time() < deadline:
                 try:
+                    # 优先取 <pre>（Chrome JSON 查看器把原始 JSON 放这里），
+                    # 否则退取 body/根节点 innerText（同样含原始 JSON 文本）
                     text = page.evaluate(
-                        "() => (document.body ? document.body.innerText : '') "
-                        "|| (document.documentElement ? document.documentElement.innerText : '')"
+                        "() => {"
+                        "  const pre = document.querySelector('pre');"
+                        "  if (pre) return (pre.innerText || pre.textContent || '');"
+                        "  return (document.body ? document.body.innerText : '') "
+                        "    || (document.documentElement ? document.documentElement.innerText : '');"
+                        "}"
                     ) or ""
                 except Exception:
                     text = ""
@@ -983,7 +989,10 @@ class XueqiuScraper:
                 self._rsleep(8 + attempt * 2, 10 + attempt * 2)
                 continue
             try:
-                return json.loads(text)
+                parsed = json.loads(text)
+                if attempt == 1:
+                    self._log("    ✓ 浏览器导航重试成功，已拿到接口 JSON")
+                return parsed
             except Exception:
                 if self._is_waf_challenge(text):
                     continue
