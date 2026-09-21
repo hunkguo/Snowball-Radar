@@ -18,6 +18,7 @@ import os
 import re
 import sqlite3
 import sys
+import subprocess
 import time
 import random
 from datetime import datetime
@@ -65,6 +66,42 @@ def resolve_profile_dir():
             if _profile_has_login(c):
                 return c
     return default
+
+
+def _kill_stale_chrome(profile_dir, log=None):
+    """关闭任何仍占用本爬虫专用 Profile 的 Chrome 进程，避免每次运行堆积新窗口。
+
+    只匹配命令行含本 profile 目录的 chrome 进程，绝不动用户的默认浏览器。
+    """
+    if not profile_dir:
+        return 0
+    pd_bs = os.path.abspath(profile_dir).replace("/", "\\")
+    pd_fs = pd_bs.replace("\\", "/")
+    try:
+        if sys.platform.startswith("win"):
+            ps = (
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                "Where-Object { $_.CommandLine -and ("
+                "$_.CommandLine -like '*%s*' -or $_.CommandLine -like '*%s*') } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+                % (pd_bs, pd_fs)
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=30,
+            )
+        else:
+            subprocess.run(["pkill", "-f", pd_bs], capture_output=True, text=True, timeout=30)
+        if log:
+            log(f"    已清理残留 Chrome 进程（仅限本 profile，若有的话）")
+        time.sleep(1.5)  # 等待 SingletonLock 释放
+        return 1
+    except Exception as e:
+        if log:
+            log(f"    清理残留 Chrome 异常(可忽略): {e}")
+        return 0
+
+
 DB_PATH = os.path.join(DATA_DIR, "hashtag_comments.db")
 EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 
@@ -346,6 +383,8 @@ class XueqiuHashtagScraper:
         with sync_playwright() as pw:
             profile_dir = resolve_profile_dir()
             _log(f"  Chrome profile: {profile_dir}")
+            # 先清理上一次运行可能残留的 Chrome 窗口（同一 profile 只允许一个实例）
+            _kill_stale_chrome(profile_dir, log=_log)
             browser = pw.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
                 channel="chrome",
