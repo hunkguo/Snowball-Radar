@@ -112,6 +112,59 @@ def _is_waf_page_text(text):
             or "请完成安全验证" in text)
 
 
+def _nav_get_json(page, url, max_retry=3, log=None):
+    """真实浏览器导航拉取 JSON 接口（不用页内 fetch，避免被 WAF 抓特征）。
+
+    返回解析后的 dict；命中风控挑战页或解析失败时返回 None。
+    与 scraper._fetch_api 路径2 同思路：page.goto 是真实浏览器导航，由 Chromium
+    自带完整请求头 + 持久化 cookie，最难被风控标记为机器人。
+    """
+    for attempt in range(1, max_retry + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        except Exception as e:
+            if log:
+                log(f"    导航异常(尝试{attempt}): {e}")
+        # 轮询等待挑战 JS 执行/重定向完成（最多 ~15s）
+        deadline = time.time() + 15
+        text = ""
+        while time.time() < deadline:
+            try:
+                text = page.evaluate(
+                    "() => {"
+                    "  const pre = document.querySelector('pre');"
+                    "  if (pre) return (pre.innerText || pre.textContent || '');"
+                    "  return (document.body ? document.body.innerText : '') "
+                    "    || (document.documentElement ? document.documentElement.innerText : '');"
+                    "}"
+                ) or ""
+            except Exception:
+                text = ""
+            if not _is_waf_page_text(text):
+                break
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                break
+        if _is_waf_page_text(text):
+            if log:
+                log(f"    ⚠ 命中雪球风控挑战页(尝试{attempt})，等待 {8 + attempt*2}s 后重试…")
+            try:
+                page.wait_for_timeout((8 + attempt * 2) * 1000)
+            except Exception:
+                pass
+            continue
+        try:
+            return json.loads(text)
+        except Exception:
+            if _is_waf_page_text(text):
+                continue
+            if log:
+                log(f"    导航响应非 JSON: {text[:120]}")
+            return None
+    return None
+
+
 DB_PATH = os.path.join(DATA_DIR, "hashtag_comments.db")
 EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 
@@ -329,24 +382,25 @@ class XueqiuHashtagScraper:
         """)
 
     def _fetch_comments(self, page, post_id):
-        return page.evaluate("""
-            async (postId) => {
-              let all = [];
-              for (let p = 1; p <= %d; p++) {
-                const url = `https://xueqiu.com/statuses/comments.json?id=${postId}&page=${p}&count=20`;
-                try {
-                  const r = await fetch(url, { credentials: 'include' });
-                  const t = await r.text();
-                  let j; try { j = JSON.parse(t); } catch(e) { break; }
-                  const list = j.comments || j.list || [];
-                  if (!list.length) break;
-                  all = all.concat(list);
-                  if (list.length < 20) break;
-                } catch(e) { break; }
-              }
-              return all;
-            }
-        """ % self.max_comment_pages, post_id)
+        """拉取某帖评论（多页）。改用真实浏览器导航，不再用页内 fetch。
+
+        每页一次 page.goto（真实导航，难被风控标记），读取 <pre>/innerText 里的
+        JSON 解析累加；空页或返回非 JSON 即停止。
+        """
+        all_comments = []
+        for p in range(1, self.max_comment_pages + 1):
+            url = (f"https://xueqiu.com/statuses/comments.json"
+                   f"?id={post_id}&page={p}&count=20")
+            j = _nav_get_json(page, url, max_retry=2, log=_log)
+            if not j:
+                break
+            list_ = j.get("comments") or j.get("list") or []
+            if not list_:
+                break
+            all_comments.extend(list_)
+            if len(list_) < 20:
+                break
+        return all_comments
 
     def _discover_hot_topic(self, page):
         """打开雪球首页，从右侧「热门话题」盒子取第一个（最热）话题。
