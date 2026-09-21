@@ -639,4 +639,9 @@ def generate_clue_files(comments, meta, export_dir, prefix="clues",
         except Exception as e:
             print(f"  [上传][!] 上传失败（已忽略，不影响本地）: {e}")
 
+    # 诊断日志：每轮打印 DB 总评论 / 已分析跳过 / 本轮新分析 / 候选数，
+    # 便于定位「有轮次但无线索」类问题（增量去重吃光 or 爬虫没采到新评论）
+    print(f"  [clue] 诊断: DB总评论={total_all} 已分析跳过={skipped} 本轮新分析={total} "
+          f"候选={len(candidates)}" + (" (incremental)" if use_incremental else " (全量)"))
+
     return md_path, json_path, candidates

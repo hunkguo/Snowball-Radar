@@ -350,6 +350,7 @@ class XueqiuHashtagScraper:
                 user_data_dir=profile_dir,
                 channel="chrome",
                 headless=self.headless,
+                accept_downloads=False,
                 args=["--disable-blink-features=AutomationControlled"],
             )
             page = browser.pages[0] if browser.pages else browser.new_page()
@@ -366,7 +367,20 @@ class XueqiuHashtagScraper:
                         _log("  自动发现未返回链接，沿用配置话题")
                 except Exception as e:
                     _log(f"  自动发现热门话题失败，沿用配置: {e}")
-            page.goto(self.url, wait_until="domcontentloaded")
+
+            # 防御：配置/回退的话题 URL 可能已失效（雪球改版/重定向到下载），
+            # 打开失败时不要让它拖累整轮抓取，跳过话题、直接收尾。
+            if not self.url or not str(self.url).startswith("http"):
+                _log("  无有效话题 URL，跳过本轮话题抓取")
+                browser.close()
+                return 0
+            try:
+                page.goto(self.url, wait_until="domcontentloaded", timeout=25000)
+            except Exception as e:
+                _log(f"  [!] 打开话题页失败（可能已失效/触发下载）: {e}")
+                _log("      已跳过本轮话题抓取，不影响推荐/热门主流程")
+                browser.close()
+                return 0
             _log(f"已打开话题页: {self.name}")
             page.wait_for_timeout(5000)
 

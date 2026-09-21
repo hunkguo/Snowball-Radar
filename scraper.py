@@ -892,35 +892,104 @@ class XueqiuScraper:
     #  API 调用
     # ──────────────────────────────────────────────
 
-    def _fetch_api(self, page, url):
+    # 雪球风控/WAF 挑战页特征串（命中即说明请求被反爬拦了，而非接口本身报错）
+    _WAF_MARKERS = (
+        "renderData", "_waf", "<textarea", "cf-mitigated", "challenge-platform",
+        "verify you are human", "请求过于频繁", "访问过于频繁", "security challenge",
+        "captcha", "验证码", "请输入验证码", "人机验证", "操作过于频繁",
+    )
+
+    @classmethod
+    def _is_waf_challenge(cls, text):
+        if not text:
+            return False
+        t = text.lower()
+        return any(m.lower() in t for m in cls._WAF_MARKERS)
+
+    def _fetch_api(self, page, url, max_retry=3):
+        """拉取雪球 JSON 接口，带风控/WAF 自适应。
+
+        路径1：页内 fetch（最快，未触发风控时可用）。
+        路径2：若路径1 返回风控挑战页或解析失败，改用「真实浏览器导航 + 读取响应体」
+               —— 这种方式能跑通风控 JS、携带完整 cookie，通常可绕过挑战。
+        """
+        # ---------- 路径1：页内 fetch ----------
         try:
             result = page.evaluate("""
                 async (apiUrl) => {
                     try {
                         const resp = await fetch(apiUrl, {
-                            headers: {"Accept": "application/json"},
+                            headers: {
+                                "Accept": "application/json",
+                                "x-requested-with": "XMLHttpRequest",
+                            },
                             credentials: "include",
                         });
                         const text = await resp.text();
                         try {
                             return JSON.parse(text);
                         } catch {
-                            return {error: "json_parse_failed", status: resp.status, text: text.substring(0, 200)};
+                            return {error: "json_parse_failed", status: resp.status, text: text.substring(0, 300)};
                         }
                     } catch(e) {
                         return {error: e.toString()};
                     }
                 }
             """, url)
-            if result and "error" in result and "list" not in result and "items" not in result:
-                self._log(f"    API 错误: {result.get('error', '?')}")
-                if "text" in result:
-                    self._log(f"    响应预览: {result['text'][:100]}")
-                return None
-            return result
+            if result and isinstance(result, dict) and "error" not in result \
+                    and ("list" in result or "items" in result or "comments" in result):
+                return result
+            if result and isinstance(result, dict):
+                prev = result.get("text", "")
+                if self._is_waf_challenge(prev):
+                    self._waf_hit = True
+                    self._log("    ⚠ 命中雪球风控/WAF 挑战页，改用浏览器导航方式重试…")
+                else:
+                    self._log(f"    API 错误: {result.get('error', '?')}")
+                    if prev:
+                        self._log(f"    响应预览: {prev[:120]}")
         except Exception as e:
             self._log(f"    fetch 异常: {e}")
-            return None
+
+        # ---------- 路径2：真实导航 + 读取响应体 ----------
+        base = url.split("?")[0]
+        for attempt in range(1, max_retry + 1):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            except Exception as e:
+                # 可能转成下载、被挑战页拦截等，不致命，下面用响应体/页面 DOM 判断
+                self._log(f"    导航异常(尝试{attempt}): {e}")
+            # 轮询等待挑战 JS 执行/重定向完成（最多 ~15s）
+            import time as _t
+            deadline = _t.time() + 15
+            text = ""
+            while _t.time() < deadline:
+                try:
+                    text = page.evaluate(
+                        "() => (document.body ? document.body.innerText : '') "
+                        "|| (document.documentElement ? document.documentElement.innerText : '')"
+                    ) or ""
+                except Exception:
+                    text = ""
+                if not self._is_waf_challenge(text):
+                    break
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    break
+            if self._is_waf_challenge(text):
+                self._waf_hit = True
+                self._log(f"    ⚠ 仍命中雪球风控挑战页(尝试{attempt})，等待 {8 + attempt*2}s 后重试…")
+                self._rsleep(8 + attempt * 2, 10 + attempt * 2)
+                continue
+            try:
+                return json.loads(text)
+            except Exception:
+                if self._is_waf_challenge(text):
+                    continue
+                self._log(f"    导航响应非 JSON: {text[:120]}")
+                return None
+        return None
 
     # ──────────────────────────────────────────────
     #  帖子解析
@@ -1240,6 +1309,7 @@ class XueqiuScraper:
 
         # 重置 sections_data
         self.sections_data = {}
+        self._waf_hit = False
 
         # 访问首页
         self._log("正在访问雪球首页 …")
@@ -1309,6 +1379,16 @@ class XueqiuScraper:
         self._log(f"  累计轮次: {stats['runs']}")
         self._log(f"    推荐: {stats['recommend']}")
         self._log(f"    热门: {stats['hot']}")
+
+        if self._waf_hit:
+            self._log("")
+            self._log("  ⚠⚠⚠ 本轮命中雪球风控/WAF 挑战页（接口返回的是验证页而非 JSON）。")
+            self._log("  → 最常见原因：持久化 Profile 的登录 Cookie 已失效/过期，或当前 IP 被雪球限流。")
+            self._log("  → 处理建议：")
+            self._log("    1) 用该 Chrome 窗口重新登录 xueqiu.com（刷新 xq_a_token 等 Cookie）；")
+            self._log("    2) 或更换/重启网络出口 IP；")
+            self._log("    3) 临时调大抓取间隔（--interval-min/--interval-max），降低请求频率。")
+            self._log("  （程序已自动改用『浏览器导航』方式重试，若仍失败多为上述登录/限流问题。）")
 
         return run_id
 
