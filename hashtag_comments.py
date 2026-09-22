@@ -209,7 +209,10 @@ HEADLESS = True            # 无头模式（可后台运行）；需看登录过
 # 登录态下该页会变成个性化信息流，看不到热点榜。
 # 故本引擎全程用【非登录】上下文，与「推荐/关注」的登录态引擎（scraper.py）严格区分（"以区分"）。
 HOTSPOT_URL = "https://www.xueqiu.com/?category=hotspot"
-HOTSPOT_TOP_N = 5            # 每轮抓取的热点话题数（取榜单前 N）
+# 每轮抓取的热点话题数（取榜单前 N）。
+# 注：雪球热点榜页面（匿名态）稳定只渲染约 10 个话题，懒加载不会追加，
+# 故这里设为 10 即吃满页面能给的全部候选；如需降负载可调小。
+HOTSPOT_TOP_N = 10           # 每轮抓取的热点话题数（取榜单前 N，页面上限约 10）
 MAX_POSTS_PER_TOPIC = 15    # 单个热点话题最多抓取的帖子数（控制单轮时长/请求量）
 # 非登录桌面 UA：让话题详情页沿用 article.timeline__item + a[data-id] 结构（已有提取逻辑）
 GUEST_USER_AGENT = (
@@ -461,11 +464,12 @@ class XueqiuHashtagScraper:
         故最多重试 3 次，每次检测 _waf / renderData / 人机验证 等特征，命中则
         等待挑战 JS 执行完再重导航。
         """
+        _log(f"  阶段1 发现热点：以【匿名/非登录】状态访问 {HOTSPOT_URL}（热点榜仅匿名可见，不携带登录 Cookie）")
         for attempt in range(3):
             try:
                 page.goto(HOTSPOT_URL, wait_until="domcontentloaded", timeout=25000)
             except Exception as e:
-                _log(f"  打开热点榜失败(尝试{attempt+1}): {e}")
+                _log(f"  打开热点榜失败(尝试{attempt+1}/3): {e}")
                 page.wait_for_timeout(2000)
                 continue
             # 等待列表渲染 + 滚动触发懒加载
@@ -481,7 +485,7 @@ class XueqiuHashtagScraper:
             except Exception:
                 txt = ""
             if _is_waf_page_text(txt):
-                _log(f"  热点榜命中 WAF 挑战页(尝试{attempt+1})，等 6s 重试…")
+                _log(f"  ⚠ 热点榜命中 WAF 挑战页(尝试{attempt+1}/3)，等 6s 重试…")
                 page.wait_for_timeout(6000)
                 continue
             items = page.evaluate("""() => {
@@ -494,6 +498,7 @@ class XueqiuHashtagScraper:
                 });
                 return out;
             }""")
+            total_found = len(items)
             out = []
             for it in items[:top_n]:
                 url = it["url"]
@@ -503,10 +508,13 @@ class XueqiuHashtagScraper:
                     url = "https://xueqiu.com" + url
                 out.append((url, it["title"]))
             if out:
-                _log(f"  自动发现 {len(out)} 个热点话题(非登录): " + " | ".join(t for _, t in out))
+                _log(f"  ✅ 匿名访问成功：页面共解析到 {total_found} 个热点话题链接，本轮将抓取前 {len(out)} 个:")
+                for i, (_, t) in enumerate(out, 1):
+                    _log(f"     {i}. {t}")
                 return out
-            _log(f"  热点榜未解析到话题链接(尝试{attempt+1})，重试…")
+            _log(f"  ⚠ 热点榜未解析到话题链接(尝试{attempt+1}/3)，可能命中 WAF 或页面改版，重试…")
             page.wait_for_timeout(2000)
+        _log("  ⚠ 匿名发现热点失败：3 次尝试均未解析到话题链接。请检查网络/WAF，或关闭 AUTO_DISCOVER 手动指定 HASHTAG_URL。")
         return []
 
     def start_session(self, pw, login_ctx=None, login_page=None):
