@@ -182,6 +182,18 @@ POST_DELAY = (3, 6)        # 帖子间随机停顿（秒）
 COMMENT_PAGE_DELAY = (1, 3)
 HEADLESS = True            # 无头模式（可后台运行）；需看登录过程改为 False
 
+# ── 移动版伪装 ──
+# m.xueqiu.com 子域单独访问常被雪球拦截/重定向，故不再依赖它；
+# 改为给持久化 Chrome 上下文设置一个移动版 User-Agent + 移动视口，
+# 直接访问 https://xueqiu.com/ 就会吐出移动版首页（同样含「热门话题」链接），
+# 且移动版命中 WAF 挑战页的概率比桌面版低。
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
+    "Mobile/15E148 Safari/604.1"
+)
+MOBILE_VIEWPORT = {"width": 390, "height": 844}
+
 # ── 持续运行参数 ──
 CONTINUOUS = True               # True=持续运行; False=单次运行后退出
 RUN_INTERVAL_MIN = 45           # 抓取间隔下限（分钟）
@@ -367,9 +379,14 @@ class XueqiuHashtagScraper:
         return page.evaluate("""
             () => {
               const ids = new Map();
-              document.querySelectorAll('article.timeline__item').forEach(a => {
+              // 桌面/移动版共用 timeline__item；移动版若改了外层 class 则退而求其次
+              // 直接在所有 article 里找带 data-id 的链接（雪球帖子链接固定带 data-id）。
+              const items = document.querySelectorAll('article.timeline__item');
+              const articles = items.length ? items
+                : document.querySelectorAll('article');
+              articles.forEach(a => {
                 const link = a.querySelector('a[data-id]');
-                const authorEl = a.querySelector('.user-name');
+                const authorEl = a.querySelector('.user-name, .timeline__user, [class*="user"] .name');
                 if (link) {
                   const v = link.getAttribute('data-id');
                   if (/^\\d{6,}$/.test(v)) {
@@ -407,9 +424,11 @@ class XueqiuHashtagScraper:
 
         返回 (url, title)；全部失败时返回 (None, None)，交由调用方跳过本轮。
 
-        发现源（2026-09-22 增补，用户建议）：优先用移动版 m.xueqiu.com 首页 ——
-        它同时展示「雪球热点」和「热门话题」链接，结构稳定，且命中 WAF 挑战页的
-        概率比桌面版低。拿不到再回退桌面版 xueqiu.com 首页。
+        发现源（2026-09-22 修正）：m.xueqiu.com 子域单独访问常被雪球拦截/重定向，
+        已不可靠。改为给持久化 Chrome 上下文设置移动版 User-Agent + 视口（见
+        MOBILE_USER_AGENT / MOBILE_VIEWPORT），直接访问 https://xueqiu.com/ 即可
+        拿到移动版首页 —— 它同样展示「雪球热点」和「热门话题」链接，结构稳定，
+        且命中 WAF 挑战页的概率比桌面版低。
 
         链接形态：话题搜索页 /k?q=%23话题名%23（即 /k?q=#话题#），并非 /hashtag/。
         这些搜索页与话题页共用 article.timeline__item 帖子结构和 comments 评论接口，
@@ -419,7 +438,8 @@ class XueqiuHashtagScraper:
         故每次最多重试 3 次，等待挑战 JS 执行完（检测 _waf / renderData / 人机验证 等）；
         选择器优先级：① 右侧热门话题盒子 → ② 页面任意 /k?q= 链接 → ③ 任意含 %23 的话题链接。
         """
-        homes = ["https://m.xueqiu.com/", "https://xueqiu.com/"]
+        # 上下文已是移动 UA，故直接用主域即可（不再依赖 m.xueqiu.com）
+        homes = ["https://xueqiu.com/"]
         for home in homes:
             for attempt in range(3):
                 try:
@@ -499,6 +519,10 @@ class XueqiuHashtagScraper:
                 channel="chrome",
                 headless=self.headless,
                 accept_downloads=False,
+                # 移动版伪装：让 xueqiu.com 直接吐出移动版首页（含热门话题链接），
+                # 避免依赖常被拦截的 m.xueqiu.com 子域。
+                user_agent=MOBILE_USER_AGENT,
+                viewport=MOBILE_VIEWPORT,
                 args=["--disable-blink-features=AutomationControlled"],
             )
             page = browser.pages[0] if browser.pages else browser.new_page()
