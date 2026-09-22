@@ -182,17 +182,18 @@ POST_DELAY = (3, 6)        # 帖子间随机停顿（秒）
 COMMENT_PAGE_DELAY = (1, 3)
 HEADLESS = True            # 无头模式（可后台运行）；需看登录过程改为 False
 
-# ── 移动版伪装 ──
-# m.xueqiu.com 子域单独访问常被雪球拦截/重定向，故不再依赖它；
-# 改为给持久化 Chrome 上下文设置一个移动版 User-Agent + 移动视口，
-# 直接访问 https://xueqiu.com/ 就会吐出移动版首页（同样含「热门话题」链接），
-# 且移动版命中 WAF 挑战页的概率比桌面版低。
-MOBILE_USER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
-    "Mobile/15E148 Safari/604.1"
+# ── 热点发现（非登录）──
+# 雪球「雪球热点」榜单【只在非登录状态】才展示于 ?category=hotspot；
+# 登录态下该页会变成个性化信息流，看不到热点榜。
+# 故本引擎全程用【非登录】上下文，与「推荐/关注」的登录态引擎（scraper.py）严格区分（"以区分"）。
+HOTSPOT_URL = "https://www.xueqiu.com/?category=hotspot"
+HOTSPOT_TOP_N = 5            # 每轮抓取的热点话题数（取榜单前 N）
+MAX_POSTS_PER_TOPIC = 15    # 单个热点话题最多抓取的帖子数（控制单轮时长/请求量）
+# 非登录桌面 UA：让话题详情页沿用 article.timeline__item + a[data-id] 结构（已有提取逻辑）
+GUEST_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-MOBILE_VIEWPORT = {"width": 390, "height": 844}
 
 # ── 持续运行参数 ──
 CONTINUOUS = True               # True=持续运行; False=单次运行后退出
@@ -419,197 +420,186 @@ class XueqiuHashtagScraper:
                 break
         return all_comments
 
-    def _discover_hot_topic(self, page):
-        """从雪球首页自动取当前最热话题链接。
+    def _discover_hotspots(self, page, top_n=HOTSPOT_TOP_N):
+        """非登录状态访问热点榜，取前 top_n 个热点话题，返回 [(url, title), ...]。
 
-        返回 (url, title)；全部失败时返回 (None, None)，交由调用方跳过本轮。
+        关键：雪球「雪球热点」榜单【只在非登录】时才展示于 ?category=hotspot；
+        登录态下该页会变成个性化信息流，看不到热点榜。故调用方必须用非登录上下文。
+        命中话题链接形如 /hashtag/I-...（话题详情页，沿用 article.timeline__item 结构）。
 
-        发现源（2026-09-22 修正）：m.xueqiu.com 子域单独访问常被雪球拦截/重定向，
-        已不可靠。改为给持久化 Chrome 上下文设置移动版 User-Agent + 视口（见
-        MOBILE_USER_AGENT / MOBILE_VIEWPORT），直接访问 https://xueqiu.com/ 即可
-        拿到移动版首页 —— 它同样展示「雪球热点」和「热门话题」链接，结构稳定，
-        且命中 WAF 挑战页的概率比桌面版低。
-
-        链接形态：话题搜索页 /k?q=%23话题名%23（即 /k?q=#话题#），并非 /hashtag/。
-        这些搜索页与话题页共用 article.timeline__item 帖子结构和 comments 评论接口，
-        抓取逻辑完全通用。
-
-        鲁棒性：首页常遇 WAF 挑战页（真实浏览器导航后挑战 JS 写 cookie 再重定向），
-        故每次最多重试 3 次，等待挑战 JS 执行完（检测 _waf / renderData / 人机验证 等）；
-        选择器优先级：① 右侧热门话题盒子 → ② 页面任意 /k?q= 链接 → ③ 任意含 %23 的话题链接。
+        鲁棒性：该页常遇 WAF 挑战页（真实导航后挑战 JS 写 cookie 再重定向），
+        故最多重试 3 次，每次检测 _waf / renderData / 人机验证 等特征，命中则
+        等待挑战 JS 执行完再重导航。
         """
-        # 上下文已是移动 UA，故直接用主域即可（不再依赖 m.xueqiu.com）
-        homes = ["https://xueqiu.com/"]
-        for home in homes:
-            for attempt in range(3):
-                try:
-                    page.goto(home, wait_until="domcontentloaded", timeout=25000)
-                except Exception as e:
-                    _log(f"  打开首页失败({home}, 尝试{attempt+1}): {e}")
-                    break  # 该首页打不开，换下一个来源
-                # 选择器优先级：热门话题盒子 → 任意 /k?q= → 任意 %23 话题链接
-                selectors = [
-                    "div.board.board__topic a[href*='/k?q=']",
-                    "a[href*='/k?q=']",
-                    "a[href*='%23']",
-                ]
-                sel = None
-                for cand in selectors:
-                    try:
-                        page.wait_for_selector(cand, timeout=8000)
-                        sel = cand
-                        break
-                    except Exception:
-                        continue
-                if not sel:
-                    # 可能仍处 WAF 挑战页
-                    try:
-                        txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
-                    except Exception:
-                        txt = ""
-                    if _is_waf_page_text(txt):
-                        _log(f"  首页({home}) 命中 WAF 挑战页(尝试{attempt+1})，等 6s 重试…")
-                        page.wait_for_timeout(6000)
-                        continue
-                    # 非挑战页但无话题链接 → 该首页无话题，换下一个来源
-                    _log(f"  首页({home}) 无热门话题链接，尝试下一个来源")
-                    break
-                page.wait_for_timeout(800)  # 让列表完全渲染
-                res = page.evaluate("""(sel) => {
-                    const box = document.querySelector('div.board.board__topic')
-                              || document.querySelector('.topic-hot__list')
-                              || document;
-                    const a = box.querySelector(sel)
-                              || document.querySelector("a[href*='/k?q=']")
-                              || document.querySelector("a[href*='%23']");
-                    if (!a) return {error: 'no topic link'};
-                    const href = a.getAttribute('href') || '';
-                    const title = (a.textContent || '').trim();
-                    return {href, title};
-                }""", sel)
-                if isinstance(res, dict) and res.get("href"):
-                    url = res["href"]
-                    if url.startswith("//"):
-                        url = "https:" + url
-                    elif url.startswith("/"):
-                        url = "https://xueqiu.com" + url
-                    title = res.get("title", "")
-                    if not title:
-                        # 链接文本为空时，从 q=%23话题%23 反解
-                        import urllib.parse as _up
-                        q = _up.urlparse(url).query
-                        title = (_up.parse_qs(q).get("q", [""])[0]
-                                .replace("%23", "").replace("#", "").strip()) or url
-                    _log(f"  自动发现最新热门话题({home}): {title or url}")
-                    return url, title
-                if attempt == 2:
-                    _log(f"  热门话题解析失败({home}): {res}")
+        for attempt in range(3):
+            try:
+                page.goto(HOTSPOT_URL, wait_until="domcontentloaded", timeout=25000)
+            except Exception as e:
+                _log(f"  打开热点榜失败(尝试{attempt+1}): {e}")
                 page.wait_for_timeout(2000)
-            # 当前 home 用尽 3 次仍未拿到 → 换下一个来源
-        return None, None
+                continue
+            # 等待列表渲染 + 滚动触发懒加载
+            page.wait_for_timeout(3000)
+            for _ in range(3):
+                try:
+                    page.mouse.wheel(0, 700)
+                    page.wait_for_timeout(800)
+                except Exception:
+                    break
+            try:
+                txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            except Exception:
+                txt = ""
+            if _is_waf_page_text(txt):
+                _log(f"  热点榜命中 WAF 挑战页(尝试{attempt+1})，等 6s 重试…")
+                page.wait_for_timeout(6000)
+                continue
+            items = page.evaluate("""() => {
+                const out = [];
+                document.querySelectorAll("a[href^='/hashtag/']").forEach(a => {
+                    const href = a.getAttribute('href') || '';
+                    const text = (a.textContent || '').trim();
+                    if (href && text && !out.some(o => o.url === href))
+                        out.push({url: href, title: text.slice(0, 50)});
+                });
+                return out;
+            }""")
+            out = []
+            for it in items[:top_n]:
+                url = it["url"]
+                if url.startswith("//"):
+                    url = "https:" + url
+                elif url.startswith("/"):
+                    url = "https://xueqiu.com" + url
+                out.append((url, it["title"]))
+            if out:
+                _log(f"  自动发现 {len(out)} 个热点话题(非登录): " + " | ".join(t for _, t in out))
+                return out
+            _log(f"  热点榜未解析到话题链接(尝试{attempt+1})，重试…")
+            page.wait_for_timeout(2000)
+        return []
 
     def scrape_once(self):
+        """一轮热点抓取（两阶段，严格区分登录/非登录）。
+
+        阶段1【非登录】发现热点榜：?category=hotspot 只在非登录态才展示「雪球热点」
+        话题列表；登录态下会变成个性化信息流，看不到热点榜。
+        阶段2【登录】抓取评论：话题详情页可非登录看，但 comments.json 评论接口
+        必须登录（实测非登录返回 error_code=400016「请重新登录」），故抓取帖子的
+        评论必须用登录态持久化 profile。
+
+        两阶段上下文严格区分（"以区分"）：发现用非登录临时上下文，抓取用登录 profile。
+        """
         with sync_playwright() as pw:
+            # ── 阶段1：非登录发现热点榜 ──
+            _log("[热点引擎] 阶段1 发现热点：使用【非登录】上下文（热点榜仅非登录可见）")
+            guest = pw.chromium.launch(
+                channel="chrome", headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            gctx = guest.new_context(
+                user_agent=GUEST_USER_AGENT, viewport={"width": 1280, "height": 900},
+            )
+            gpage = gctx.new_page()
+            if self.auto_discover:
+                try:
+                    topics = self._discover_hotspots(gpage)
+                except Exception as e:
+                    _log(f"  发现热点异常，本轮跳过: {e}")
+                    topics = []
+                if not topics:
+                    _log("  未从热点榜发现任何话题，本轮跳过")
+                    gctx.close(); guest.close(); return 0
+            else:
+                topics = [(self.url, self.name)]
+            gctx.close(); guest.close()
+
+            # ── 阶段2：登录态抓取每个热点的帖子+评论（评论接口需登录）──
+            _log("[热点引擎] 阶段2 抓取评论：使用【登录】持久化 profile（评论接口需登录态）")
             profile_dir = resolve_profile_dir()
-            _log(f"  Chrome profile: {profile_dir}")
-            # 先清理上一次运行可能残留的 Chrome 窗口（同一 profile 只允许一个实例）
             _kill_stale_chrome(profile_dir, log=_log)
             browser = pw.chromium.launch_persistent_context(
-                user_data_dir=profile_dir,
-                channel="chrome",
-                headless=self.headless,
-                accept_downloads=False,
-                # 移动版伪装：让 xueqiu.com 直接吐出移动版首页（含热门话题链接），
-                # 避免依赖常被拦截的 m.xueqiu.com 子域。
-                user_agent=MOBILE_USER_AGENT,
-                viewport=MOBILE_VIEWPORT,
+                user_data_dir=profile_dir, channel="chrome", headless=self.headless,
+                accept_downloads=False, user_agent=GUEST_USER_AGENT,
+                viewport={"width": 1280, "height": 900},
                 args=["--disable-blink-features=AutomationControlled"],
             )
             page = browser.pages[0] if browser.pages else browser.new_page()
-            if self.auto_discover:
-                try:
-                    url, title = self._discover_hot_topic(page)
-                    if url:
-                        self.url = url
-                        if title:
-                            self.name = title
-                            self.short = _slugify(title)  # 按话题独立 seen 文件，避免串味
-                        _log(f"自动发现最新热门话题: {self.name}")
-                    else:
-                        # 自动发现失败：清空 URL 干净跳过，不再去 goto 失效的写死配置
-                        self.url = None
-                        _log("  自动发现未返回链接，本轮跳过话题抓取（不回退失效配置）")
-                except Exception as e:
-                    self.url = None
-                    _log(f"  自动发现热门话题异常，本轮跳过: {e}")
+            total_new = 0
+            n = min(len(topics), HOTSPOT_TOP_N)
+            for idx, (url, title) in enumerate(topics[:HOTSPOT_TOP_N], 1):
+                _log(f"\n{'='*16} 热点 {idx}/{n}: {title} {'='*16}")
+                total_new += self._scrape_topic(page, url, title)
+            _log(f"\n本轮热点抓取完成，共入库评论 {total_new} 条")
+            browser.close()
+        return total_new
 
-            # 防御：配置/回退的话题 URL 可能已失效（雪球改版/重定向到下载），
-            # 打开失败时不要让它拖累整轮抓取，跳过话题、直接收尾。
-            if not self.url or not str(self.url).startswith("http"):
-                _log("  无有效话题 URL，跳过本轮话题抓取")
-                browser.close()
-                return 0
+    def _scrape_topic(self, page, url, title):
+        """抓取单个热点话题页的帖子评论（登录上下文，评论接口需登录）。返回本轮入库评论数。"""
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        except Exception as e:
+            _log(f"  [!] 打开话题页失败（可能已失效/触发下载）: {e}，跳过该话题")
+            return 0
+        page.wait_for_timeout(4000)
+        # 滚动加载更多帖子
+        for i in range(self.scroll_rounds):
             try:
-                page.goto(self.url, wait_until="domcontentloaded", timeout=25000)
-            except Exception as e:
-                _log(f"  [!] 打开话题页失败（可能已失效/触发下载）: {e}")
-                _log("      已跳过本轮话题抓取，不影响推荐/热门主流程")
-                browser.close()
-                return 0
-            _log(f"已打开话题页: {self.name}")
-            page.wait_for_timeout(5000)
-
-            # 滚动加载更多帖子
-            for i in range(self.scroll_rounds):
                 page.mouse.wheel(0, 2500)
                 page.wait_for_timeout(random.uniform(1.5, 3.0))
-            page.wait_for_timeout(2000)
+            except Exception:
+                break
+        page.wait_for_timeout(2000)
 
-            posts = self._extract_post_ids(page)
-            _log(f"提取到 {len(posts)} 个帖子")
+        posts = self._extract_post_ids(page)
+        # 限制单话题帖子数，控制单轮运行时长与请求量
+        if MAX_POSTS_PER_TOPIC and len(posts) > MAX_POSTS_PER_TOPIC:
+            posts = posts[:MAX_POSTS_PER_TOPIC]
+        _log(f"提取到 {len(posts)} 个帖子")
 
-            total_new = 0
-            for idx, p in enumerate(posts, 1):
-                pid = p["id"]
-                author = p.get("author", "")
-                self.db.save_post(pid, author, self.name)
-                _log(f"  ({idx}/{len(posts)}) 抓取帖子 {pid} 的评论…")
-                raw = self._fetch_comments(page, pid)
-                saved_this = 0
-                for cm in raw:
-                    text = _strip_tags(cm.get("text", ""))
-                    if not text:
-                        continue
-                    user = cm.get("user", {}) or {}
-                    ca = cm.get("created_at") or 0
-                    if isinstance(ca, str):
-                        try:
-                            ca = int(ca)
-                        except Exception:
-                            ca = 0
-                    row = {
-                        "id": str(cm.get("id")),
-                        "post_id": pid,
-                        "post_author": author,
-                        "text": text,
-                        "hashtag": self.name,
-                        "user_id": str(user.get("id", "")),
-                        "user_name": user.get("screen_name", ""),
-                        "like_count": cm.get("like_count", 0) or 0,
-                        "created_at": int(ca) // 1000 if ca > 10**12 else int(ca),
-                        "time_str": cm.get("timeStr") or cm.get("timeBefore") or "",
-                        "reply_count": cm.get("reply_count", 0) or 0,
-                    }
-                    self.db.save_comment(row)
-                    saved_this += 1
-                total_new += saved_this
-                _log(f"      评论 {len(raw)} 条, 入库 {saved_this} 条（累计 {self.db.count()}）")
-                page.wait_for_timeout(random.uniform(*POST_DELAY))
+        total_new = 0
+        for idx, p in enumerate(posts, 1):
+            pid = p["id"]
+            author = p.get("author", "")
+            self.db.save_post(pid, author, title)
+            _log(f"  ({idx}/{len(posts)}) 抓取帖子 {pid} 的评论…")
+            raw = self._fetch_comments(page, pid)
+            saved_this = 0
+            for cm in raw:
+                text = _strip_tags(cm.get("text", ""))
+                if not text:
+                    continue
+                user = cm.get("user", {}) or {}
+                ca = cm.get("created_at") or 0
+                if isinstance(ca, str):
+                    try:
+                        ca = int(ca)
+                    except Exception:
+                        ca = 0
+                row = {
+                    "id": str(cm.get("id")),
+                    "post_id": pid,
+                    "post_author": author,
+                    "text": text,
+                    "hashtag": title,
+                    "user_id": str(user.get("id", "")),
+                    "user_name": user.get("screen_name", ""),
+                    "like_count": cm.get("like_count", 0) or 0,
+                    "created_at": int(ca) // 1000 if ca > 10**12 else int(ca),
+                    "time_str": cm.get("timeStr") or cm.get("timeBefore") or "",
+                    "reply_count": cm.get("reply_count", 0) or 0,
+                }
+                self.db.save_comment(row)
+                saved_this += 1
+            total_new += saved_this
+            _log(f"      评论 {len(raw)} 条, 入库 {saved_this} 条（累计 {self.db.count()}）")
+            page.wait_for_timeout(random.uniform(*POST_DELAY))
 
-            _log(f"本轮完成，共入库评论 {total_new} 条")
-            page.wait_for_timeout(1500)
-            browser.close()
-
+        # 每话题单独生成价值线索（按话题独立短标识，避免串味）
+        try:
+            self._gen_insight(short=_slugify(title), name=title)
+        except Exception as e:
+            _log(f"  生成价值候选失败(可忽略): {e}")
         return total_new
 
 
@@ -625,11 +615,16 @@ class XueqiuHashtagScraper:
         _log(f"  本轮 JSON 导出: {export_path}  ({size_kb:.1f} KB, 类型={res['export_type']}, 评论={res['comment_count']}条)")
         return export_path
 
-    def _gen_insight(self):
-        """每轮同时生成 Layer1 价值候选（可选，需 insight_extractor.py）"""
+    def _gen_insight(self, short=None, name=None):
+        """生成 Layer1 价值候选（可选，需 insight_extractor.py）。
+
+        可传 short/name 指定单个热点话题；缺省则回退到实例默认的 self.short/self.name。
+        hashtag 传话题标题，确保 insight_extractor 只分析本话题评论（按话题独立，不串味）。
+        """
         try:
             import insight_extractor
-            insight_extractor.main(short=self.short, name=self.name)
+            insight_extractor.main(
+                short=short or self.short, name=name or self.name, hashtag=name or self.name)
         except Exception as e:
             _log(f"  生成价值候选失败(可忽略): {e}")
 
@@ -661,8 +656,7 @@ class XueqiuHashtagScraper:
                     _log(f"  ⚠ 本轮抓取异常: {e}")
                     new_count = 0
                 self._export_round()
-                if GEN_INSIGHT_EACH_ROUND:
-                    self._gen_insight()
+                # 价值线索已按话题在 _scrape_topic 内逐个生成，无需再整体生成
                 if not self._running:
                     break
                 wait_min = random.randint(RUN_INTERVAL_MIN, RUN_INTERVAL_MAX)

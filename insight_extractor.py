@@ -59,11 +59,23 @@ UPLOAD_TOKEN = ""             # 与 Worker 端 INGEST_TOKEN 一致
 UPLOAD_SOURCE = "hashtag"
 
 
-def load_comments():
+def load_comments(hashtag=None):
+    """读取 hashtag_comments.db 中已抓取的评论。
+
+    hashtag 为 None 时读取全部（兜底/全量模式）；
+    传入具体话题标题时只读取该话题的评论，确保「每个热点单独生成价值线索」
+    不串味（否则所有热点的评论会被混进同一份 insight）。
+    """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute("SELECT * FROM comments ORDER BY like_count DESC")
+    if hashtag:
+        cur.execute(
+            "SELECT * FROM comments WHERE hashtag=? ORDER BY like_count DESC",
+            (hashtag,),
+        )
+    else:
+        cur.execute("SELECT * FROM comments ORDER BY like_count DESC")
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -96,16 +108,18 @@ def build_comment_dicts(rows):
 def main(write_json=False, incremental=INCREMENTAL, short=None, name=None,
          seen_path=None, include_prompt=INCLUDE_LLM_PROMPT,
          upload=UPLOAD_ENABLED, upload_url=UPLOAD_URL, upload_token=UPLOAD_TOKEN,
-         upload_source=UPLOAD_SOURCE, jev_api_key=None):
+         upload_source=UPLOAD_SOURCE, jev_api_key=None, hashtag=None):
     if not os.path.exists(DB_PATH):
         print(f"[错误] 未找到数据库：{DB_PATH}\n请先运行 hashtag_comments.py 抓取评论。")
         return
 
     short = short or HASHTAG_SHORT
     name = name or HASHTAG_NAME
+    # hashtag 缺省回退：优先用 name（即该话题标题，DB 中 hashtag 列存的就是它）
+    hashtag = hashtag or name
     seen_path = seen_path or seen_path_for(short)
 
-    rows = load_comments()
+    rows = load_comments(hashtag=hashtag)
     total = len(rows)
     comment_dicts = build_comment_dicts(rows)
 
@@ -116,6 +130,7 @@ def main(write_json=False, incremental=INCREMENTAL, short=None, name=None,
         "context_desc": f"雪球用户讨论：{name}。以下评论集中于相关题材的个股联动与产业链消息。",
         "threshold": SCORE_THRESHOLD,
         "total_comments": total,
+        "hashtag": hashtag,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "max_llm_candidates": MAX_LLM_CANDIDATES,
     }
