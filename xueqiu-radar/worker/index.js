@@ -4,7 +4,8 @@
  * 职责：
  *   1) POST /api/ingest   —— xueqiu.exe 定时上传 { meta, candidates, comments }，鉴权后写入 D1
  *   2) GET  /api/rounds   —— 轮次列表（倒序，支持分页）
- *   3) GET  /api/clues    —— 线索（按 ts 时间排序，支持分页 + 标的/关键词/分数筛选）
+ *   3) GET  /api/clues    —— 线索（按 ts 时间排序，支持分页 + 标的/关键词/分数/板块筛选）
+ *                            板块筛选：section=recommend(推荐/关注) | hot(热门) | topic(热点话题)
  *   4) POST /api/cleanup  —— 手动触发清理（token 鉴权），删 10 天前数据
  *   5) 每日 Cron 自动清理 10 天前数据
  *   6) 其余路径            —— 交给 ASSETS 托管 Vue 前台（SPA）
@@ -151,14 +152,23 @@ function parseQuery(url) {
   const min = url.searchParams.get("min");
   const minScore = min != null && min !== "" ? Math.max(parseInt(min, 10) || 0, 0) : null;
   const sort = url.searchParams.get("sort") === "jev" ? "jev" : "ts";
-  return { limit, offset, order, stock, q, minScore, sort };
+  // section 筛选："" = 全部 | "recommend" = 推荐/关注 | "hot" = 热门 | "topic" = 热点话题(无 section)
+  const rawSection = (url.searchParams.get("section") || "").trim();
+  const section = ["recommend", "hot", "topic"].includes(rawSection) ? rawSection : "";
+  return { limit, offset, order, stock, q, minScore, sort, section };
 }
 
 // 组装 WHERE 与绑定参数
-function buildWhere({ stock, q, minScore, round }) {
+function buildWhere({ stock, q, minScore, round, section }) {
   const where = [];
   const binds = [];
   if (round) { where.push("round_id = ?"); binds.push(round); }
+  if (section === "topic") {
+    // 热点话题来源（hashtag 引擎）不写 section，统一归为「话题」
+    where.push("(section IS NULL OR section = '')");
+  } else if (section) {
+    where.push("section = ?"); binds.push(section);
+  }
   if (stock) { where.push("stocks LIKE ?"); binds.push("%" + stock + "%"); }
   if (q) { where.push("(text LIKE ? OR user_name LIKE ?)"); binds.push("%" + q + "%", "%" + q + "%"); }
   if (minScore != null) { where.push("score >= ?"); binds.push(minScore); }
@@ -184,9 +194,9 @@ async function handleRounds(env, url) {
 }
 
 async function handleClues(env, url) {
-  const { limit, offset, order, stock, q, minScore, sort } = parseQuery(url);
+  const { limit, offset, order, stock, q, minScore, sort, section } = parseQuery(url);
   const round = url.searchParams.get("round") || "";
-  const { clause, binds } = buildWhere({ stock, q, minScore, round });
+  const { clause, binds } = buildWhere({ stock, q, minScore, round, section });
 
   const { results: t } = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM clues ${clause}`

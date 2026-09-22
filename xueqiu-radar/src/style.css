@@ -96,6 +96,36 @@ input:focus, select:focus { border-color: var(--accent); }
   margin: 12px 0;
 }
 
+/* 板块筛选：推荐/关注 · 热门 · 热点话题 */
+.section-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 14px 0 -4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px;
+  width: fit-content;
+}
+.section-tabs .tab {
+  font-size: 13px;
+  padding: 5px 14px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+.section-tabs .tab:hover { color: var(--text); border-color: transparent; }
+.section-tabs .tab.active {
+  background: var(--panel-2);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .group-title {
   font-size: 15px;
   font-weight: 600;
@@ -148,6 +178,8 @@ input:focus, select:focus { border-color: var(--accent); }
   border: 1px solid var(--border);
 }
 .clue .src.recommend { color: var(--accent); border-color: var(--accent); }
+.clue .src.hot { color: var(--red); border-color: var(--red); }
+.clue .src.topic { color: var(--amber); border-color: var(--amber); }
 .clue .src.hashtag { color: var(--amber); border-color: var(--amber); }
 .clue .src.unknown { color: var(--muted); }
 .clue .text { font-size: 15px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }

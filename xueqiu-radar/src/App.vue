@@ -20,6 +20,14 @@ const minScore = ref(0);
 const search = ref("");
 const asc = ref(false); // false = 最新在前（倒序时间线）
 const sort = ref("ts"); // "ts"=按时间(默认) | "jev"=按 Jev 价值分降序
+// 板块筛选：""=全部 | "recommend"=推荐/关注 | "hot"=热门 | "topic"=热点话题
+const sectionFilter = ref("");
+const SECTION_TABS = [
+  { key: "", label: "全部" },
+  { key: "recommend", label: "推荐/关注" },
+  { key: "hot", label: "热门" },
+  { key: "topic", label: "热点话题" },
+];
 
 onMounted(loadInitial);
 
@@ -29,6 +37,7 @@ const currentParams = computed(() => ({
   min: minScore.value || 0,
   order: asc.value ? "asc" : "desc",
   sort: sort.value,
+  section: sectionFilter.value,
   limit: PAGE,
 }));
 
@@ -139,6 +148,22 @@ function jevLabel(c) {
   return "";
 }
 
+// 板块归属：推荐(section=recommend) / 热门(section=hot) / 热点话题(无 section，来自 hashtag 引擎)
+function sectionOf(c) {
+  if (c.section === "recommend") return "recommend";
+  if (c.section === "hot") return "hot";
+  return "topic";
+}
+function sectionLabel(c) {
+  const s = sectionOf(c);
+  return s === "recommend" ? "推荐" : s === "hot" ? "热门" : "话题";
+}
+
+// 是否有任何生效中的筛选（用于区分「无数据」与「筛选后无数据」两种空态）
+const hasActiveFilter = computed(() =>
+  !!(sectionFilter.value || search.value.trim() || stockFilter.value.trim() || minScore.value)
+);
+
 // 按「日期」分段（时间线视觉分隔，不做任何关联推算）
 const timeline = computed(() => {
   const map = {};
@@ -179,24 +204,35 @@ function scoreClass(s) {
       </div>
     </div>
 
+    <!-- 板块筛选：推荐/关注 · 热门 · 热点话题（服务端按 section 过滤） -->
+    <div class="section-tabs">
+      <button
+        v-for="t in SECTION_TABS"
+        :key="t.key"
+        :class="['tab', { active: sectionFilter === t.key }]"
+        @click="sectionFilter = t.key; onFilterChange()"
+      >{{ t.label }}</button>
+    </div>
+
+    <div class="filters">
+      <input v-model="search" @input="onFilterChange" placeholder="搜索正文 / 作者" />
+      <input v-model="stockFilter" @input="onFilterChange" placeholder="按标的筛选（如 澜起科技）" />
+      <select v-model.number="minScore" @change="onFilterChange">
+        <option :value="0">分数 ≥ 0</option>
+        <option :value="7">分数 ≥ 7</option>
+        <option :value="12">分数 ≥ 12</option>
+        <option :value="15">分数 ≥ 15</option>
+      </select>
+      <span class="count">共 {{ total }} 条</span>
+    </div>
+
     <div v-if="loading" class="loading">加载中…</div>
     <div v-else-if="error" class="error">错误：{{ error }}</div>
     <div v-else-if="!total" class="empty">
-      暂无数据。请先让 xueqiu.exe 上传一轮线索（加 --upload 与 Worker 地址）。
+      <template v-if="hasActiveFilter">当前筛选条件下暂无数据，试试切换板块或清空筛选条件。</template>
+      <template v-else>暂无数据。请先让 xueqiu.exe 上传一轮线索（加 --upload 与 Worker 地址）。</template>
     </div>
     <div v-else>
-      <div class="filters">
-        <input v-model="search" @input="onFilterChange" placeholder="搜索正文 / 作者" />
-        <input v-model="stockFilter" @input="onFilterChange" placeholder="按标的筛选（如 澜起科技）" />
-        <select v-model.number="minScore" @change="onFilterChange">
-          <option :value="0">分数 ≥ 0</option>
-          <option :value="7">分数 ≥ 7</option>
-          <option :value="12">分数 ≥ 12</option>
-          <option :value="15">分数 ≥ 15</option>
-        </select>
-        <span class="count">共 {{ total }} 条</span>
-      </div>
-
       <div v-for="[day, items] in timeline" :key="day">
         <div class="day-divider">{{ dayLabel(day) }}</div>
         <div v-for="c in items" :key="c.round_id + '_' + c.clue_id" class="clue">
@@ -204,10 +240,10 @@ function scoreClass(s) {
             <span class="time" :title="c.time_str">{{ relTime(c) }}</span>
             <span class="who">{{ c.user_name || "（匿名）" }}</span>
             <span
-              v-if="roundMap[c.round_id] && roundMap[c.round_id].source"
               class="src"
-              :class="roundMap[c.round_id].source"
-            >{{ roundMap[c.round_id].source }}</span>
+              :class="sectionOf(c)"
+              :title="'来源：' + ((roundMap[c.round_id] && roundMap[c.round_id].source) || '-')"
+            >{{ sectionLabel(c) }}</span>
           </div>
 
           <div class="text">{{ c.text }}</div>
