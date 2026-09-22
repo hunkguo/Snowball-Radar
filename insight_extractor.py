@@ -47,8 +47,8 @@ HASHTAG_SHORT = "walsh_rate_hike"
 HASHTAG_NAME = "沃什：加息25基点至4%，通胀难降但就业不伤"
 
 # ── 参数 ──
-SCORE_THRESHOLD = 5          # 进入候选池的最低分
-MAX_LLM_CANDIDATES = 80      # 发给大模型的候选上限（按分数截取）
+SCORE_THRESHOLD = 4          # 进入候选池的最低分（4=含行业分析/逻辑推演等有实质信息内容；0~2 灌水仍过滤）
+MAX_LLM_CANDIDATES = 150     # 发给大模型的候选上限（按分数截取；上调以展示更多有价值评论正文）
 INCREMENTAL = True           # True=只分析新出现的评论（分析过的不再重复）
 INCLUDE_LLM_PROMPT = False   # False=只输出适合人工阅读的内容（默认自己看，不需要 AI 提示词区块）
 

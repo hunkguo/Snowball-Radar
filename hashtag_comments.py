@@ -199,7 +199,7 @@ AUTO_DISCOVER_HOT_TOPIC = True
 
 # ── 行为参数 ──
 SCROLL_ROUNDS = 8          # 滚动加载帖子次数
-MAX_COMMENT_PAGES = 15     # 单帖评论最多翻页数
+MAX_COMMENT_PAGES = 25     # 单帖评论最多翻页数（上调以收集更多评论；注意请求量/WAF 风险）
 POST_DELAY = (3, 6)        # 帖子间随机停顿（秒）
 COMMENT_PAGE_DELAY = (1, 3)
 HEADLESS = True            # 无头模式（可后台运行）；需看登录过程改为 False
@@ -213,7 +213,7 @@ HOTSPOT_URL = "https://www.xueqiu.com/?category=hotspot"
 # 注：雪球热点榜页面（匿名态）稳定只渲染约 10 个话题，懒加载不会追加，
 # 故这里设为 10 即吃满页面能给的全部候选；如需降负载可调小。
 HOTSPOT_TOP_N = 10           # 每轮抓取的热点话题数（取榜单前 N，页面上限约 10）
-MAX_POSTS_PER_TOPIC = 15    # 单个热点话题最多抓取的帖子数（控制单轮时长/请求量）
+MAX_POSTS_PER_TOPIC = 20    # 单个热点话题最多抓取的帖子数（上调以收集更多评论；注意单轮时长）
 # 非登录桌面 UA：让话题详情页沿用 article.timeline__item + a[data-id] 结构（已有提取逻辑）
 GUEST_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -591,11 +591,93 @@ class XueqiuHashtagScraper:
         self._guest_page = None
         self._owns_login = True
 
+    @staticmethod
+    def _page_alive(page):
+        """页面/浏览器是否仍可用（未被关闭、未崩溃）。"""
+        try:
+            if page is None or page.is_closed():
+                return False
+            page.evaluate("1+1")
+            return True
+        except Exception:
+            return False
+
+    def ensure_guest_context(self, force=False):
+        """确保【非登录】guest context/page 可用；失效或 force 时在同一浏览器上重建。
+
+        非登录发现热点榜的前提是 guest context 不携带持久化登录 cookie。
+        浏览器（self._login_ctx.browser）若被调度器重连换过，这里会跟随到新浏览器。
+        返回 True/False。
+        """
+        if not force and self._page_alive(self._guest_page):
+            return True
+        try:
+            if self._guest_ctx is not None:
+                try:
+                    self._guest_ctx.close()
+                except Exception:
+                    pass
+                self._guest_ctx = None
+                self._guest_page = None
+            ctx = self._login_ctx
+            if ctx is None:
+                return False
+            try:
+                self._browser = ctx.browser or self._browser
+            except Exception:
+                pass
+            if self._browser is None:
+                return False
+            self._guest_ctx = self._browser.new_context(
+                user_agent=GUEST_USER_AGENT, viewport={"width": 1280, "height": 900})
+            try:
+                self._guest_ctx.clear_cookies()
+            except Exception:
+                pass
+            self._guest_page = self._guest_ctx.new_page()
+            return True
+        except Exception as e:
+            _log(f"  [!] 重建非登录 guest 上下文失败: {e}")
+            self._guest_ctx = None
+            self._guest_page = None
+            return False
+
+    def ensure_session_alive(self, pw):
+        """话题单跑模式(--mode hashtag)自愈：登录会话失效则整体重连，并确保 guest 可用。"""
+        if not self._page_alive(self._login_page):
+            _log("  [!] 热点引擎浏览器已失效（被关闭/崩溃），正在自动重连…")
+            try:
+                self.close_session()
+                self.start_session(pw)
+            except Exception as e:
+                _log(f"  [!] 热点引擎重连失败: {e}")
+                return False
+        return self.ensure_guest_context()
+
     def _scrape_round(self, login_page, guest_page):
         """执行一轮热点抓取（发现 + 逐话题抓评论），不负责浏览器的开关。
 
         两阶段上下文严格区分（"以区分"）：发现用非登录 guest_page，抓取用登录 login_page。
+        若页面/浏览器已被外部关闭（崩溃、被其它进程清理），先尝试自愈重建再继续，
+        避免整轮以 "Target page, context or browser has been closed" 失败。
         """
+        # ── 阶段0：会话健康检查（自愈）──
+        if not self._page_alive(guest_page):
+            _log("  [!] 非登录发现页面已失效（浏览器可能被关闭/崩溃），尝试自动重建…")
+            if self.ensure_guest_context(force=True):
+                guest_page = self._guest_page
+                _log("  [ok] 非登录发现页面已重建")
+            else:
+                _log("  [!] 非登录发现页面重建失败，本轮跳过（下一轮会自动重试）")
+                return 0
+        if not self._page_alive(login_page):
+            if self._page_alive(self._login_page):
+                login_page = self._login_page
+            else:
+                _log("  [!] 登录页面已失效，本轮跳过评论抓取"
+                     "（--mode all 下由调度器重连浏览器后自动恢复）")
+                return 0
+
         # ── 阶段1：非登录发现热点榜 ──
         if self.auto_discover:
             _log("[热点引擎] 阶段1 发现热点：使用【非登录】上下文（热点榜仅非登录可见）")

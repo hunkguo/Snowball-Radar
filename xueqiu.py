@@ -25,8 +25,11 @@
 """
 
 import argparse
+import atexit
 import os
+import re
 import signal
+import subprocess
 import sys
 import time
 import random
@@ -142,6 +145,80 @@ def gen_hashtag_clues(name=HASHTAG_NAME, short=HASHTAG_SHORT, write_json=False,
 
 
 # ──────────────────────────────────────────────
+#  单实例保护
+# ──────────────────────────────────────────────
+def _pid_alive(pid):
+    """指定 PID 的进程是否仍在运行（Windows: tasklist）。
+
+    注意：tasklist 输出是系统本地编码（中文 Windows 为 GBK），必须 errors="replace"
+    解码，否则读取线程会因 UnicodeDecodeError 崩溃、stdout 变空 → 恒定返回 False。
+    """
+    try:
+        pid = int(pid)
+        raw = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                             capture_output=True, timeout=10).stdout or b""
+        text = raw.decode("utf-8", "replace")
+        if str(pid) not in text:
+            try:
+                text = raw.decode("mbcs", "replace")
+            except Exception:
+                pass
+        return bool(re.search(rf"\b{pid}\b", text))
+    except Exception:
+        return False
+
+
+def acquire_single_instance(allow_multi=False):
+    """单实例保护：同一台机器、同一份 data/ 只允许一个爬虫实例运行。
+
+    两个实例会争抢同一个 chrome_profile：后启动者的清理逻辑可能关掉前者的浏览器，
+    对方随即出现 "Target page, context or browser has been closed"（此后每轮都失败）。
+    返回 True 表示可以继续运行。
+    """
+    if allow_multi:
+        _print("  [单实例] 已加 --allow-multi，跳过单实例检查"
+               "（不推荐：并行实例可能互相关闭浏览器，导致热点发现失败）")
+        return True
+
+    lock_path = os.path.join(os.path.dirname(HASH_DB), ".xueqiu.lock")
+    try:
+        if os.path.exists(lock_path):
+            old_pid = 0
+            try:
+                old_pid = int((open(lock_path, encoding="utf-8").read() or "0").strip())
+            except Exception:
+                old_pid = 0
+            if old_pid and old_pid != os.getpid() and _pid_alive(old_pid):
+                _print(f"  [!] 检测到已有雪球爬虫实例在运行（PID={old_pid}），本次启动中止。")
+                _print("      两个实例会争抢同一个 Chrome Profile，互相把对方的浏览器关掉，")
+                _print("      导致出现 'Target page, context or browser has been closed'。")
+                _print("      处理：先关闭旧实例（在其窗口按 Ctrl+C）再启动；")
+                _print("      确需并行请加 --allow-multi（不推荐）。")
+                return False
+            _print(f"  [单实例] 发现陈旧锁文件（PID={old_pid} 已不在运行），已接管。")
+
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with open(lock_path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+
+        def _release_lock():
+            try:
+                if os.path.exists(lock_path):
+                    cur = (open(lock_path, encoding="utf-8").read() or "").strip()
+                    if cur == str(os.getpid()):
+                        os.remove(lock_path)
+            except Exception:
+                pass
+
+        atexit.register(_release_lock)
+        _print(f"  [单实例] 已获取运行锁（PID={os.getpid()}）")
+        return True
+    except Exception as e:
+        _print(f"  [单实例] 锁检查异常，继续运行: {e}")
+        return True
+
+
+# ──────────────────────────────────────────────
 #  参数
 # ──────────────────────────────────────────────
 def parse_args():
@@ -175,6 +252,8 @@ def parse_args():
                    help="抓取间隔下限（分钟）")
     p.add_argument("--interval-max", type=int, default=60,
                    help="抓取间隔上限（分钟）")
+    p.add_argument("--allow-multi", dest="allow_multi", action="store_true",
+                   help="允许并行运行多个实例（默认单实例保护：两实例会争抢同一 Chrome Profile、互相关闭浏览器）")
     # ── 上传到 Cloudflare Worker（雪球雷达 · 线索台）──
     p.add_argument("--upload", action="store_true",
                    help="每轮自动上传线索到 Worker（默认关闭；也可用环境变量 WORKER_URL/ WORKER_TOKEN 配置）")
@@ -209,6 +288,10 @@ def main():
     mode = args.mode
     do_recommend = mode in ("recommend", "all")
     do_hashtag = mode in ("hashtag", "all")
+
+    # 单实例保护（--clues 是只读模式、不启动浏览器，无需加锁）
+    if not args.clues and not acquire_single_instance(args.allow_multi):
+        sys.exit(2)
 
     # 同步两个引擎的开关
     import scraper as _scraper_mod  # noqa: E402
@@ -346,6 +429,34 @@ def main():
             _print(f"\n{'='*60}")
             _print(f"  第 {round_no} 轮抓取  {datetime.now():%Y-%m-%d %H:%M:%S}")
             _print(f"{'='*60}")
+
+            # ── 会话健康检查（自愈）：浏览器被关闭/崩溃时自动重连，而不是此后每轮都失败 ──
+            if do_recommend and not rec.is_session_alive():
+                _print("  [!] 检测到浏览器已关闭/失效（可能被外部关闭或崩溃），正在自动重连…")
+                try:
+                    rec.close_session()
+                    rec.start_session(pw)
+                    _print("  [ok] 浏览器已重连")
+                except Exception as e:
+                    _print(f"  [!] 浏览器重连失败: {e}（本轮跳过抓取，下一轮自动重试）")
+            if do_hashtag:
+                if do_recommend:
+                    # 推荐侧可能刚重连换了 context → 话题引擎同步其借用的登录上下文
+                    if rec._context is not None and htag._login_ctx is not rec._context:
+                        htag._login_ctx = rec._context
+                        htag._login_page = rec._page
+                        try:
+                            htag._browser = rec._context.browser
+                        except Exception:
+                            htag._browser = None
+                    if not htag._page_alive(htag._guest_page):
+                        if htag.ensure_guest_context(force=True):
+                            _print("  [ok] 非登录发现页面已重建")
+                        else:
+                            _print("  [!] 非登录发现页面重建失败（本轮热点发现将跳过）")
+                else:
+                    if not htag.ensure_session_alive(pw):
+                        _print("  [!] 热点引擎会话不可用（本轮跳过，下一轮自动重试）")
 
             if do_recommend:
                 try:

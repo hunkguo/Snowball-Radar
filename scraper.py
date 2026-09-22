@@ -153,8 +153,8 @@ EXPORT_JSON = False            # 是否导出原始抓取数据 JSON（默认关
 
 # ── 价值线索提取（Layer 1）──
 GEN_CLUES = True               # 每轮导出时同时生成价值线索文件
-CLUE_THRESHOLD = 5             # 进入候选池的最低分
-CLUE_MAX_CANDIDATES = 80       # 发给大模型的候选上限（按分数截取）
+CLUE_THRESHOLD = 4             # 进入候选池的最低分（与 insight 引擎保持一致：4=有实质信息；0~2 灌水过滤）
+CLUE_MAX_CANDIDATES = 150      # 发给大模型的候选上限（按分数截取；上调以展示更多有价值评论正文）
 CLUE_INCREMENTAL = True        # True=只分析新出现的评论（分析过的不再重复）
 CLUE_INCLUDE_PROMPT = False    # False=只输出适合人工阅读的内容（默认自己看，不需要 AI 提示词区块）
 
@@ -1282,11 +1282,13 @@ class XueqiuScraper:
     @staticmethod
     def _is_chrome_running():
         try:
-            result = subprocess.run(
+            # tasklist 输出为系统本地编码(中文 Windows=GBK)，用 errors="replace" 解码，
+            # 否则读取线程会因 UnicodeDecodeError 崩溃、stdout 变空 → 恒返回 False。
+            raw = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq chrome.exe"],
-                capture_output=True, text=True, timeout=10
-            )
-            return "chrome.exe" in result.stdout.lower()
+                capture_output=True, timeout=10
+            ).stdout or b""
+            return "chrome.exe" in raw.decode("utf-8", "replace").lower()
         except Exception:
             return False
 
@@ -1518,12 +1520,10 @@ class XueqiuScraper:
         """
         if self._context is not None:
             return (self._context, self._page)
-        # 确保 Chrome 已关闭（仅限本 profile 的残留进程）
-        if self._is_chrome_running():
-            self._log("  检测到残留 Chrome 进程，正在清理…")
-            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
-                           capture_output=True, timeout=15)
-            time.sleep(3)
+        # 只清理【占用本爬虫专属 Profile】的残留 Chrome。
+        # 绝不 taskkill 全局 chrome.exe：那会误杀用户自己的浏览器，或另一个正在运行的
+        # 爬虫实例的浏览器，令对方立刻出现 "Target page, context or browser has been closed"。
+        _kill_stale_chrome(resolve_profile_dir(), log=self._log)
 
         self._log("--- 启动 Chrome（智能复制 Profile）---")
         context = self._connect_via_copy(pw)
@@ -1558,6 +1558,23 @@ class XueqiuScraper:
         self._context = None
         self._page = None
 
+    def is_session_alive(self):
+        """当前常驻会话是否仍可用（浏览器/页面未被关闭或崩溃）。
+
+        供统一调度器(xueqiu.py)每轮开始前做健康检查：失效时自动重连，避免浏览器
+        被外部关闭后，此后每一轮都以 "Target page, context or browser has been closed"
+        失败（历史上正是这个原因导致热点发现整个失效）。
+        """
+        try:
+            if self._context is None or self._page is None:
+                return False
+            if self._page.is_closed():
+                return False
+            self._page.evaluate("1+1")
+            return True
+        except Exception:
+            return False
+
     def scrape_once(self, session=None):
         """单次抓取一轮（推荐/热门）。
 
@@ -1584,12 +1601,8 @@ class XueqiuScraper:
         os.makedirs(JSON_EXPORT_DIR, exist_ok=True)
 
         with sync_playwright() as p:
-            # 确保 Chrome 已关闭
-            if self._is_chrome_running():
-                self._log("  检测到残留 Chrome 进程，正在清理…")
-                subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
-                               capture_output=True, timeout=15)
-                time.sleep(3)
+            # 只清理占用本专属 Profile 的残留 Chrome（不做全局 taskkill，避免误杀其它 Chrome/实例）
+            _kill_stale_chrome(resolve_profile_dir(), log=self._log)
 
             self._log("--- 启动 Chrome（智能复制 Profile）---")
             context = self._connect_via_copy(p)
