@@ -103,6 +103,26 @@ def _kill_stale_chrome(profile_dir, log=None):
         return 0
 
 
+def _cleanup_restored_tabs(context):
+    """关闭持久化 profile 启动时 Chrome 自动恢复的旧标签页，只保留一个干净页面。
+
+    否则每轮重复启动后标签页越积越多、内存膨胀。抓取时只在该页面内导航/刷新。
+    """
+    try:
+        pages = list(context.pages)
+        if len(pages) > 1:
+            for p in pages[1:]:
+                try:
+                    p.close()
+                except Exception:
+                    pass
+        if not context.pages:
+            context.new_page()
+    except Exception:
+        pass
+
+
+
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 DB_PATH = os.path.join(DATA_DIR, "xueqiu.db")
 JSON_EXPORT_DIR = os.path.join(DATA_DIR, "exports")
@@ -1305,6 +1325,7 @@ class XueqiuScraper:
                     "--lang=zh-CN",
                 ],
             )
+            _cleanup_restored_tabs(context)  # 关掉 Chrome 自动恢复的旧标签页，只留一个干净页面
             context.add_init_script(STEALTH_JS)
             return context
         except Exception as e:
@@ -1489,51 +1510,69 @@ class XueqiuScraper:
             self._log(f"  JSON : {json_path}")
         return md_path
 
-    def scrape_once(self):
-        """单次抓取一轮（推荐/热门），自带浏览器生命周期，供统一调度器(xueqiu.py)调用。
+    def start_session(self, pw):
+        """启动并复用单一浏览器会话（整个 --mode all / 持续运行 生命周期只开一次）。
 
-        每轮独立打开并关闭 Chrome（持久化 Profile 保存登录态），
-        因此可与话题版(xueqiu.py --mode all)顺序调用而互不干扰。
+        自带标签页清理（关掉 Chrome 自动恢复的旧标签），避免每轮重复启动后标签页堆积。
+        返回 (context, page)；登录检测只做一次（headless=False 时如需人工登录会在此等待）。
+        """
+        if self._context is not None:
+            return (self._context, self._page)
+        # 确保 Chrome 已关闭（仅限本 profile 的残留进程）
+        if self._is_chrome_running():
+            self._log("  检测到残留 Chrome 进程，正在清理…")
+            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
+                           capture_output=True, timeout=15)
+            time.sleep(3)
+
+        self._log("--- 启动 Chrome（智能复制 Profile）---")
+        context = self._connect_via_copy(pw)
+        if context is None:
+            raise RuntimeError("无法启动浏览器（Profile 复制/启动失败）")
+        _cleanup_restored_tabs(context)  # 关掉自动恢复的旧标签页，只留一个干净页面
+
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(60000)
+        self._context = context
+        self._page = page
+
+        self._log("正在访问雪球首页 …")
+        try:
+            page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
+        except Exception:
+            pass
+        self._rsleep(5, 8)
+        self._human_move(page)
+        self._rsleep(2, 4)
+        # 登录检测（仅在无登录态时等待人工登录；有持久化 Profile 则秒过）
+        self._ensure_login(page)
+        return (context, page)
+
+    def close_session(self):
+        """关闭常驻浏览器会话（Ctrl+C 退出或单次运行结束时调用）。"""
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
+        self._context = None
+        self._page = None
+
+    def scrape_once(self, session=None):
+        """单次抓取一轮（推荐/热门）。
+
+        session=(context, page) 由 xueqiu.py 复用（单一浏览器常驻，只刷新页面不复开）；
+        为 None 时（单次运行）自行启动并关闭浏览器（同样带标签页清理）。
         返回本轮 run_id；异常向上抛出由调用方处理。
         """
+        if session is not None:
+            return self._do_one_scrape(session[1])
         with sync_playwright() as p:
-            # 确保 Chrome 已关闭
-            if self._is_chrome_running():
-                self._log("  检测到残留 Chrome 进程，正在清理…")
-                subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"],
-                               capture_output=True, timeout=15)
-                time.sleep(3)
-
-            self._log("--- 启动 Chrome（智能复制 Profile）---")
-            context = self._connect_via_copy(p)
-            if context is None:
-                raise RuntimeError("无法启动浏览器（Profile 复制/启动失败）")
-
-            page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(60000)
-            self._page = page
-
+            context, page = self.start_session(p)
             try:
-                self._log("正在访问雪球首页 …")
-                try:
-                    page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
-                except Exception:
-                    pass
-                self._rsleep(5, 8)
-                self._human_move(page)
-                self._rsleep(2, 4)
-
-                # 登录检测（仅在无登录态时等待人工登录；有持久化 Profile 则秒过）
-                self._ensure_login(page)
-
-                run_id = self._do_one_scrape(page)
+                return self._do_one_scrape(page)
             finally:
-                try:
-                    context.close()
-                except Exception:
-                    pass
-                self._page = None
-        return run_id if 'run_id' in dir() else None
+                self.close_session()
 
     # ──────────────────────────────────────────────
     #  主流程 — 持续运行

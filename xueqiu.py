@@ -31,6 +31,7 @@ import sys
 import time
 import random
 from datetime import datetime, timedelta
+from playwright.sync_api import sync_playwright
 
 # ── 路径配置（支持 EXE 打包）──
 if getattr(sys, "frozen", False):
@@ -325,6 +326,20 @@ def main():
         signal.signal(signal.SIGTERM, _handler)
 
     round_no = 0
+    # 单一浏览器常驻：所有引擎共用一个 Chrome 进程（登录持久化 profile），
+    # 推荐与话题顺序复用同一 context/page；话题在其上另开非登录 guest context 做热点发现。
+    # 只刷新页面不复开，避免每轮重复启动 Chrome 导致标签页堆积、内存膨胀。
+    pw_cm = None
+    if do_recommend or do_hashtag:
+        pw_cm = sync_playwright()
+        pw = pw_cm.__enter__()
+        if do_recommend:
+            rec.start_session(pw)            # 推荐引擎拥有登录持久化 context
+        if do_hashtag:
+            if do_recommend:
+                htag.start_session(pw, login_ctx=rec._context, login_page=rec._page)  # 借用同一 context
+            else:
+                htag.start_session(pw)       # 话题单独运行，自行拥有登录 context
     try:
         while state["running"]:
             round_no += 1
@@ -334,14 +349,14 @@ def main():
 
             if do_recommend:
                 try:
-                    rid = rec.scrape_once()
+                    rid = rec._do_one_scrape(rec._page)
                     _print(f"  推荐/热门抓取完成 (run_id={rid})")
                 except Exception as e:
                     _print(f"  [!] 推荐抓取异常: {e}")
 
             if do_hashtag:
                 try:
-                    n = htag.scrape_once()
+                    n = htag._scrape_round(htag._login_page, htag._guest_page)
                     _print(f"  话题抓取完成 (新增 {n} 条评论) -> {htag.name}")
                     if not args.no_clues:
                         md, _, c = gen_hashtag_clues(
@@ -382,6 +397,21 @@ def main():
                 time.sleep(5)
                 waited += 5
     finally:
+        if pw_cm is not None:
+            try:
+                if do_hashtag:
+                    htag.close_session()      # 关 guest；若 --mode all 借用则不关共享登录 context
+            except Exception:
+                pass
+            try:
+                if do_recommend:
+                    rec.close_session()       # 关共享登录 context（--mode all 由推荐引擎持有）
+            except Exception:
+                pass
+            try:
+                pw_cm.__exit__(None, None, None)
+            except Exception:
+                pass
         if rec is not None:
             try:
                 rec.db.close()

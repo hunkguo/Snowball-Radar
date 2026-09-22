@@ -165,6 +165,28 @@ def _nav_get_json(page, url, max_retry=3, log=None):
     return None
 
 
+def _cleanup_restored_tabs(context):
+    """关闭持久化 profile 启动时 Chrome 自动恢复的旧标签页，只保留一个干净页面。
+
+    雪球的持久化 profile 每次启动都会恢复上次未关闭的窗口/标签页；若不处理，
+    每轮重复启动后标签页越积越多、内存持续膨胀。这里在启动后只留一个页面，
+    抓取时只在该页面内导航/刷新，不再开新标签。
+    """
+    try:
+        pages = list(context.pages)
+        if len(pages) > 1:
+            for p in pages[1:]:
+                try:
+                    p.close()
+                except Exception:
+                    pass
+        if not context.pages:
+            context.new_page()
+    except Exception:
+        pass
+
+
+
 DB_PATH = os.path.join(DATA_DIR, "hashtag_comments.db")
 EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 
@@ -375,6 +397,14 @@ class XueqiuHashtagScraper:
         self.max_comment_pages = max_comment_pages
         self.auto_discover = auto_discover
         self._running = True
+        # 常驻浏览器会话（run_forever / --mode hashtag 只开一次，避免每轮重复启动 Chrome 导致标签页堆积）
+        self._pw = None
+        self._browser = None
+        self._owns_login = True  # --mode all 借用推荐引擎 context 时为 False
+        self._login_ctx = None
+        self._login_page = None
+        self._guest_ctx = None
+        self._guest_page = None
 
     def _extract_post_ids(self, page):
         return page.evaluate("""
@@ -479,60 +509,124 @@ class XueqiuHashtagScraper:
             page.wait_for_timeout(2000)
         return []
 
-    def scrape_once(self):
-        """一轮热点抓取（两阶段，严格区分登录/非登录）。
+    def start_session(self, pw, login_ctx=None, login_page=None):
+        """启动并复用单一浏览器会话（整个持续运行/--mode hashtag 生命周期内只开一次）。
 
-        阶段1【非登录】发现热点榜：?category=hotspot 只在非登录态才展示「雪球热点」
-        话题列表；登录态下会变成个性化信息流，看不到热点榜。
-        阶段2【登录】抓取评论：话题详情页可非登录看，但 comments.json 评论接口
-        必须登录（实测非登录返回 error_code=400016「请重新登录」），故抓取帖子的
-        评论必须用登录态持久化 profile。
+        设计（回应"chrome 每轮重复打开、标签页越积越多"的诉求）：
+        - 登录态抓评论（comments.json 需登录）；
+        - 同一进程上另开一个【非登录】guest context（不携带持久化 cookie）用于热点榜发现
+          （?category=hotspot 的热点榜仅非登录可见），满足"以区分"且不再额外开浏览器；
+        - 两个 context 各自只保一个页面，抓取时只在该页面内导航/刷新，绝不开新标签、绝不复开。
 
-        两阶段上下文严格区分（"以区分"）：发现用非登录临时上下文，抓取用登录 profile。
+        login_ctx/login_page 可选：由 --mode all 的统一调度器传入【推荐引擎已启动的同一
+        持久化登录 context】，此时本引擎不再另开浏览器，直接复用该 context 抓评论 +
+        在其浏览器上开 guest context 做非登录发现——实现【单一浏览器跑两个引擎】。
+        返回 (login_ctx, login_page, guest_page)；缓存在 self 上供 run_forever 复用。
         """
-        with sync_playwright() as pw:
-            # ── 阶段1：非登录发现热点榜 ──
-            _log("[热点引擎] 阶段1 发现热点：使用【非登录】上下文（热点榜仅非登录可见）")
-            guest = pw.chromium.launch(
-                channel="chrome", headless=self.headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            gctx = guest.new_context(
-                user_agent=GUEST_USER_AGENT, viewport={"width": 1280, "height": 900},
-            )
-            gpage = gctx.new_page()
-            if self.auto_discover:
-                try:
-                    topics = self._discover_hotspots(gpage)
-                except Exception as e:
-                    _log(f"  发现热点异常，本轮跳过: {e}")
-                    topics = []
-                if not topics:
-                    _log("  未从热点榜发现任何话题，本轮跳过")
-                    gctx.close(); guest.close(); return 0
-            else:
-                topics = [(self.url, self.name)]
-            gctx.close(); guest.close()
+        if self._browser is not None:
+            return (self._login_ctx, self._login_page, self._guest_page)
 
-            # ── 阶段2：登录态抓取每个热点的帖子+评论（评论接口需登录）──
-            _log("[热点引擎] 阶段2 抓取评论：使用【登录】持久化 profile（评论接口需登录态）")
+        if login_ctx is not None and login_page is not None:
+            # 借用推荐引擎的登录 context（--mode all 单一浏览器）
+            self._owns_login = False
+            self._login_ctx = login_ctx
+            self._login_page = login_page
+            browser = login_ctx.browser
+        else:
+            # 自行启动登录持久化 context
+            self._owns_login = True
             profile_dir = resolve_profile_dir()
             _kill_stale_chrome(profile_dir, log=_log)
-            browser = pw.chromium.launch_persistent_context(
+            login_ctx = pw.chromium.launch_persistent_context(
                 user_data_dir=profile_dir, channel="chrome", headless=self.headless,
                 accept_downloads=False, user_agent=GUEST_USER_AGENT,
                 viewport={"width": 1280, "height": 900},
                 args=["--disable-blink-features=AutomationControlled"],
             )
-            page = browser.pages[0] if browser.pages else browser.new_page()
-            total_new = 0
-            n = min(len(topics), HOTSPOT_TOP_N)
-            for idx, (url, title) in enumerate(topics[:HOTSPOT_TOP_N], 1):
-                _log(f"\n{'='*16} 热点 {idx}/{n}: {title} {'='*16}")
-                total_new += self._scrape_topic(page, url, title)
-            _log(f"\n本轮热点抓取完成，共入库评论 {total_new} 条")
-            browser.close()
+            _cleanup_restored_tabs(login_ctx)  # 关掉 Chrome 自动恢复的旧标签页，只留一个干净页面
+            self._login_ctx = login_ctx
+            self._login_page = login_ctx.pages[0] if login_ctx.pages else login_ctx.new_page()
+            browser = login_ctx.browser
+
+        self._browser = browser
+        # 非登录 guest context：同一浏览器进程上的独立 context，不读持久化 cookie
+        self._guest_ctx = browser.new_context(
+            user_agent=GUEST_USER_AGENT, viewport={"width": 1280, "height": 900})
+        try:
+            self._guest_ctx.clear_cookies()
+        except Exception:
+            pass
+        self._guest_page = self._guest_ctx.new_page()
+        _log("[热点引擎] 浏览器会话已就绪：单一常驻进程（登录态抓评论 + 非登录发现热点）")
+        return (self._login_ctx, self._login_page, self._guest_page)
+
+    def close_session(self):
+        """关闭常驻浏览器会话（Ctrl+C 退出或单次运行结束时调用）。
+
+        若 login context 是 --mode all 下向推荐引擎借用的（_owns_login=False），
+        则只关自己的 guest context，不动共享的登录 context（由推荐引擎负责关闭）。
+        """
+        try:
+            if self._guest_ctx is not None:
+                self._guest_ctx.close()
+        except Exception:
+            pass
+        try:
+            if self._owns_login and self._login_ctx is not None:
+                self._login_ctx.close()
+        except Exception:
+            pass
+        self._browser = None
+        self._login_ctx = None
+        self._login_page = None
+        self._guest_ctx = None
+        self._guest_page = None
+        self._owns_login = True
+
+    def _scrape_round(self, login_page, guest_page):
+        """执行一轮热点抓取（发现 + 逐话题抓评论），不负责浏览器的开关。
+
+        两阶段上下文严格区分（"以区分"）：发现用非登录 guest_page，抓取用登录 login_page。
+        """
+        # ── 阶段1：非登录发现热点榜 ──
+        if self.auto_discover:
+            _log("[热点引擎] 阶段1 发现热点：使用【非登录】上下文（热点榜仅非登录可见）")
+            try:
+                topics = self._discover_hotspots(guest_page)
+            except Exception as e:
+                _log(f"  发现热点异常，本轮跳过: {e}")
+                topics = []
+            if not topics:
+                _log("  未从热点榜发现任何话题，本轮跳过")
+                return 0
+        else:
+            topics = [(self.url, self.name)]
+
+        # ── 阶段2：登录态抓取每个热点的帖子+评论（评论接口需登录）──
+        _log("[热点引擎] 阶段2 抓取评论：使用【登录】持久化 profile（评论接口需登录态）")
+        total_new = 0
+        n = min(len(topics), HOTSPOT_TOP_N)
+        for idx, (url, title) in enumerate(topics[:HOTSPOT_TOP_N], 1):
+            _log(f"\n{'='*16} 热点 {idx}/{n}: {title} {'='*16}")
+            total_new += self._scrape_topic(login_page, url, title)
+        _log(f"\n本轮热点抓取完成，共入库评论 {total_new} 条")
         return total_new
+
+    def scrape_once(self, session=None):
+        """一轮热点抓取。
+
+        session=(login_ctx, login_page, guest_page) 由 run_forever / xueqiu.py 复用
+        （单一浏览器常驻，只刷新页面不复开，节约内存）；为 None 时（单次运行 / --mode all
+        每轮）自行启动并关闭浏览器（同样带标签页清理，避免旧标签堆积）。
+        """
+        if session is not None:
+            return self._scrape_round(*session)
+        with sync_playwright() as pw:
+            login_ctx, login_page, guest_page = self.start_session(pw)
+            try:
+                return self._scrape_round(login_page, guest_page)
+            finally:
+                self.close_session()
 
     def _scrape_topic(self, page, url, title):
         """抓取单个热点话题页的帖子评论（登录上下文，评论接口需登录）。返回本轮入库评论数。"""
@@ -640,36 +734,39 @@ class XueqiuHashtagScraper:
         from datetime import timedelta
         _log("=" * 60)
         _log(f"  持续运行模式启动：每 {RUN_INTERVAL_MIN}-{RUN_INTERVAL_MAX} 分钟抓取一轮")
-        _log("  数据增量去重存储，每轮生成独立的价值线索 md 文件（不重复）")
+        _log("  单一浏览器常驻（登录态抓评论 + 非登录发现热点），只刷新页面不复开，节约内存")
         _log("  按 Ctrl+C 可退出程序")
         _log("=" * 60)
         round_no = 0
-        try:
-            while self._running:
-                round_no += 1
-                _log(f"\n{'='*60}")
-                _log(f"  第 {round_no} 轮抓取  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                _log(f"{'='*60}")
-                try:
-                    new_count = self.scrape_once()
-                except Exception as e:
-                    _log(f"  ⚠ 本轮抓取异常: {e}")
-                    new_count = 0
-                self._export_round()
-                # 价值线索已按话题在 _scrape_topic 内逐个生成，无需再整体生成
-                if not self._running:
-                    break
-                wait_min = random.randint(RUN_INTERVAL_MIN, RUN_INTERVAL_MAX)
-                next_t = datetime.now() + timedelta(minutes=wait_min)
-                _log(f"\n  本轮结束，新增评论 {new_count} 条")
-                _log(f"  下次执行时间: {next_t.strftime('%Y-%m-%d %H:%M:%S')}（约 {wait_min} 分钟后）")
-                _log(f"  按 Ctrl+C 退出程序\n")
-                self._interruptible_sleep(wait_min * 60)
-        except KeyboardInterrupt:
-            _log("\n收到 Ctrl+C，准备退出…")
-        finally:
-            _log("数据库已关闭")
-            self.db.close()
+        with sync_playwright() as pw:
+            self.start_session(pw)  # 整个运行期只开一次浏览器
+            try:
+                while self._running:
+                    round_no += 1
+                    _log(f"\n{'='*60}")
+                    _log(f"  第 {round_no} 轮抓取  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    _log(f"{'='*60}")
+                    try:
+                        new_count = self._scrape_round(self._login_page, self._guest_page)
+                    except Exception as e:
+                        _log(f"  ⚠ 本轮抓取异常: {e}")
+                        new_count = 0
+                    self._export_round()
+                    # 价值线索已按话题在 _scrape_topic 内逐个生成，无需再整体生成
+                    if not self._running:
+                        break
+                    wait_min = random.randint(RUN_INTERVAL_MIN, RUN_INTERVAL_MAX)
+                    next_t = datetime.now() + timedelta(minutes=wait_min)
+                    _log(f"\n  本轮结束，新增评论 {new_count} 条")
+                    _log(f"  下次执行时间: {next_t.strftime('%Y-%m-%d %H:%M:%S')}（约 {wait_min} 分钟后）")
+                    _log(f"  按 Ctrl+C 退出程序\n")
+                    self._interruptible_sleep(wait_min * 60)
+            except KeyboardInterrupt:
+                _log("\n收到 Ctrl+C，准备退出…")
+            finally:
+                self.close_session()
+                _log("数据库已关闭")
+                self.db.close()
 
 
 def main():
