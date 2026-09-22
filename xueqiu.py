@@ -450,11 +450,9 @@ def main():
                             htag._browser = rec._context.browser
                         except Exception:
                             htag._browser = None
-                    if not htag._page_alive(htag._guest_page):
-                        if htag.ensure_guest_context(force=True):
-                            _print("  [ok] 非登录发现页面已重建")
-                        else:
-                            _print("  [!] 非登录发现页面重建失败（本轮热点发现将跳过）")
+                    # 非登录 guest context 已改为【惰性创建】：热点发现走登录态首页右侧
+                    # 「热门话题」榜，匿名 context 仅在登录态取不到榜单时由 _scrape_round
+                    # 内部按需建立，这里不再每轮强制重建（少一个 context，省内存 + 少一份指纹）。
                 else:
                     if not htag.ensure_session_alive(pw):
                         _print("  [!] 热点引擎会话不可用（本轮跳过，下一轮自动重试）")
@@ -469,10 +467,12 @@ def main():
             if do_hashtag:
                 try:
                     n = htag._scrape_round(htag._login_page, htag._guest_page)
-                    _print(f"  话题抓取完成 (新增 {n} 条评论) -> {htag.name}")
+                    _print(f"  话题抓取完成 (新增 {n} 条评论)")
                     if not args.no_clues:
+                        # 注：各话题已在 _scrape_topic 内按话题独立生成 insight_<话题>_*.md；
+                        # 这里额外产出一份「全部热门话题」汇总（名称中立，不再沿用写死的旧话题名）。
                         md, _, c = gen_hashtag_clues(
-                            name=htag.name, short=htag.short,
+                            name="雪球热门话题（全部）", short="hashtag_all",
                             write_json=args.write_json, incremental=_do_incremental,
                             include_prompt=args.include_prompt,
                             upload=upload_enabled, upload_url=worker_url,

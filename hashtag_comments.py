@@ -112,12 +112,15 @@ def _is_waf_page_text(text):
             or "请完成安全验证" in text)
 
 
-def _nav_get_json(page, url, max_retry=3, log=None):
+def _nav_get_json(page, url, max_retry=3, log=None, state=None):
     """真实浏览器导航拉取 JSON 接口（不用页内 fetch，避免被 WAF 抓特征）。
 
     返回解析后的 dict；命中风控挑战页或解析失败时返回 None。
     与 scraper._fetch_api 路径2 同思路：page.goto 是真实浏览器导航，由 Chromium
     自带完整请求头 + 持久化 cookie，最难被风控标记为机器人。
+
+    state：可选 dict，用于跨调用累计风控命中次数（state["waf"] 自增），
+    调用方据此判断"是否已被风控盯上"并提前止损（避免持续轰炸加重封禁）。
     """
     for attempt in range(1, max_retry + 1):
         try:
@@ -204,17 +207,23 @@ POST_DELAY = (3, 6)        # 帖子间随机停顿（秒）
 COMMENT_PAGE_DELAY = (1, 3)
 HEADLESS = True            # 无头模式（可后台运行）；需看登录过程改为 False
 
-# ── 热点发现（非登录）──
-# 雪球「雪球热点」榜单【只在非登录状态】才展示于 ?category=hotspot；
-# 登录态下该页会变成个性化信息流，看不到热点榜。
-# 故本引擎全程用【非登录】上下文，与「推荐/关注」的登录态引擎（scraper.py）严格区分（"以区分"）。
+# ── 热点发现（登录态优先，非登录仅作兜底）──
+# 实测结论（2026-09-22）：
+#   · 登录态首页右侧「热门话题」表 (table.board__list.topic-hot__list) 与匿名
+#     ?category=hotspot 页榜单【内容完全一致】（同为 10 条），条目链接形如
+#     /k?q=%23<话题名>%23，点击后自动 301 到 /hashtag/I-... 标准话题页。
+#   · 匿名上下文抓 comments.json 返回【空列表】(count=None)，等于抓不到评论；
+#     只有登录态才能拿到评论。故【发现 + 抓取全程使用登录态】，不再依赖匿名。
+LOGIN_HOT_URL = "https://www.xueqiu.com/"   # 登录态首页（右侧含热门话题榜）
+HOT_TOPIC_TABLE_SEL = "table.board__list.topic-hot__list"
+# 每轮抓取的热点话题数（取榜单前 N，页面上限约 10）
+HOTSPOT_TOP_N = 10
+# 匿名兜底源（仅当登录态首页取不到热门话题时才回退使用）
 HOTSPOT_URL = "https://www.xueqiu.com/?category=hotspot"
-# 每轮抓取的热点话题数（取榜单前 N）。
-# 注：雪球热点榜页面（匿名态）稳定只渲染约 10 个话题，懒加载不会追加，
-# 故这里设为 10 即吃满页面能给的全部候选；如需降负载可调小。
-HOTSPOT_TOP_N = 10           # 每轮抓取的热点话题数（取榜单前 N，页面上限约 10）
 MAX_POSTS_PER_TOPIC = 20    # 单个热点话题最多抓取的帖子数（上调以收集更多评论；注意单轮时长）
-# 非登录桌面 UA：让话题详情页沿用 article.timeline__item + a[data-id] 结构（已有提取逻辑）
+# 风控止损：本轮累计命中风控次数达到该值，即中止本轮（避免持续请求加深封禁）
+WAF_ABORT_THRESHOLD = 3
+# 非登录桌面 UA（仅匿名兜底发现时使用，保持与登录浏览器一致的指纹）
 GUEST_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -254,7 +263,9 @@ def _log(msg):
     try:
         print(line, flush=True)
     except UnicodeEncodeError:
-        print(line.encode("utf-8", "replace").decode("utf-8"), flush=True)
+        # Windows GBK 控制台无法输出 ✅/⚠ 等字符：按当前编码降级替换，保证不崩线程
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
 
 
 # ── 数据库 ──
@@ -432,17 +443,25 @@ class XueqiuHashtagScraper:
             }
         """)
 
-    def _fetch_comments(self, page, post_id):
-        """拉取某帖评论（多页）。改用真实浏览器导航，不再用页内 fetch。
+    def _fetch_comments(self, page, post_id, state=None):
+        """拉取某帖评论（多页，登录态 page）。
 
-        每页一次 page.goto（真实导航，难被风控标记），读取 <pre>/innerText 里的
-        JSON 解析累加；空页或返回非 JSON 即停止。
+        用真实浏览器导航取 JSON（难被风控标记），读取 <pre>/innerText 解析累加；
+        空页或返回非 JSON 即停止。
+
+        state：跨帖累计风控次数的 dict（见 _nav_get_json）。一旦累计命中达到
+        WAF_ABORT_THRESHOLD，本方法立即返回并置 state["abort"]=True，让调用方
+        中止本轮，避免在已被风控盯上的情况下继续大量请求（越请求封得越久）。
         """
         all_comments = []
         for p in range(1, self.max_comment_pages + 1):
             url = (f"https://xueqiu.com/statuses/comments.json"
                    f"?id={post_id}&page={p}&count=20")
-            j = _nav_get_json(page, url, max_retry=2, log=_log)
+            j = _nav_get_json(page, url, max_retry=2, log=_log, state=state)
+            if state is not None and state.get("waf", 0) >= WAF_ABORT_THRESHOLD:
+                if state is not None:
+                    state["abort"] = True
+                break
             if not j:
                 break
             list_ = j.get("comments") or j.get("list") or []
@@ -451,20 +470,94 @@ class XueqiuHashtagScraper:
             all_comments.extend(list_)
             if len(list_) < 20:
                 break
+            # 翻页间隔（降低请求密度，减小触发风控概率）
+            try:
+                page.wait_for_timeout(random.uniform(*COMMENT_PAGE_DELAY) * 1000)
+            except Exception:
+                break
         return all_comments
 
-    def _discover_hotspots(self, page, top_n=HOTSPOT_TOP_N):
-        """非登录状态访问热点榜，取前 top_n 个热点话题，返回 [(url, title), ...]。
+    def _discover_hot_from_home(self, page, top_n=HOTSPOT_TOP_N):
+        """登录态访问雪球首页，读取右侧「热门话题」榜，返回 [(url, title), ...]。
 
-        关键：雪球「雪球热点」榜单【只在非登录】时才展示于 ?category=hotspot；
-        登录态下该页会变成个性化信息流，看不到热点榜。故调用方必须用非登录上下文。
+        为什么用登录态：
+        - 首页右侧「热门话题」表（table.board__list.topic-hot__list）在登录态下
+          正常渲染，内容与匿名 ?category=hotspot 榜完全一致（实测同为 10 条）；
+        - 而匿名上下文抓评论接口只会拿到空列表 —— 所以整条链路统一走登录态，
+          不再需要额外的匿名 guest context（少一个 context，内存与指纹都更干净）。
+        条目 href 形如 /k?q=%23<话题名>%23，点击后自动跳转到 /hashtag/I-... 话题页。
+        """
+        _log(f"  登录态访问雪球首页 {LOGIN_HOT_URL}，读取右侧「热门话题」…")
+        for attempt in range(1, 4):
+            try:
+                page.goto(LOGIN_HOT_URL, wait_until="domcontentloaded", timeout=25000)
+            except Exception as e:
+                _log(f"  打开雪球首页失败(尝试{attempt}/3): {e}")
+                page.wait_for_timeout(2000)
+                continue
+            page.wait_for_timeout(3500)
+            # 右栏偶尔随首屏懒渲染，轻滚两下促其出现
+            for _ in range(2):
+                try:
+                    page.mouse.wheel(0, 900)
+                    page.wait_for_timeout(700)
+                except Exception:
+                    break
+            try:
+                txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            except Exception:
+                txt = ""
+            if _is_waf_page_text(txt):
+                _log(f"  [!] 首页命中风控/拦截页(尝试{attempt}/3)，等 6s 重试…")
+                page.wait_for_timeout(6000)
+                continue
+            items = page.evaluate("""() => {
+                const tbl = document.querySelector('table.board__list.topic-hot__list');
+                if (!tbl) return [];
+                const out = [];
+                tbl.querySelectorAll('tr').forEach(tr => {
+                    const a = tr.querySelector('a');
+                    if (!a) return;
+                    const href = a.getAttribute('href') || '';
+                    const text = (a.textContent || '').trim();
+                    if (href && text && !out.some(o => o.url === href))
+                        out.push({url: href, title: text.slice(0, 60)});
+                });
+                return out;
+            }""")
+            total_found = len(items)
+            out = []
+            for it in items[:top_n]:
+                url = it["url"]
+                if url.startswith("//"):
+                    url = "https:" + url
+                elif url.startswith("/"):
+                    url = "https://xueqiu.com" + url
+                out.append((url, it["title"]))
+            if out:
+                _log(f"  ✅ 登录态取到右侧「热门话题」{total_found} 条，本轮抓取前 {len(out)} 个:")
+                for i, (_, t) in enumerate(out, 1):
+                    _log(f"     {i}. {t}")
+                return out
+            _log(f"  [!] 首页未解析到「热门话题」表格(尝试{attempt}/3)，可能页面改版/未登录，重试…")
+            page.wait_for_timeout(2000)
+        return []
+
+    def _discover_hotspots(self, page, top_n=HOTSPOT_TOP_N):
+        """【兜底】非登录状态访问热点榜，取前 top_n 个热点话题，返回 [(url, title), ...]。
+
+        仅在登录态首页取不到热门话题时才调用。注意：匿名上下文只能用来「发现」
+        列表，抓评论必须回到登录态 page（匿名抓 comments.json 只会拿到空列表）。
+
+        关键：雪球「雪球热点」榜单在匿名态展示于 ?category=hotspot；
+        登录态下该页会变成个性化信息流，看不到热点榜，故兜底路径必须用非登录上下文。
         命中话题链接形如 /hashtag/I-...（话题详情页，沿用 article.timeline__item 结构）。
 
         鲁棒性：该页常遇 WAF 挑战页（真实导航后挑战 JS 写 cookie 再重定向），
         故最多重试 3 次，每次检测 _waf / renderData / 人机验证 等特征，命中则
         等待挑战 JS 执行完再重导航。
         """
-        _log(f"  阶段1 发现热点：以【匿名/非登录】状态访问 {HOTSPOT_URL}（热点榜仅匿名可见，不携带登录 Cookie）")
+        _log(f"  【兜底】匿名访问 {HOTSPOT_URL} 发现热点（仅列表发现，抓评论仍回登录态）")
         for attempt in range(3):
             try:
                 page.goto(HOTSPOT_URL, wait_until="domcontentloaded", timeout=25000)
@@ -517,18 +610,22 @@ class XueqiuHashtagScraper:
         _log("  ⚠ 匿名发现热点失败：3 次尝试均未解析到话题链接。请检查网络/WAF，或关闭 AUTO_DISCOVER 手动指定 HASHTAG_URL。")
         return []
 
+    def _discover_hotspots_fallback(self, page):
+        """兼容旧调用名（等价于 _discover_hotspots）。"""
+        return self._discover_hotspots(page)
+
     def start_session(self, pw, login_ctx=None, login_page=None):
         """启动并复用单一浏览器会话（整个持续运行/--mode hashtag 生命周期内只开一次）。
 
         设计（回应"chrome 每轮重复打开、标签页越积越多"的诉求）：
-        - 登录态抓评论（comments.json 需登录）；
-        - 同一进程上另开一个【非登录】guest context（不携带持久化 cookie）用于热点榜发现
-          （?category=hotspot 的热点榜仅非登录可见），满足"以区分"且不再额外开浏览器；
-        - 两个 context 各自只保一个页面，抓取时只在该页面内导航/刷新，绝不开新标签、绝不复开。
+        - 登录态抓评论 + 登录态发现热门话题（首页右侧「热门话题」），全程单一 context；
+        - 非登录 guest context 改为【惰性创建】：只有在登录态取不到热门话题、需要
+          匿名兜底发现时才临时新建（实测两者榜单内容一致，正常情况下根本用不到，
+          少一个 context 更省内存、也少一份被风控关联的指纹）；
+        - 只保一个页面，抓取时只在该页面内导航/刷新，绝不开新标签、绝不复开。
 
         login_ctx/login_page 可选：由 --mode all 的统一调度器传入【推荐引擎已启动的同一
-        持久化登录 context】，此时本引擎不再另开浏览器，直接复用该 context 抓评论 +
-        在其浏览器上开 guest context 做非登录发现——实现【单一浏览器跑两个引擎】。
+        持久化登录 context】，此时本引擎不再另开浏览器，直接复用该 context。
         返回 (login_ctx, login_page, guest_page)；缓存在 self 上供 run_forever 复用。
         """
         if self._browser is not None:
@@ -539,7 +636,7 @@ class XueqiuHashtagScraper:
             self._owns_login = False
             self._login_ctx = login_ctx
             self._login_page = login_page
-            browser = login_ctx.browser
+            self._browser = login_ctx.browser
         else:
             # 自行启动登录持久化 context
             self._owns_login = True
@@ -554,18 +651,12 @@ class XueqiuHashtagScraper:
             _cleanup_restored_tabs(login_ctx)  # 关掉 Chrome 自动恢复的旧标签页，只留一个干净页面
             self._login_ctx = login_ctx
             self._login_page = login_ctx.pages[0] if login_ctx.pages else login_ctx.new_page()
-            browser = login_ctx.browser
+            self._browser = login_ctx.browser
 
-        self._browser = browser
-        # 非登录 guest context：同一浏览器进程上的独立 context，不读持久化 cookie
-        self._guest_ctx = browser.new_context(
-            user_agent=GUEST_USER_AGENT, viewport={"width": 1280, "height": 900})
-        try:
-            self._guest_ctx.clear_cookies()
-        except Exception:
-            pass
-        self._guest_page = self._guest_ctx.new_page()
-        _log("[热点引擎] 浏览器会话已就绪：单一常驻进程（登录态抓评论 + 非登录发现热点）")
+        # guest context 惰性创建（默认 None）；只有兜底发现时才由 ensure_guest_context() 建
+        self._guest_ctx = None
+        self._guest_page = None
+        _log("[热点引擎] 浏览器会话已就绪：单一常驻进程（登录态发现热点 + 登录态抓评论）")
         return (self._login_ctx, self._login_page, self._guest_page)
 
     def close_session(self):
@@ -643,7 +734,11 @@ class XueqiuHashtagScraper:
             return False
 
     def ensure_session_alive(self, pw):
-        """话题单跑模式(--mode hashtag)自愈：登录会话失效则整体重连，并确保 guest 可用。"""
+        """话题单跑模式(--mode hashtag)自愈：登录会话失效则整体重连。
+
+        注意：这里【不再】顺带创建非登录 guest context —— 发现热点已改为登录态优先，
+        匿名 context 只在登录态取不到榜单时才惰性建立（见 _scrape_round）。
+        """
         if not self._page_alive(self._login_page):
             _log("  [!] 热点引擎浏览器已失效（被关闭/崩溃），正在自动重连…")
             try:
@@ -652,42 +747,53 @@ class XueqiuHashtagScraper:
             except Exception as e:
                 _log(f"  [!] 热点引擎重连失败: {e}")
                 return False
-        return self.ensure_guest_context()
+        return self._page_alive(self._login_page)
 
-    def _scrape_round(self, login_page, guest_page):
+    def _scrape_round(self, login_page, guest_page=None, state=None):
         """执行一轮热点抓取（发现 + 逐话题抓评论），不负责浏览器的开关。
 
-        两阶段上下文严格区分（"以区分"）：发现用非登录 guest_page，抓取用登录 login_page。
+        全程登录态：
+        - 阶段1 用【登录】page 打开雪球首页，读右侧「热门话题」榜；
+        - 阶段2 仍是同一个登录 page 抓评论（comments.json 需登录态；匿名只会返回空列表）。
+        仅当登录态取不到热门话题时，才临时创建非登录 guest context 做兜底发现。
+
+        state：本轮共享的 dict，累计风控命中次数（state["waf"]）与中止标记（state["abort"]）。
         若页面/浏览器已被外部关闭（崩溃、被其它进程清理），先尝试自愈重建再继续，
         避免整轮以 "Target page, context or browser has been closed" 失败。
         """
-        # ── 阶段0：会话健康检查（自愈）──
-        if not self._page_alive(guest_page):
-            _log("  [!] 非登录发现页面已失效（浏览器可能被关闭/崩溃），尝试自动重建…")
-            if self.ensure_guest_context(force=True):
-                guest_page = self._guest_page
-                _log("  [ok] 非登录发现页面已重建")
-            else:
-                _log("  [!] 非登录发现页面重建失败，本轮跳过（下一轮会自动重试）")
-                return 0
+        if state is None:
+            state = {}
+
+        # ── 阶段0：登录会话健康检查（自愈，必须通过）──
         if not self._page_alive(login_page):
             if self._page_alive(self._login_page):
                 login_page = self._login_page
             else:
-                _log("  [!] 登录页面已失效，本轮跳过评论抓取"
+                _log("  [!] 登录页面已失效，本轮跳过"
                      "（--mode all 下由调度器重连浏览器后自动恢复）")
                 return 0
 
-        # ── 阶段1：非登录发现热点榜 ──
+        # ── 阶段1：登录态发现热门话题（首页右侧「热门话题」榜）──
         if self.auto_discover:
-            _log("[热点引擎] 阶段1 发现热点：使用【非登录】上下文（热点榜仅非登录可见）")
+            _log("[热点引擎] 阶段1 发现热点：登录态打开雪球首页，读取右侧「热门话题」榜")
+            topics = []
             try:
-                topics = self._discover_hotspots(guest_page)
+                topics = self._discover_hot_from_home(login_page)
             except Exception as e:
-                _log(f"  发现热点异常，本轮跳过: {e}")
-                topics = []
+                _log(f"  登录态发现热点异常: {e}")
             if not topics:
-                _log("  未从热点榜发现任何话题，本轮跳过")
+                # 兜底：非登录热点榜（仅在登录态取不到时才惰性建匿名 context）
+                _log("  [!] 登录态未取到热门话题，启用【非登录】兜底发现（仅用于列表发现）…")
+                try:
+                    if not self._page_alive(guest_page):
+                        if self.ensure_guest_context():
+                            guest_page = self._guest_page
+                    if self._page_alive(guest_page):
+                        topics = self._discover_hotspots(guest_page)
+                except Exception as e:
+                    _log(f"  非登录兜底发现异常: {e}")
+            if not topics:
+                _log("  未发现任何热点话题，本轮跳过")
                 return 0
         else:
             topics = [(self.url, self.name)]
@@ -697,8 +803,12 @@ class XueqiuHashtagScraper:
         total_new = 0
         n = min(len(topics), HOTSPOT_TOP_N)
         for idx, (url, title) in enumerate(topics[:HOTSPOT_TOP_N], 1):
+            if state.get("abort"):
+                _log(f"\n  [!] 本轮已累计命中风控 {state.get('waf', 0)} 次，提前结束"
+                     f"（已完成 {idx-1}/{n} 个话题），留待下一轮再抓")
+                break
             _log(f"\n{'='*16} 热点 {idx}/{n}: {title} {'='*16}")
-            total_new += self._scrape_topic(login_page, url, title)
+            total_new += self._scrape_topic(login_page, url, title, state=state)
         _log(f"\n本轮热点抓取完成，共入库评论 {total_new} 条")
         return total_new
 
@@ -710,7 +820,8 @@ class XueqiuHashtagScraper:
         每轮）自行启动并关闭浏览器（同样带标签页清理，避免旧标签堆积）。
         """
         if session is not None:
-            return self._scrape_round(*session)
+            # session = (login_ctx, login_page, guest_page)
+            return self._scrape_round(session[1], session[2])
         with sync_playwright() as pw:
             login_ctx, login_page, guest_page = self.start_session(pw)
             try:
@@ -718,13 +829,24 @@ class XueqiuHashtagScraper:
             finally:
                 self.close_session()
 
-    def _scrape_topic(self, page, url, title):
-        """抓取单个热点话题页的帖子评论（登录上下文，评论接口需登录）。返回本轮入库评论数。"""
+    def _scrape_topic(self, page, url, title, state=None):
+        """抓取单个热点话题页的帖子评论（登录态 page）。返回本轮入库评论数。
+
+        url 可能是两种形态，均落在同一话题页：
+        - /k?q=%23<话题名>%23（首页右侧「热门话题」条目，浏览器会自动跳转到话题页）
+        - /hashtag/I-...（话题页直链，匿名兜底路径给出）
+        state：本轮共享风控计数（见 _scrape_round）。
+        """
+        if state is None:
+            state = {}
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=25000)
         except Exception as e:
             _log(f"  [!] 打开话题页失败（可能已失效/触发下载）: {e}，跳过该话题")
             return 0
+        # /k?q= 是搜索跳转入口，需等它 301 到 /hashtag/... 话题页再解析
+        if "/k?" in url or "/k?" in (page.url or ""):
+            page.wait_for_timeout(2500)
         page.wait_for_timeout(4000)
         # 滚动加载更多帖子
         for i in range(self.scroll_rounds):
@@ -743,11 +865,15 @@ class XueqiuHashtagScraper:
 
         total_new = 0
         for idx, p in enumerate(posts, 1):
+            if state.get("abort"):
+                _log(f"  [!] 已累计命中风控 {state.get('waf', 0)} 次，跳过本话题剩余 "
+                     f"{len(posts) - idx + 1} 个帖子（避免继续请求加深封禁）")
+                break
             pid = p["id"]
             author = p.get("author", "")
             self.db.save_post(pid, author, title)
             _log(f"  ({idx}/{len(posts)}) 抓取帖子 {pid} 的评论…")
-            raw = self._fetch_comments(page, pid)
+            raw = self._fetch_comments(page, pid, state=state)
             saved_this = 0
             for cm in raw:
                 text = _strip_tags(cm.get("text", ""))
