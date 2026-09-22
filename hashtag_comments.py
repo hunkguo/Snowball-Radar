@@ -403,74 +403,89 @@ class XueqiuHashtagScraper:
         return all_comments
 
     def _discover_hot_topic(self, page):
-        """打开雪球首页，从右侧「热门话题」盒子取第一个（最热）话题。
+        """从雪球首页自动取当前最热话题链接。
 
-        返回 (url, title)；解析/超时失败时返回 (None, None)，交由调用方回退到写死配置。
+        返回 (url, title)；全部失败时返回 (None, None)，交由调用方跳过本轮。
 
-        关键事实（2026-09-17 实测）：热门话题盒子的真实 DOM 结构为
-            div.board.board__topic  >  h3「热门话题」  >  table.topic-hot__list  >  tr > td > a
-        话题链接是「话题搜索页」链接，形如  /k?q=%23话题名%23  （即 /k?q=#话题#），
-        并不是 /hashtag/ 链接。这些搜索页与话题页共用 article.timeline__item 帖子结构
-        和 comments 评论接口，因此抓取逻辑完全通用。
+        发现源（2026-09-22 增补，用户建议）：优先用移动版 m.xueqiu.com 首页 ——
+        它同时展示「雪球热点」和「热门话题」链接，结构稳定，且命中 WAF 挑战页的
+        概率比桌面版低。拿不到再回退桌面版 xueqiu.com 首页。
 
-        鲁棒性（2026-09-22 增补）：
-        - 雪球首页现常被 WAF 挑战页拦截：真实浏览器导航后挑战 JS 会写入 cookie 再重定向，
-          因此最多重试 3 次，每次等挑战 JS 执行完（检测 _waf / renderData / 人机验证 等）。
-        - 话题盒子 class 可能随改版变化，故先等精准盒子；等不到则放宽到页面任意
-          a[href*='/k?q='] 链接（帖子正文里的 #话题# 也行，总比回退到失效配置强）。
+        链接形态：话题搜索页 /k?q=%23话题名%23（即 /k?q=#话题#），并非 /hashtag/。
+        这些搜索页与话题页共用 article.timeline__item 帖子结构和 comments 评论接口，
+        抓取逻辑完全通用。
+
+        鲁棒性：首页常遇 WAF 挑战页（真实浏览器导航后挑战 JS 写 cookie 再重定向），
+        故每次最多重试 3 次，等待挑战 JS 执行完（检测 _waf / renderData / 人机验证 等）；
+        选择器优先级：① 右侧热门话题盒子 → ② 页面任意 /k?q= 链接 → ③ 任意含 %23 的话题链接。
         """
-        for attempt in range(3):
-            try:
-                page.goto("https://xueqiu.com/", wait_until="domcontentloaded", timeout=25000)
-            except Exception as e:
-                _log(f"  打开首页失败(尝试{attempt+1}): {e}")
-                return None, None
-            try:
-                # 优先等右侧热点话题盒子
-                page.wait_for_selector("div.board.board__topic a[href*='/k?q=']", timeout=12000)
-                sel = "div.board.board__topic a[href*='/k?q=']"
-            except Exception:
-                # 布局可能变化，退而求其次取页面任意 /k?q= 链接
+        homes = ["https://m.xueqiu.com/", "https://xueqiu.com/"]
+        for home in homes:
+            for attempt in range(3):
                 try:
-                    page.wait_for_selector("a[href*='/k?q=']", timeout=8000)
-                    sel = "a[href*='/k?q=']"
-                except Exception:
-                    # 两者都没有：可能是 WAF 挑战页，检查后重试
+                    page.goto(home, wait_until="domcontentloaded", timeout=25000)
+                except Exception as e:
+                    _log(f"  打开首页失败({home}, 尝试{attempt+1}): {e}")
+                    break  # 该首页打不开，换下一个来源
+                # 选择器优先级：热门话题盒子 → 任意 /k?q= → 任意 %23 话题链接
+                selectors = [
+                    "div.board.board__topic a[href*='/k?q=']",
+                    "a[href*='/k?q=']",
+                    "a[href*='%23']",
+                ]
+                sel = None
+                for cand in selectors:
+                    try:
+                        page.wait_for_selector(cand, timeout=8000)
+                        sel = cand
+                        break
+                    except Exception:
+                        continue
+                if not sel:
+                    # 可能仍处 WAF 挑战页
                     try:
                         txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
                     except Exception:
                         txt = ""
                     if _is_waf_page_text(txt):
-                        _log(f"  首页仍处 WAF 挑战页(尝试{attempt+1})，等待挑战 JS 执行后重试…")
+                        _log(f"  首页({home}) 命中 WAF 挑战页(尝试{attempt+1})，等 6s 重试…")
                         page.wait_for_timeout(6000)
                         continue
-                    if attempt == 2:
-                        _log("  等待热门话题链接超时（首页布局可能变化），放弃自动发现")
-                        return None, None
-                    page.wait_for_timeout(2000)
-                    continue
-            page.wait_for_timeout(800)  # 让列表完全渲染
-            res = page.evaluate("""(sel) => {
-                const box = document.querySelector('div.board.board__topic')
-                          || document.querySelector('.topic-hot__list')
-                          || document;
-                const a = box.querySelector(sel) || document.querySelector("a[href*='/k?q=']");
-                if (!a) return {error: 'no topic link'};
-                const href = a.getAttribute('href') || '';
-                const title = (a.textContent || '').trim();
-                return {href, title};
-            }""", sel)
-            if isinstance(res, dict) and res.get("href"):
-                url = res["href"]
-                if url.startswith("/"):
-                    url = "https://xueqiu.com" + url
-                title = res.get("title", "")
-                _log(f"  自动发现最新热门话题: {title or url}")
-                return url, title
-            if attempt == 2:
-                _log(f"  热门话题解析失败: {res}")
-                return None, None
-            page.wait_for_timeout(2000)
+                    # 非挑战页但无话题链接 → 该首页无话题，换下一个来源
+                    _log(f"  首页({home}) 无热门话题链接，尝试下一个来源")
+                    break
+                page.wait_for_timeout(800)  # 让列表完全渲染
+                res = page.evaluate("""(sel) => {
+                    const box = document.querySelector('div.board.board__topic')
+                              || document.querySelector('.topic-hot__list')
+                              || document;
+                    const a = box.querySelector(sel)
+                              || document.querySelector("a[href*='/k?q=']")
+                              || document.querySelector("a[href*='%23']");
+                    if (!a) return {error: 'no topic link'};
+                    const href = a.getAttribute('href') || '';
+                    const title = (a.textContent || '').trim();
+                    return {href, title};
+                }""", sel)
+                if isinstance(res, dict) and res.get("href"):
+                    url = res["href"]
+                    if url.startswith("//"):
+                        url = "https:" + url
+                    elif url.startswith("/"):
+                        url = "https://xueqiu.com" + url
+                    title = res.get("title", "")
+                    if not title:
+                        # 链接文本为空时，从 q=%23话题%23 反解
+                        import urllib.parse as _up
+                        q = _up.urlparse(url).query
+                        title = (_up.parse_qs(q).get("q", [""])[0]
+                                .replace("%23", "").replace("#", "").strip()) or url
+                    _log(f"  自动发现最新热门话题({home}): {title or url}")
+                    return url, title
+                if attempt == 2:
+                    _log(f"  热门话题解析失败({home}): {res}")
+                page.wait_for_timeout(2000)
+            # 当前 home 用尽 3 次仍未拿到 → 换下一个来源
         return None, None
 
     def scrape_once(self):
