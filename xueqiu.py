@@ -194,6 +194,7 @@ def acquire_single_instance(allow_multi=False):
                 _print("      导致出现 'Target page, context or browser has been closed'。")
                 _print("      处理：先关闭旧实例（在其窗口按 Ctrl+C）再启动；")
                 _print("      确需并行请加 --allow-multi（不推荐）。")
+                _print(f"      若确认已无实例在运行，删除锁文件后重试: {lock_path}")
                 return False
             _print(f"  [单实例] 发现陈旧锁文件（PID={old_pid} 已不在运行），已接管。")
 
