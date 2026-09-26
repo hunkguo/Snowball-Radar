@@ -810,6 +810,18 @@ class XueqiuScraper:
     # ──────────────────────────────────────────────
 
     def _human_move(self, page):
+        """曲线鼠标移动（2026-09-26 改）。
+
+        原实现 `mouse.move(x, y, steps=N)` 是**等速直线插值**，轨迹特征明显；
+        改用 stealth 模块的贝塞尔曲线轨迹（控制点抖动 + 变速），与话题引擎共用。
+        """
+        try:
+            import stealth
+            stealth.human_move(page)
+            self._rsleep(0.4, 1.2)
+            return
+        except Exception:
+            pass
         try:
             x = random.randint(100, 1000)
             y = random.randint(100, 600)
@@ -819,13 +831,28 @@ class XueqiuScraper:
             pass
 
     def _human_scroll(self, page, times=3):
+        """拟人滚动。
+
+        2026-09-26 改：原实现用 `window.scrollBy()` —— 那是 JS 滚动，**不产生
+        wheel 事件**、滚动位置为整数跳变，是明显的脚本特征。现改用 stealth 模块
+        的真实滚轮（分段变速 + 惯性收尾），与话题引擎共用同一套拟人逻辑。
+        """
+        try:
+            import stealth
+            for _ in range(times):
+                stealth.human_wheel(page, total=random.randint(300, 1200))
+                self._rsleep(1.0, 2.5)
+            return
+        except Exception:
+            pass
+        # 兜底：真实滚轮事件（不改用 scrollBy）
         for i in range(times):
             amt = random.randint(300, 1200)
             try:
-                page.evaluate(f"window.scrollBy(0, {amt})")
+                page.mouse.wheel(0, amt)
             except Exception:
                 pass
-            self._rsleep(2, 5)
+            self._rsleep(2, 4)
 
     def _human_click(self, page, selector=None, x=None, y=None):
         """模拟人类鼠标点击：移动 → 停顿 → 点击"""
@@ -866,10 +893,10 @@ class XueqiuScraper:
         self._rsleep(1, 2)
         self._human_move(page)
         self._rsleep(1, 2)
-        # 偶尔滚动回去
+        # 偶尔滚动回去看（用真实滚轮，不用 window.scrollBy）
         if random.random() < 0.3:
             try:
-                page.evaluate(f"window.scrollBy(0, -{random.randint(200, 500)})")
+                page.mouse.wheel(0, -random.randint(200, 500))
             except Exception:
                 pass
             self._rsleep(1, 2)
@@ -1361,7 +1388,7 @@ class XueqiuScraper:
         self._rsleep(5, 8)
         self._human_move(page)
         try:
-            page.evaluate("window.scrollBy(0, 300)")
+            page.mouse.wheel(0, random.randint(200, 450))   # 真实滚轮（不用 window.scrollBy）
         except Exception:
             pass
         self._rsleep(2, 4)

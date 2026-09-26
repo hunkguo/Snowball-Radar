@@ -22,8 +22,12 @@ import subprocess
 import time
 import random
 from datetime import datetime
+from urllib.parse import urljoin
 
 from playwright.sync_api import sync_playwright
+
+import stealth
+from stealth import STEALTH_JS
 
 # ── 路径配置（支持 EXE 打包）──
 if getattr(sys, 'frozen', False):
@@ -219,12 +223,23 @@ HASHTAG_SHORT = "walsh_rate_hike"  # 导出文件名用的短标识（仅兜底�
 # 是否自动从雪球首页右侧「热门话题」取当前最热话题来抓（False 则始终抓上面写死的 HASHTAG_URL）
 AUTO_DISCOVER_HOT_TOPIC = True
 
+# ── 拟人化（2026-09-26 新增，回应"被识别出来要完成验证"）──
+# True  = 每个帖子都真实打开详情页 + 拟人浏览（鼠标/滚轮/阅读停顿）后页内 XHR 取评论。
+#         最接近真人行为，实测约 15-18s/帖（一轮 200 帖约 50-60 分钟）。
+# False = 不打开详情页，直接在话题页上下文用 XHR 取（仍然不是"地址栏打开 JSON"，
+#         真实度仍高于旧实现），约 3-5s/帖，适合想快跑或流量紧张时。
+HUMAN_BROWSE = True
+# 命中人机验证时，有头模式下等待人工完成的秒数（无头模式无法人工过，会退避重试）
+CHALLENGE_WAIT_SEC = 180
+
 # ── 行为参数 ──
-SCROLL_ROUNDS = 8          # 滚动加载帖子次数
+SCROLL_ROUNDS = 3          # 话题列表拟人滚动次数（每次为一段变速真实滚轮）
 MAX_COMMENT_PAGES = 25     # 单帖评论最多翻页数（上调以收集更多评论；注意请求量/WAF 风险）
-POST_DELAY = (3, 6)        # 帖子间随机停顿（秒）
+# 帖子间随机停顿：2026-09-26 起每个帖子都会真实打开详情页并拟人浏览（约 4-8s），
+# 已提供足够的自然间隔，故此处由 (3,6) 收紧到 (1.5,3.5)，避免单轮过长。
+POST_DELAY = (1.5, 3.5)
 COMMENT_PAGE_DELAY = (1, 3)
-HEADLESS = True            # 无头模式（可后台运行）；需看登录过程改为 False
+HEADLESS = True            # 无头模式（可后台运行）；需人工过验证/看登录过程时改 False
 
 # ── 热点发现（登录态优先，非登录仅作兜底）──
 # 实测结论（2026-09-22）：
@@ -462,14 +477,15 @@ class XueqiuHashtagScraper:
                 // 遍历卡片内所有 data-id 链接，取【第一个 href 为 /<用户ID>/<帖子ID> 的】
                 // （卡片里可能还有头像/昵称等指向 /<用户ID> 单段的链接，必须跳过而非中断）
                 for (const link of a.querySelectorAll('a[data-id]')) {
-                  const m = (link.getAttribute('href') || '').match(/^\\/(\\d+)\\/(\\d+)$/);
+                  const href = link.getAttribute('href') || '';
+                  const m = href.match(/^\\/(\\d+)\\/(\\d+)$/);
                   if (!m) continue;
                   if (!/^\\d{6,}$/.test(m[2])) continue;
-                  ids.set(m[2], author);
+                  ids.set(m[2], {id: m[2], author: author, href: href});
                   break;
                 }
               });
-              return Array.from(ids.entries()).map(([id, author]) => ({id, author}));
+              return Array.from(ids.values());
             }
         """)
         if strict:
@@ -489,33 +505,118 @@ class XueqiuHashtagScraper:
                   if (/^\\/\\d+$/.test(href)) continue;   // 明确的用户主页链接，排除
                   const v = link.getAttribute('data-id');
                   if (/^\\d{6,}$/.test(v)) {
-                    ids.set(v, author);
+                    ids.set(v, {id: v, author: author, href: href});
                     break;
                   }
                 }
               });
-              return Array.from(ids.entries()).map(([id, author]) => ({id, author}));
+              return Array.from(ids.values());
             }
         """)
 
+    def _page_is_challenge(self, page):
+        """当前页面是否显示雪球验证/风控页。"""
+        try:
+            txt = page.evaluate("() => (document.body ? document.body.innerText : '')") or ""
+        except Exception:
+            return False
+        return _is_waf_page_text(txt)
+
+    def _wait_for_human_challenge(self, page, timeout=180):
+        """命中验证页时的处置：有头模式等用户手工过验证，无头模式退避重试。
+
+        用户遇到的"提示要完成什么验证"就是这里处理：不再闷头重试或直接放弃，
+        而是把浏览器窗口交给用户，验证通过后自动继续抓取。
+        返回 True 表示（已恢复/已通过），False 表示超时或无法处理。
+        """
+        if not self._page_is_challenge(page):
+            return True
+        if self.headless:
+            _log("    [!] 命中雪球验证页，但当前是无头模式无法人工验证 —— 退避 15s 后重试")
+            try:
+                page.wait_for_timeout(15000)
+            except Exception:
+                return False
+            return not self._page_is_challenge(page)
+        _log("")
+        _log("  " + "=" * 58)
+        _log("  [!] 雪球要求人机验证：请在【浏览器窗口】中完成验证（滑块/点选）")
+        _log(f"      程序会等待最多 {timeout} 秒，验证通过后自动继续抓取；")
+        _log("      若不想等待可 Ctrl+C 退出，稍后再跑。")
+        _log("  " + "=" * 58)
+        waited = 0
+        while waited < timeout and self._running:
+            try:
+                page.wait_for_timeout(3000)
+            except Exception:
+                return False
+            waited += 3
+            if not self._page_is_challenge(page):
+                _log(f"  [ok] 验证已通过（等待 {waited}s），继续抓取")
+                return True
+            if waited % 30 == 0:
+                _log(f"      仍在等待人工验证… 已等 {waited}s / {timeout}s")
+        _log("  [!] 等待人工验证超时，本轮跳过")
+        return False
+
+    def _xhr_json(self, page, path, state=None):
+        """在当前页面上下文用 XHR 拉 JSON（真人流量模式：同源 + 完整 XHR 头）。
+
+        为什么优先用 XHR 而不是 page.goto：
+          - 真人浏览时评论是页面里的 XHR 拉取的，浏览器**绝不会**在地址栏打开
+            `…/comments.json`；直接导航到 .json 是明显的自动化特征（也是最容易被
+            风控盯上的行为）。
+          - XHR 自带正确的 Referer（当前帖子页）、Accept、X-Requested-With，
+            与页面真实业务请求完全一致。
+        失败（非 200 / 非 JSON / 抛异常）返回 None，由调用方回退到真实导航兜底。
+        """
+        try:
+            r = page.evaluate("""async (path) => {
+                return await new Promise(resolve => {
+                    const x = new XMLHttpRequest();
+                    x.open('GET', path, true);
+                    x.setRequestHeader('Accept', 'application/json, text/plain, */*');
+                    x.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+                    x.timeout = 20000;
+                    x.onload = () => resolve({status: x.status, text: x.responseText || ''});
+                    x.onerror = () => resolve({status: -1, text: ''});
+                    x.ontimeout = () => resolve({status: -2, text: ''});
+                    x.send();
+                });
+            }""", path)
+        except Exception:
+            return None
+        status = r.get("status")
+        text = r.get("text") or ""
+        if status != 200:
+            if text and _is_waf_page_text(text) and state is not None:
+                state["waf"] = state.get("waf", 0) + 1
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
     def _fetch_comments(self, page, post_id, state=None):
-        """拉取某帖评论（多页，登录态 page）。
+        """拉取某帖评论（多页，登录态）。
 
-        用真实浏览器导航取 JSON（难被风控标记），读取 <pre>/innerText 解析累加；
-        空页或返回非 JSON 即停止。
+        取数优先级：
+          1) 【首选】页面内 XHR —— 真人流量模式，最不易被识别；
+          2) 【兜底】真实浏览器导航到 .json —— 仅在 XHR 失败时使用。
 
-        state：跨帖累计风控次数的 dict（见 _nav_get_json）。一旦累计命中达到
-        WAF_ABORT_THRESHOLD，本方法立即返回并置 state["abort"]=True，让调用方
-        中止本轮，避免在已被风控盯上的情况下继续大量请求（越请求封得越久）。
+        空页或返回非 JSON 即停止。state 用于跨帖累计风控命中次数
+        （达 WAF_ABORT_THRESHOLD 时置 state["abort"]=True 让调用方中止本轮）。
         """
         all_comments = []
         for p in range(1, self.max_comment_pages + 1):
-            url = (f"https://xueqiu.com/statuses/comments.json"
-                   f"?id={post_id}&page={p}&count=20")
-            j = _nav_get_json(page, url, max_retry=2, log=_log, state=state)
+            path = f"/statuses/comments.json?id={post_id}&page={p}&count=20"
+            j = self._xhr_json(page, path, state=state)
+            if j is None and not (state or {}).get("abort"):
+                # 兜底：真实导航（保留旧路径，避免页面状态异常时完全失效）
+                j = _nav_get_json(page, "https://xueqiu.com" + path,
+                                  max_retry=2, log=_log, state=state)
             if state is not None and state.get("waf", 0) >= WAF_ABORT_THRESHOLD:
-                if state is not None:
-                    state["abort"] = True
+                state["abort"] = True
                 break
             if not j:
                 break
@@ -550,19 +651,22 @@ class XueqiuHashtagScraper:
                 _log(f"  打开雪球首页失败(尝试{attempt}/3): {e}")
                 page.wait_for_timeout(2000)
                 continue
-            page.wait_for_timeout(3500)
-            # 右栏偶尔随首屏懒渲染，轻滚两下促其出现
-            for _ in range(2):
-                try:
-                    page.mouse.wheel(0, 900)
-                    page.wait_for_timeout(700)
-                except Exception:
-                    break
+            page.wait_for_timeout(3000)
+            # 拟人化：曲线鼠标 + 真实滚轮轻滚，促使右侧「热门话题」渲染
+            try:
+                stealth.human_move(page)
+                stealth.human_wheel(page, total=random.randint(400, 900))
+                time.sleep(random.uniform(0.5, 1.2))
+            except Exception:
+                pass
             try:
                 txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
             except Exception:
                 txt = ""
             if _is_waf_page_text(txt):
+                # 先给人工过验证的机会（有头模式）；无头/超时则退避重试
+                if self._wait_for_human_challenge(page):
+                    continue
                 _log(f"  [!] 首页命中风控/拦截页(尝试{attempt}/3)，等 6s 重试…")
                 page.wait_for_timeout(6000)
                 continue
@@ -620,14 +724,12 @@ class XueqiuHashtagScraper:
                 _log(f"  打开热点榜失败(尝试{attempt+1}/3): {e}")
                 page.wait_for_timeout(2000)
                 continue
-            # 等待列表渲染 + 滚动触发懒加载
+            # 等待列表渲染 + 拟人滚动触发懒加载（真实滚轮，非 JS 滚动）
             page.wait_for_timeout(3000)
-            for _ in range(3):
-                try:
-                    page.mouse.wheel(0, 700)
-                    page.wait_for_timeout(800)
-                except Exception:
-                    break
+            try:
+                stealth.browse_list(page, scroll_times=2)
+            except Exception:
+                pass
             try:
                 txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
             except Exception:
@@ -692,6 +794,11 @@ class XueqiuHashtagScraper:
             self._login_ctx = login_ctx
             self._login_page = login_page
             self._browser = login_ctx.browser
+            # 幂等补注（推荐引擎通常已注入；这里兜底，避免版本不一致导致漏注入）
+            try:
+                login_ctx.add_init_script(STEALTH_JS)
+            except Exception:
+                pass
         else:
             # 自行启动登录持久化 context
             self._owns_login = True
@@ -700,9 +807,15 @@ class XueqiuHashtagScraper:
             login_ctx = pw.chromium.launch_persistent_context(
                 user_data_dir=profile_dir, channel="chrome", headless=self.headless,
                 accept_downloads=False, user_agent=GUEST_USER_AGENT,
-                viewport={"width": 1280, "height": 900},
+                viewport={"width": 1440, "height": 900},
+                locale="zh-CN", timezone_id="Asia/Shanghai",
                 args=["--disable-blink-features=AutomationControlled"],
             )
+            # 注入反自动化检测脚本（此前话题引擎完全没有注入，是重要短板）
+            try:
+                login_ctx.add_init_script(STEALTH_JS)
+            except Exception as e:
+                _log(f"    [!] stealth 脚本注入失败(可忽略): {e}")
             _cleanup_restored_tabs(login_ctx)  # 关掉 Chrome 自动恢复的旧标签页，只留一个干净页面
             self._login_ctx = login_ctx
             self._login_page = login_ctx.pages[0] if login_ctx.pages else login_ctx.new_page()
@@ -775,7 +888,11 @@ class XueqiuHashtagScraper:
             if self._browser is None:
                 return False
             self._guest_ctx = self._browser.new_context(
-                user_agent=GUEST_USER_AGENT, viewport={"width": 1280, "height": 900})
+                user_agent=GUEST_USER_AGENT, viewport={"width": 1440, "height": 900})
+            try:
+                self._guest_ctx.add_init_script(STEALTH_JS)
+            except Exception:
+                pass
             try:
                 self._guest_ctx.clear_cookies()
             except Exception:
@@ -905,15 +1022,18 @@ class XueqiuHashtagScraper:
         # /k?q= 是搜索跳转入口，需等它 301 到 /hashtag/... 话题页再解析
         if "/k?" in url or "/k?" in (page.url or ""):
             page.wait_for_timeout(2500)
-        page.wait_for_timeout(4000)
-        # 滚动加载更多帖子
-        for i in range(self.scroll_rounds):
-            try:
-                page.mouse.wheel(0, 2500)
-                page.wait_for_timeout(random.uniform(1.5, 3.0))
-            except Exception:
-                break
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(3000)
+        # 拟人化浏览话题列表：曲线鼠标 + 真实滚轮（原先用 mouse.wheel 直跳 + 固定间隔）
+        try:
+            stealth.browse_list(page, scroll_times=self.scroll_rounds)
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+
+        # 话题页本身可能就是验证页
+        if not self._wait_for_human_challenge(page):
+            _log("  [!] 话题页处于验证状态且未通过，跳过该话题")
+            return 0
 
         posts = self._extract_post_ids(page)
         # 限制单话题帖子数，控制单轮运行时长与请求量
@@ -931,8 +1051,25 @@ class XueqiuHashtagScraper:
                 break
             pid = p["id"]
             author = p.get("author", "")
+            href = p.get("href", "")
             self.db.save_post(pid, author, title)
             _log(f"  ({idx}/{len(posts)}) 抓取帖子 {pid} 的评论…")
+
+            # ── 真人路径：打开帖子详情页 → 拟人浏览 → 页内 XHR 取评论 ──
+            # 原实现直接 page.goto("…/comments.json")（等于在地址栏打开 JSON 文件），
+            # 是最明显的自动化特征；改为「像真人一样点进帖子看评论」。
+            # HUMAN_BROWSE=False 时跳过打开详情页，直接在话题页上下文 XHR（更快）。
+            if HUMAN_BROWSE and href:
+                post_url = href if href.startswith("http") else urljoin("https://xueqiu.com", href)
+                try:
+                    page.goto(post_url, wait_until="domcontentloaded", timeout=25000)
+                    if not self._wait_for_human_challenge(page, timeout=CHALLENGE_WAIT_SEC):
+                        _log("      帖子页处于验证状态且未通过，跳过该帖")
+                        continue
+                    stealth.browse_post(page)
+                except Exception as e:
+                    _log(f"      打开帖子页异常（改走 XHR 兜底）: {e}")
+
             raw = self._fetch_comments(page, pid, state=state)
             fetched_total += len(raw)
             saved_this = 0

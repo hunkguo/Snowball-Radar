@@ -90,6 +90,7 @@ def run():
         "--hidden-import", "clue_extractor",
         "--hidden-import", "scraper",
         "--hidden-import", "hashtag_comments",
+        "--hidden-import", "stealth",
         "--hidden-import", "uploader",
         "--hidden-import", "jev_client",
         SCRAPER_FILE,

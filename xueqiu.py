@@ -246,6 +246,10 @@ def parse_args():
                    help="话题抓取使用无头 Chrome（推荐模式始终需要可见窗口登录）")
     p.add_argument("--no-headless", action="store_true",
                    help="话题抓取使用可见 Chrome")
+    p.add_argument("--fast", action="store_true",
+                   help="话题抓取走快速模式：不打开帖子详情页，直接在话题页上下文用 XHR 取评论"
+                        "（约 3-5s/帖）。默认拟人模式会真实打开每个帖子并像真人一样浏览"
+                        "（鼠标轨迹/滚轮/阅读停顿），约 15-18s/帖，被风控概率更低")
     p.add_argument("--url", default=None, help="话题页 URL（覆盖默认）")
     p.add_argument("--name", default=None, help="话题标题（覆盖默认，用于标注）")
     p.add_argument("--short", default=None, help="文件名短标识（覆盖默认）")
@@ -374,6 +378,12 @@ def main():
         hashtag_headless = True
     if args.no_headless:
         hashtag_headless = False
+    if args.fast:
+        # 关闭「打开每个帖子详情页 + 拟人浏览」，改为在话题页上下文直接 XHR（更快）
+        import hashtag_comments as _hcm
+        _hcm.HUMAN_BROWSE = False
+        _print("  话题抓取：--fast 快速模式（不打开帖子详情页，直接在话题页 XHR 取评论；"
+               "被风控概率高于默认拟人模式）")
 
     rec = None
     htag = None
