@@ -22,7 +22,7 @@ import subprocess
 import time
 import random
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 
 from playwright.sync_api import sync_playwright
 
@@ -622,6 +622,62 @@ class XueqiuHashtagScraper:
                 break
         return all_comments
 
+    def _page_text(self, page):
+        """安全读取当前页面可见文本（失败返回空串）。"""
+        try:
+            return page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            return ""
+
+    def _wait_page_recover(self, page, seconds=25):
+        """原地等待风控页"自愈"（挑战页常见机制：执行 JS → 写 cookie → 自动刷新）。
+
+        为什么不在命中后立刻重新 goto：重新导航往往会**再触发一次挑战**，
+        形成"越刷新越拦"的循环。这里改为在原地轮询，等页面自己跳转/恢复。
+        返回恢复后的页面文本（未恢复则返回风控页文本）。
+        """
+        deadline = time.time() + seconds
+        txt = self._page_text(page)
+        while time.time() < deadline:
+            try:
+                page.wait_for_timeout(2500)
+            except Exception:
+                break
+            txt = self._page_text(page)
+            if not _is_waf_page_text(txt):
+                return txt
+        return txt
+
+    def _topics_from_recent(self, limit=HOTSPOT_TOP_N):
+        """兜底话题列表：用【上一轮抓过的话题】继续本轮抓取。
+
+        为什么需要：热点榜（登录态右侧榜 / 匿名热点榜）都取不到时（如命中验证页
+        且短时间无法恢复），原逻辑会让整轮一条都抓不到。但热点话题本身变化很慢
+        （通常几小时才轮换），用上一轮的话题继续抓评论，比整轮空跑有价值得多。
+
+        话题 URL 用 `/k?q=%23<话题名>%23` 搜索入口 —— 与首页右侧榜的链接同形态，
+        浏览器会自动 301 到对应话题页（已验证）。
+        """
+        try:
+            rows = self.db.conn.execute(
+                "SELECT hashtag, MAX(first_seen) AS t FROM comments "
+                "WHERE hashtag IS NOT NULL AND hashtag != '' "
+                "GROUP BY hashtag ORDER BY t DESC LIMIT ?",
+                (max(limit * 3, limit),)).fetchall()
+        except Exception:
+            return []
+        out = []
+        seen = set()
+        for r in rows:
+            name = (r["hashtag"] or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append((f"https://xueqiu.com/k?q=%23{quote(name)}%23", name))
+            if len(out) >= limit:
+                break
+        return out
+
     def _discover_hot_from_home(self, page, top_n=HOTSPOT_TOP_N):
         """登录态访问雪球首页，读取右侧「热门话题」榜，返回 [(url, title), ...]。
 
@@ -648,17 +704,22 @@ class XueqiuHashtagScraper:
                 time.sleep(random.uniform(0.5, 1.2))
             except Exception:
                 pass
-            try:
-                txt = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
-            except Exception:
-                txt = ""
+            txt = self._page_text(page)
             if _is_waf_page_text(txt):
-                # 先给人工过验证的机会（有头模式）；无头/超时则退避重试
+                # ① 先给人工处理的机会（有头模式会打印提示并等待用户操作）
                 if self._wait_for_human_challenge(page):
+                    txt = self._page_text(page)
+                else:
+                    # ② 挑战页常见机制：执行 JS → 写 cookie → 自动刷新。
+                    #    命中后立刻重新 goto 往往会**再触发一次挑战**（越刷新越拦），
+                    #    故改为原地轮询等待页面自愈。
+                    _log("  [!] 首页命中风控/拦截页，原地等待页面自动恢复（最多 25s）…")
+                    txt = self._wait_page_recover(page, 25)
+                if _is_waf_page_text(txt):
+                    _log(f"  [!] 首页仍为风控/拦截页(尝试{attempt}/3)，6s 后重试…")
+                    page.wait_for_timeout(6000)
                     continue
-                _log(f"  [!] 首页命中风控/拦截页(尝试{attempt}/3)，等 6s 重试…")
-                page.wait_for_timeout(6000)
-                continue
+                _log("  [ok] 页面已恢复，继续解析「热门话题」…")
             items = page.evaluate("""() => {
                 const tbl = document.querySelector('table.board__list.topic-hot__list');
                 if (!tbl) return [];
@@ -955,7 +1016,17 @@ class XueqiuHashtagScraper:
                 except Exception as e:
                     _log(f"  非登录兜底发现异常: {e}")
             if not topics:
-                _log("  未发现任何热点话题，本轮跳过")
+                # 第三层兜底：热点榜取不到 ≠ 话题不可抓。热点话题变化很慢，
+                # 用上一轮的话题继续抓评论，比整轮空跑有价值得多。
+                recent = self._topics_from_recent()
+                if recent:
+                    _log(f"  [!] 热点榜不可用，降级使用【上一轮话题】继续抓取（{len(recent)} 个）：")
+                    for i, (_, t) in enumerate(recent, 1):
+                        _log(f"       {i}. {t}")
+                    _log("       （这是降级策略：热点榜恢复后会自动回到实时榜单）")
+                    topics = recent
+            if not topics:
+                _log("  未发现任何热点话题，本轮跳过（热点榜与历史话题均不可用）")
                 return 0
         else:
             topics = [(self.url, self.name)]
