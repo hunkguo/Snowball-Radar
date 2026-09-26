@@ -240,8 +240,11 @@ HEADLESS = True            # 无头模式（可后台运行）；需人工过验
 #     只有登录态才能拿到评论。故【发现 + 抓取全程使用登录态】，不再依赖匿名。
 LOGIN_HOT_URL = "https://www.xueqiu.com/"   # 登录态首页（右侧含热门话题榜）
 HOT_TOPIC_TABLE_SEL = "table.board__list.topic-hot__list"
-# 每轮抓取的热点话题数（取榜单前 N，页面上限约 10）
-HOTSPOT_TOP_N = 10
+# 每轮抓取的热点话题数（取榜单前 N，页面上限约 10）。
+# 2026-09-27 调小 10 → 3：单轮请求数 = 话题数 × 帖子数 × 评论页数，
+# 10 个话题时一轮请求量偏大，是连续触发雪球验证/风控的主要因素之一；
+# 取前 3 个最热话题既覆盖最活跃讨论，又把单轮请求压到原来的 1/3。
+HOTSPOT_TOP_N = 3
 # 匿名兜底源（仅当登录态首页取不到热门话题时才回退使用）
 HOTSPOT_URL = "https://www.xueqiu.com/?category=hotspot"
 MAX_POSTS_PER_TOPIC = 20    # 单个热点话题最多抓取的帖子数（上调以收集更多评论；注意单轮时长）
