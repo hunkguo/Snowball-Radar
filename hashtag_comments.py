@@ -109,23 +109,13 @@ def _kill_stale_chrome(profile_dir, log=None):
 def _is_waf_page_text(text):
     """判断页面文本是否为雪球 WAF/风控页。
 
-    三类都要识别（2026-09-26 补全，此前只认挑战页 → 403 拦截页被误判为
-    「导航响应非 JSON」而直接放弃，既没退避重试也没触发止损）：
+    特征表统一维护在 stealth 模块（与推荐引擎共用，避免两处口径漂移），覆盖：
       ① 挑战页：`<textarea id="renderData">{"_waf_...">` / 人机验证 / 访问验证
       ② 403 拦截页：`Sorry, your request has been blocked as it may cause
-         potential threats to the server's security.` ← 用户日志里实际出现的就是它
+         potential threats to the server's security.`
       ③ 频率提示：请求过于频繁 / 请完成安全验证
     """
-    if not text:
-        return False
-    t = text.lower()
-    return ("_waf" in t or "renderdata" in t or "人机验证" in text
-            or "请求过于频繁" in text or "访问验证" in text or "security challenge" in t
-            or "请完成安全验证" in text
-            # ② 403 拦截页（不是可自动解开的挑战页，通常需冷却或换 IP）
-            or "has been blocked" in t or "potential threats" in t
-            or "your request has been blocked" in t or "访问被拒绝" in text
-            or "forbidden" in t)
+    return stealth.is_challenge_text(text)
 
 
 def _nav_get_json(page, url, max_retry=3, log=None, state=None):
@@ -453,6 +443,7 @@ class XueqiuHashtagScraper:
         self._login_page = None
         self._guest_ctx = None
         self._guest_page = None
+        self._challenge_waited = False   # 本轮是否已等待过人工验证（防止整轮被拖死）
 
     def _extract_post_ids(self, page):
         """从话题页提取帖子 ID。
@@ -527,10 +518,20 @@ class XueqiuHashtagScraper:
 
         用户遇到的"提示要完成什么验证"就是这里处理：不再闷头重试或直接放弃，
         而是把浏览器窗口交给用户，验证通过后自动继续抓取。
+
+        重要：同一轮内【最多只等一次】—— 否则每个帖子都可能等满 timeout，
+        整轮会被拖死（推荐引擎实测踩过这个坑）。
         返回 True 表示（已恢复/已通过），False 表示超时或无法处理。
         """
         if not self._page_is_challenge(page):
             return True
+        if getattr(self, "_challenge_waited", False):
+            _log("    [!] 本轮已等待过一次人工验证，改为短退避 15s（避免整轮被拖死）")
+            try:
+                page.wait_for_timeout(15000)
+            except Exception:
+                return False
+            return not self._page_is_challenge(page)
         if self.headless:
             _log("    [!] 命中雪球验证页，但当前是无头模式无法人工验证 —— 退避 15s 后重试")
             try:
@@ -538,11 +539,16 @@ class XueqiuHashtagScraper:
             except Exception:
                 return False
             return not self._page_is_challenge(page)
+        self._challenge_waited = True
         _log("")
         _log("  " + "=" * 58)
-        _log("  [!] 雪球要求人机验证：请在【浏览器窗口】中完成验证（滑块/点选）")
-        _log(f"      程序会等待最多 {timeout} 秒，验证通过后自动继续抓取；")
-        _log("      若不想等待可 Ctrl+C 退出，稍后再跑。")
+        _log("  [!] 雪球拦截了当前访问，请在【浏览器窗口】中处理：")
+        _log("      · 页面是验证码 / 滑块 → 完成验证即可")
+        _log("      · 页面是「请求异常已被安全策略拦截」→ 请点击页面上的「登录」重新登录，")
+        _log("        或等待几分钟后刷新页面")
+        _log(f"      程序等待最多 {timeout} 秒，页面恢复后自动继续抓取（Ctrl+C 可退出）")
+        _log("      若长时间无法恢复：通常是该 IP/账号被临时限制，需冷却 30-60 分钟，")
+        _log("      或换个网络出口（手机热点）后重试。")
         _log("  " + "=" * 58)
         waited = 0
         while waited < timeout and self._running:
@@ -560,7 +566,7 @@ class XueqiuHashtagScraper:
         return False
 
     def _xhr_json(self, page, path, state=None):
-        """在当前页面上下文用 XHR 拉 JSON（真人流量模式：同源 + 完整 XHR 头）。
+        """在当前页面上下文用 XHR 拉 JSON（真人流量模式，实现见 stealth.xhr_fetch）。
 
         为什么优先用 XHR 而不是 page.goto：
           - 真人浏览时评论是页面里的 XHR 拉取的，浏览器**绝不会**在地址栏打开
@@ -570,24 +576,7 @@ class XueqiuHashtagScraper:
             与页面真实业务请求完全一致。
         失败（非 200 / 非 JSON / 抛异常）返回 None，由调用方回退到真实导航兜底。
         """
-        try:
-            r = page.evaluate("""async (path) => {
-                return await new Promise(resolve => {
-                    const x = new XMLHttpRequest();
-                    x.open('GET', path, true);
-                    x.setRequestHeader('Accept', 'application/json, text/plain, */*');
-                    x.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
-                    x.timeout = 20000;
-                    x.onload = () => resolve({status: x.status, text: x.responseText || ''});
-                    x.onerror = () => resolve({status: -1, text: ''});
-                    x.ontimeout = () => resolve({status: -2, text: ''});
-                    x.send();
-                });
-            }""", path)
-        except Exception:
-            return None
-        status = r.get("status")
-        text = r.get("text") or ""
+        status, text = stealth.xhr_fetch(page, path)
         if status != 200:
             if text and _is_waf_page_text(text) and state is not None:
                 state["waf"] = state.get("waf", 0) + 1
@@ -935,6 +924,7 @@ class XueqiuHashtagScraper:
         """
         if state is None:
             state = {}
+        self._challenge_waited = False   # 每轮重置：一轮内最多只等一次人工验证
 
         # ── 阶段0：登录会话健康检查（自愈，必须通过）──
         if not self._page_alive(login_page):

@@ -177,3 +177,62 @@ def browse_list(page, scroll_times=None):
     if random.random() < 0.3:
         human_wheel(page, total=random.randint(200, 500), direction=-1)
         time.sleep(random.uniform(0.3, 0.8))
+
+
+# ── 风控页判定（两个引擎共用同一张特征表，避免口径漂移）──
+WAF_MARKERS = (
+    "renderdata", "_waf", "<textarea", "cf-mitigated", "challenge-platform",
+    "verify you are human", "请求过于频繁", "访问过于频繁", "security challenge",
+    "captcha", "验证码", "请输入验证码", "人机验证", "操作过于频繁",
+    "请完成安全验证", "访问验证",
+    # 403 拦截页（不是可自动解开的挑战页，通常需冷却或换 IP）
+    "has been blocked", "potential threats", "访问被拒绝", "forbidden",
+    # 安全策略拦截页（2026-09-26 实测遇到）：页面为雪球标准错误页，
+    # 含「请求异常已被安全策略拦截 / 投资是一场马拉松 / 请求ID」，
+    # 此前未收录 → 被误判为「导航响应非 JSON」而放弃，既不退避也不提示人工验证。
+    "安全策略拦截", "已被安全策略拦截", "投资是一场马拉松", "请求异常",
+)
+
+
+def is_challenge_text(text):
+    """文本是否为雪球 WAF/风控页（挑战页、403 拦截页、频率提示）。"""
+    if not text:
+        return False
+    t = text.lower()
+    return any(m in t for m in WAF_MARKERS)
+
+
+# ── 页内 XHR 取数（真人流量模式）──
+_XHR_JS = """async (args) => {
+    const [path, tmo] = args;
+    return await new Promise(resolve => {
+        const x = new XMLHttpRequest();
+        x.open('GET', path, true);
+        x.setRequestHeader('Accept', 'application/json, text/plain, */*');
+        x.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        x.timeout = tmo;
+        x.onload = () => resolve({status: x.status, text: x.responseText || ''});
+        x.onerror = () => resolve({status: -1, text: ''});
+        x.ontimeout = () => resolve({status: -2, text: ''});
+        x.send();
+    });
+}"""
+
+
+def xhr_fetch(page, path, timeout_ms=20000):
+    """在当前页面上下文用 XHR 拉取资源（真人流量模式）。
+
+    为什么不用 page.goto：真人访问雪球时，推荐流/热门/评论都是**页面里的 XHR**
+    拉取的；`page.goto("…/list.json")` 等于在地址栏打开一个 JSON 文件，
+    是最明显的自动化特征（本引擎此前被风控挑战页拦住的主因之一）。
+    XHR 自带正确的 Referer（当前浏览页）、Accept、X-Requested-With，
+    与页面真实业务请求完全一致。
+
+    path   需为同域路径，如 "/statuses/comments.json?id=1&page=1&count=20"
+    返回   (status, text)：status 为 HTTP 码；-1=网络错误；-2=超时；None=调用异常
+    """
+    try:
+        r = page.evaluate(_XHR_JS, [path, timeout_ms])
+    except Exception:
+        return None, ""
+    return r.get("status"), (r.get("text") or "")

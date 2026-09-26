@@ -706,6 +706,13 @@ class XueqiuScraper:
         self._running = True
         self._context = None
         self._page = None
+        # 风控命中标记：此前只在 _do_one_scrape 里初始化，若直接调用 _fetch_api
+        # （如测试/复用场景）会抛 AttributeError，故在此统一定义。
+        self._waf_hit = False
+        self._challenge_waited = False
+        # 与 start_session 的 launch_persistent_context(headless=False) 保持一致；
+        # 测试若自建 headless context，可在调用前置 True，避免白白等待人工验证。
+        self.headless = False
 
         # 初始化 SQLite
         self.db = XueqiuDB(DB_PATH)
@@ -976,49 +983,154 @@ class XueqiuScraper:
     #  API 调用
     # ──────────────────────────────────────────────
 
-    # 雪球风控/WAF 页特征串（命中即说明请求被反爬拦了，而非接口本身报错）
-    # 2026-09-26 补：403 拦截页（"your request has been blocked ... potential threats"）
-    # 此前未收录，导致被误判为「导航响应非 JSON」而直接放弃（既无退避也无止损）。
-    _WAF_MARKERS = (
-        "renderData", "_waf", "<textarea", "cf-mitigated", "challenge-platform",
-        "verify you are human", "请求过于频繁", "访问过于频繁", "security challenge",
-        "captcha", "验证码", "请输入验证码", "人机验证", "操作过于频繁",
-        "has been blocked", "potential threats", "访问被拒绝", "forbidden",
-    )
-
+    # 风控页特征表统一维护在 stealth 模块（两个引擎共用，避免口径漂移）；
+    # 覆盖：WAF 挑战页 / 403 拦截页("has been blocked…potential threats") / 频率提示。
     @classmethod
     def _is_waf_challenge(cls, text):
-        if not text:
+        import stealth
+        return stealth.is_challenge_text(text)
+
+    def _ensure_browsing_page(self, page):
+        """确保当前页面是一个「正常浏览页」而非 JSON 接口页/空白页。
+
+        XHR 的 Referer 取自当前页面地址；若页面停在 `…/list.json`（旧实现 goto
+        到接口留下的状态），XHR 的 Referer 会是一个 JSON URL —— 明显不像真人。
+        这里把这种情况纠正回首页。
+
+        另外：首页本身可能就是风控/验证页（雪球对异常访问会整站拦截），
+        这里只做检测并告警，实际的风控处置统一交给 _fetch_api 在命中后处理，
+        避免同一次抓取里重复等待人工验证。
+        """
+        try:
+            url = page.url or ""
+        except Exception:
+            url = ""
+        need_reload = not url or ".json" in url or "xueqiu.com" not in url or url == "about:blank"
+        if need_reload:
+            self._log("    页面不在正常浏览状态，先回到首页…")
+            try:
+                page.goto("https://xueqiu.com/", wait_until="domcontentloaded", timeout=25000)
+                self._rsleep(2, 4)
+            except Exception:
+                pass
+        # 首页/当前页若是风控拦截页，先给人工过验证的机会
+        if self._page_is_challenge(page):
+            self._log("    [!] 当前页面为雪球安全拦截页（整站级），先处理验证…")
+            self._wait_for_human_challenge(page)
+
+    def _page_is_challenge(self, page):
+        """当前页面是否显示雪球验证/风控页。"""
+        try:
+            txt = page.evaluate("() => (document.body ? document.body.innerText : '')") or ""
+        except Exception:
             return False
-        t = text.lower()
-        return any(m.lower() in t for m in cls._WAF_MARKERS)
+        return self._is_waf_challenge(txt)
+
+    def _wait_for_human_challenge(self, page, timeout=120):
+        """命中验证页：有头模式等人工完成验证，无头模式短退避后重探。
+
+        推荐引擎始终以有头模式运行（launch_persistent_context headless=False，
+        关注板块需要人工登录），故 self.headless 默认 False → 会把浏览器交给用户。
+
+        重要：同一轮内【最多只等一次】。否则 max_retry 次重试会各等一个 timeout
+        （180s×3 ≈ 9 分钟）把一轮拖死 —— 这是实测踩到的坑。
+        返回 True 表示已恢复，False 表示超时/无法处理。
+        """
+        if not self._page_is_challenge(page):
+            return True
+        if getattr(self, "headless", False):
+            self._log("    [!] 命中验证页，当前无头模式无法人工验证 —— 短退避 15s 后重试")
+            try:
+                page.wait_for_timeout(15000)
+            except Exception:
+                return False
+            return not self._page_is_challenge(page)
+        if getattr(self, "_challenge_waited", False):
+            self._log("    [!] 本轮已等待过一次人工验证，改为短退避 15s（避免整轮被拖死）")
+            try:
+                page.wait_for_timeout(15000)
+            except Exception:
+                return False
+            return not self._page_is_challenge(page)
+        self._challenge_waited = True
+        self._log("")
+        self._log("  " + "=" * 58)
+        self._log("  [!] 雪球拦截了当前访问，请在【浏览器窗口】中处理：")
+        self._log("      · 页面是验证码 / 滑块 → 完成验证即可")
+        self._log("      · 页面是「请求异常已被安全策略拦截」→ 雪球会提示"
+                  "「建议先登录后再访问重试」，")
+        self._log("        请点击页面上的「登录」重新登录；或等待几分钟后刷新页面")
+        self._log(f"      程序等待最多 {timeout} 秒，页面恢复后自动继续抓取（Ctrl+C 可退出）")
+        self._log("      若长时间无法恢复：通常是该 IP/账号被临时限制，需冷却 30-60 分钟，")
+        self._log("      或换个网络出口（手机热点）后重试。")
+        self._log("  " + "=" * 58)
+        waited = 0
+        while waited < timeout:
+            try:
+                page.wait_for_timeout(3000)
+            except Exception:
+                return False
+            waited += 3
+            if not self._page_is_challenge(page):
+                self._log(f"  [ok] 验证已通过（等待 {waited}s），继续抓取")
+                return True
+            if waited % 30 == 0:
+                self._log(f"      仍在等待人工验证… 已等 {waited}s / {timeout}s")
+        self._log(f"  [!] 等待人工验证超时（{timeout}s），本轮跳过")
+        return False
 
     def _fetch_api(self, page, url, max_retry=3):
         """拉取雪球 JSON 接口。
 
-        只走「真实浏览器导航 + 读取响应体」这一条路径：
-        - 不再使用页内 fetch（其请求特征会被雪球 WAF 识别为脚本请求，
-          触发风控挑战页 / 被 CSP 的 connect-src 拦截），这正是之前反复
-          看到 TypeError: Failed to fetch / json_parse_failed 的根因。
-        - page.goto 到接口 URL 是真实浏览器导航，由 Chromium 自带完整请求头
-          （User-Agent / Accept / sec-fetch-* / Referer 等）+ 持久化 cookie，
-          与真实用户访问该 JSON 资源无异，最难被风控标记为机器人。
-        - 若命中风控挑战页，等待挑战 JS 执行完（写 cookie/重定向）后重试。
+        取数优先级（2026-09-26 改造）：
+          1) 【首选】页内 XHR —— 真人访问雪球时，推荐流/热门/评论都是**页面里的
+             XHR** 拉取的；而 `page.goto("…/list.json")` 等于在地址栏打开 JSON
+             文件，是最明显的自动化特征（此前被风控挑战页拦住的主因之一）。
+          2) 【兜底】真实浏览器导航 —— XHR 拿不到时回退，保留旧路径避免完全失效。
+
+        命中风控页时：置 self._waf_hit，并交由 _wait_for_human_challenge 处理
+        （有头模式会把浏览器交给用户手工处理，而不是闷头重试）。
+        若人工处理也没能让页面恢复，则【立即放弃本次取数】—— 风控不会在一分钟内
+        自行解除，反复重试只会延长封禁时间（实测：无脑重试会累计等待 90s+）。
         """
         import time as _t
+        import stealth
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+
         for attempt in range(1, max_retry + 1):
+            # ── 1) 首选：页内 XHR（真人流量模式）──
+            self._ensure_browsing_page(page)
+            status, text = stealth.xhr_fetch(page, path)
+            if status == 200 and text:
+                try:
+                    parsed_json = json.loads(text)
+                    if attempt == 1:
+                        self._log("    ✓ 页内 XHR 已拿到接口 JSON")
+                    return parsed_json
+                except Exception:
+                    pass
+            if text and self._is_waf_challenge(text):
+                self._waf_hit = True
+                self._log(f"    [!] XHR 命中雪球风控页(尝试{attempt}/{max_retry})")
+                if self._wait_for_human_challenge(page):
+                    continue
+                self._log("    [!] 风控未解除，放弃该接口（下一轮再试，避免反复请求加重封禁）")
+                return None
+            if status == 200 and not text:
+                return None
+
+            # ── 2) 兜底：真实浏览器导航 ──
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=25000)
             except Exception as e:
-                # 可能转成下载、被挑战页拦截等，不致命，下面用响应体/页面 DOM 判断
                 self._log(f"    导航异常(尝试{attempt}): {e}")
-            # 轮询等待挑战 JS 执行/重定向完成（最多 ~15s）
             deadline = _t.time() + 15
             text = ""
             while _t.time() < deadline:
                 try:
-                    # 优先取 <pre>（Chrome JSON 查看器把原始 JSON 放这里），
-                    # 否则退取 body/根节点 innerText（同样含原始 JSON 文本）
                     text = page.evaluate(
                         "() => {"
                         "  const pre = document.querySelector('pre');"
@@ -1037,19 +1149,16 @@ class XueqiuScraper:
                     break
             if self._is_waf_challenge(text):
                 self._waf_hit = True
-                self._log(f"    ⚠ 命中雪球风控挑战页(尝试{attempt})，等待 {8 + attempt*2}s 后重试…")
-                self._rsleep(8 + attempt * 2, 10 + attempt * 2)
-                continue
-            try:
-                parsed = json.loads(text)
-                if attempt == 1:
-                    self._log("    ✓ 浏览器导航已拿到接口 JSON")
-                else:
-                    self._log(f"    ✓ 浏览器导航重试成功(第{attempt}次)，已拿到接口 JSON")
-                return parsed
-            except Exception:
-                if self._is_waf_challenge(text):
+                self._log(f"    [!] 导航命中雪球风控页(尝试{attempt}/{max_retry})")
+                if self._wait_for_human_challenge(page):
                     continue
+                self._log("    [!] 风控未解除，放弃该接口（下一轮再试，避免反复请求加重封禁）")
+                return None
+            try:
+                parsed_json = json.loads(text)
+                self._log(f"    ✓ 浏览器导航兜底成功(第{attempt}次)，已拿到接口 JSON")
+                return parsed_json
+            except Exception:
                 self._log(f"    导航响应非 JSON: {text[:120]}")
                 return None
         return None
@@ -1378,6 +1487,7 @@ class XueqiuScraper:
         # 重置 sections_data
         self.sections_data = {}
         self._waf_hit = False
+        self._challenge_waited = False   # 每轮重置：一轮内最多只等一次人工验证
 
         # 访问首页
         self._log("正在访问雪球首页 …")
