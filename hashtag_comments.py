@@ -103,24 +103,37 @@ def _kill_stale_chrome(profile_dir, log=None):
 
 
 def _is_waf_page_text(text):
-    """判断页面文本是否为雪球 WAF/风控挑战页（而非正常内容）。"""
+    """判断页面文本是否为雪球 WAF/风控页。
+
+    三类都要识别（2026-09-26 补全，此前只认挑战页 → 403 拦截页被误判为
+    「导航响应非 JSON」而直接放弃，既没退避重试也没触发止损）：
+      ① 挑战页：`<textarea id="renderData">{"_waf_...">` / 人机验证 / 访问验证
+      ② 403 拦截页：`Sorry, your request has been blocked as it may cause
+         potential threats to the server's security.` ← 用户日志里实际出现的就是它
+      ③ 频率提示：请求过于频繁 / 请完成安全验证
+    """
     if not text:
         return False
     t = text.lower()
     return ("_waf" in t or "renderdata" in t or "人机验证" in text
             or "请求过于频繁" in text or "访问验证" in text or "security challenge" in t
-            or "请完成安全验证" in text)
+            or "请完成安全验证" in text
+            # ② 403 拦截页（不是可自动解开的挑战页，通常需冷却或换 IP）
+            or "has been blocked" in t or "potential threats" in t
+            or "your request has been blocked" in t or "访问被拒绝" in text
+            or "forbidden" in t)
 
 
 def _nav_get_json(page, url, max_retry=3, log=None, state=None):
     """真实浏览器导航拉取 JSON 接口（不用页内 fetch，避免被 WAF 抓特征）。
 
-    返回解析后的 dict；命中风控挑战页或解析失败时返回 None。
+    返回解析后的 dict；命中风控页或解析失败时返回 None。
     与 scraper._fetch_api 路径2 同思路：page.goto 是真实浏览器导航，由 Chromium
     自带完整请求头 + 持久化 cookie，最难被风控标记为机器人。
 
-    state：可选 dict，用于跨调用累计风控命中次数（state["waf"] 自增），
-    调用方据此判断"是否已被风控盯上"并提前止损（避免持续轰炸加重封禁）。
+    state：可选 dict，跨调用累计风控命中次数（state["waf"] 自增），调用方据此
+    判断"是否已被风控盯上"并提前止损（避免持续轰炸加重封禁）。2026-09-26 补：
+    此前该参数只声明未写入，导致止损逻辑形同虚设。
     """
     for attempt in range(1, max_retry + 1):
         try:
@@ -150,8 +163,12 @@ def _nav_get_json(page, url, max_retry=3, log=None, state=None):
             except Exception:
                 break
         if _is_waf_page_text(text):
+            if state is not None:
+                state["waf"] = state.get("waf", 0) + 1
             if log:
-                log(f"    ⚠ 命中雪球风控挑战页(尝试{attempt})，等待 {8 + attempt*2}s 后重试…")
+                log(f"    [!] 命中雪球风控/拦截页(尝试{attempt}/{max_retry})"
+                    f"（累计 {state.get('waf', 0) if state is not None else '?'} 次），"
+                    f"退避 {8 + attempt*2}s 后重试…")
             try:
                 page.wait_for_timeout((8 + attempt * 2) * 1000)
             except Exception:
@@ -161,6 +178,8 @@ def _nav_get_json(page, url, max_retry=3, log=None, state=None):
             return json.loads(text)
         except Exception:
             if _is_waf_page_text(text):
+                if state is not None:
+                    state["waf"] = state.get("waf", 0) + 1
                 continue
             if log:
                 log(f"    导航响应非 JSON: {text[:120]}")
@@ -421,21 +440,57 @@ class XueqiuHashtagScraper:
         self._guest_page = None
 
     def _extract_post_ids(self, page):
+        """从话题页提取帖子 ID。
+
+        2026-09-26 重要修正：雪球帖子链接形态为 /<用户ID>/<帖子ID>（两段纯数字），
+        而【用户主页链接】是 /<用户ID>（单段）。此前实现只校验 data-id 是 6 位以上数字，
+        一旦页面把用户卡片（头像/昵称链接）排在前面，就会把【用户 ID】当成帖子 ID ——
+        表现是日志里出现 10 位 ID、逐个请求 comments.json 全部拿不到评论
+        （用户 ID 与帖子 ID 量级不同：用户 ID 约 10 亿-90 亿即 10 位，帖子 ID 当前为 9 位）。
+
+        故改为**从 href 形态判别**：必须是 /数字/数字 两段式，取第二段为帖子 ID；
+        若严格判别取不到（雪球改版），回退到宽松逻辑（原 data-id 规则）以免整体失效。
+        """
+        strict = page.evaluate("""
+            () => {
+              const ids = new Map();
+              const items = document.querySelectorAll('article.timeline__item');
+              const articles = items.length ? items : document.querySelectorAll('article');
+              articles.forEach(a => {
+                const authorEl = a.querySelector('.user-name, .timeline__user, [class*="user"] .name');
+                const author = authorEl ? authorEl.textContent.trim() : '';
+                // 遍历卡片内所有 data-id 链接，取【第一个 href 为 /<用户ID>/<帖子ID> 的】
+                // （卡片里可能还有头像/昵称等指向 /<用户ID> 单段的链接，必须跳过而非中断）
+                for (const link of a.querySelectorAll('a[data-id]')) {
+                  const m = (link.getAttribute('href') || '').match(/^\\/(\\d+)\\/(\\d+)$/);
+                  if (!m) continue;
+                  if (!/^\\d{6,}$/.test(m[2])) continue;
+                  ids.set(m[2], author);
+                  break;
+                }
+              });
+              return Array.from(ids.entries()).map(([id, author]) => ({id, author}));
+            }
+        """)
+        if strict:
+            return strict
+        # 回退：宽松逻辑（保持旧行为），并告警提示可能改版/未登录导致卡片混入
+        _log("    [!] 严格链接判别未取到帖子（页面可能改版），回退宽松规则，请注意核对 ID")
         return page.evaluate("""
             () => {
               const ids = new Map();
-              // 桌面/移动版共用 timeline__item；移动版若改了外层 class 则退而求其次
-              // 直接在所有 article 里找带 data-id 的链接（雪球帖子链接固定带 data-id）。
               const items = document.querySelectorAll('article.timeline__item');
-              const articles = items.length ? items
-                : document.querySelectorAll('article');
+              const articles = items.length ? items : document.querySelectorAll('article');
               articles.forEach(a => {
-                const link = a.querySelector('a[data-id]');
                 const authorEl = a.querySelector('.user-name, .timeline__user, [class*="user"] .name');
-                if (link) {
+                const author = authorEl ? authorEl.textContent.trim() : '';
+                for (const link of a.querySelectorAll('a[data-id]')) {
+                  const href = link.getAttribute('href') || '';
+                  if (/^\\/\\d+$/.test(href)) continue;   // 明确的用户主页链接，排除
                   const v = link.getAttribute('data-id');
                   if (/^\\d{6,}$/.test(v)) {
-                    ids.set(v, authorEl ? authorEl.textContent.trim() : '');
+                    ids.set(v, author);
+                    break;
                   }
                 }
               });
@@ -806,6 +861,9 @@ class XueqiuHashtagScraper:
             if state.get("abort"):
                 _log(f"\n  [!] 本轮已累计命中风控 {state.get('waf', 0)} 次，提前结束"
                      f"（已完成 {idx-1}/{n} 个话题），留待下一轮再抓")
+                _log("      处置建议：① 等 30-60 分钟让风控冷却（403 拦截页是 IP/账号级限流，"
+                     "短退避无效）；② 若持续命中，检查登录态是否失效并重新登录；"
+                     "③ 可调小 MAX_COMMENT_PAGES / MAX_POSTS_PER_TOPIC 降低请求密度")
                 break
             _log(f"\n{'='*16} 热点 {idx}/{n}: {title} {'='*16}")
             total_new += self._scrape_topic(login_page, url, title, state=state)
@@ -864,6 +922,8 @@ class XueqiuHashtagScraper:
         _log(f"提取到 {len(posts)} 个帖子")
 
         total_new = 0
+        fetched_total = 0        # 接口返回的评论条数（与入库数不同：入库会按 id 去重）
+        waf_before = state.get("waf", 0)
         for idx, p in enumerate(posts, 1):
             if state.get("abort"):
                 _log(f"  [!] 已累计命中风控 {state.get('waf', 0)} 次，跳过本话题剩余 "
@@ -874,6 +934,7 @@ class XueqiuHashtagScraper:
             self.db.save_post(pid, author, title)
             _log(f"  ({idx}/{len(posts)}) 抓取帖子 {pid} 的评论…")
             raw = self._fetch_comments(page, pid, state=state)
+            fetched_total += len(raw)
             saved_this = 0
             for cm in raw:
                 text = _strip_tags(cm.get("text", ""))
@@ -902,8 +963,19 @@ class XueqiuHashtagScraper:
                 self.db.save_comment(row)
                 saved_this += 1
             total_new += saved_this
-            _log(f"      评论 {len(raw)} 条, 入库 {saved_this} 条（累计 {self.db.count()}）")
+            waf_tip = ""
+            if state.get("waf", 0) > waf_before:
+                waf_tip = f"  [风控命中累计 {state['waf']} 次]"
+                waf_before = state["waf"]
+            _log(f"      评论 {len(raw)} 条, 入库 {saved_this} 条（累计 {self.db.count()}）{waf_tip}")
             page.wait_for_timeout(random.uniform(*POST_DELAY))
+
+        # 诊断：接口一条评论都没返回 —— 多半是帖子 ID 提取有误（如把 10 位用户 ID 当帖子 ID），
+        # 而非"该话题无人评论"。给明确提示，避免静默空跑一整轮。
+        if posts and fetched_total == 0 and state.get("waf", 0) == waf_before:
+            lens = sorted({len(p["id"]) for p in posts})
+            _log(f"  [!] 本话题 {len(posts)} 个帖子均未返回评论数据（ID 位数={lens}）。"
+                 f"若 ID 为 10 位，很可能误把【用户 ID】当成【帖子 ID】—— 请检查页面提取规则。")
 
         # 每话题单独生成价值线索（按话题独立短标识，避免串味）
         try:

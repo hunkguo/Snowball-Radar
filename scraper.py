@@ -949,11 +949,14 @@ class XueqiuScraper:
     #  API 调用
     # ──────────────────────────────────────────────
 
-    # 雪球风控/WAF 挑战页特征串（命中即说明请求被反爬拦了，而非接口本身报错）
+    # 雪球风控/WAF 页特征串（命中即说明请求被反爬拦了，而非接口本身报错）
+    # 2026-09-26 补：403 拦截页（"your request has been blocked ... potential threats"）
+    # 此前未收录，导致被误判为「导航响应非 JSON」而直接放弃（既无退避也无止损）。
     _WAF_MARKERS = (
         "renderData", "_waf", "<textarea", "cf-mitigated", "challenge-platform",
         "verify you are human", "请求过于频繁", "访问过于频繁", "security challenge",
         "captcha", "验证码", "请输入验证码", "人机验证", "操作过于频繁",
+        "has been blocked", "potential threats", "访问被拒绝", "forbidden",
     )
 
     @classmethod
