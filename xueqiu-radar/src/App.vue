@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed } from "vue";
+import { ref, onMounted, onUnmounted, computed } from "vue";
 import { fetchRounds, fetchCluesPage } from "./api.js";
 
 const rounds = ref([]);
@@ -29,7 +29,21 @@ const SECTION_TABS = [
   { key: "topic", label: "热点话题" },
 ];
 
-onMounted(loadInitial);
+onMounted(() => {
+  loadInitial();
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+});
+onUnmounted(() => window.removeEventListener("scroll", onScroll));
+
+// 返回顶部浮动按钮：滚动超过阈值才显示
+const showToTop = ref(false);
+function onScroll() {
+  showToTop.value = (window.scrollY || window.pageYOffset || 0) > 400;
+}
+function scrollToTop() {
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
 
 const currentParams = computed(() => ({
   stock: stockFilter.value.trim(),
@@ -269,5 +283,7 @@ function scoreClass(s) {
         <span v-else class="end">— 没有更多了 —</span>
       </div>
     </div>
+
+    <button class="to-top" v-show="showToTop" @click="scrollToTop" aria-label="返回顶部" title="返回顶部">↑</button>
   </div>
 </template>

@@ -192,6 +192,8 @@ input:focus, select:focus { border-color: var(--accent); }
   font-size: 12px;
   color: var(--muted);
 }
+/* 允许 flex 子项收缩，避免长串把卡片撑宽 */
+.clue .meta > * { min-width: 0; }
 .clue .meta .score { font-weight: 600; }
 .clue .meta .jev {
   font-size: 11px;
@@ -209,6 +211,8 @@ input:focus, select:focus { border-color: var(--accent); }
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 1px 7px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .clue .tags { margin-top: 6px; }
 .clue .tag {
@@ -219,6 +223,9 @@ input:focus, select:focus { border-color: var(--accent); }
   border-radius: 6px;
   padding: 1px 6px;
   margin: 2px 4px 0 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .score-dot {
   font-size: 12px;
@@ -247,3 +254,28 @@ input:focus, select:focus { border-color: var(--accent); }
 }
 .more button:disabled { opacity: 0.6; cursor: default; }
 .more .end { color: var(--muted); font-size: 12px; }
+
+/* 返回顶部浮动按钮 */
+.to-top {
+  position: fixed;
+  right: 22px;
+  bottom: 26px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #06283d;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: transform 0.15s ease, opacity 0.2s ease;
+}
+.to-top:hover { transform: translateY(-2px); border: none; background: var(--accent); }
+.to-top:active { transform: translateY(0); }
