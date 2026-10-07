@@ -815,12 +815,15 @@ def generate_clue_files(comments, meta, export_dir, prefix="clues",
         _save_seen(seen_path, seen)
 
     # 上传到 Cloudflare Worker（雪球雷达 · 线索台）。失败不影响本地落盘。
+    # 带「版本号增量 + 线上全量比对」去重：同轮重跑跳过、已存在线索不上传。
     if upload and upload_url and upload_token:
         try:
-            from uploader import build_payload, upload_round
+            from uploader import build_payload, upload_round_dedup
             payload = build_payload(meta, candidates, comments, source=upload_source)
-            code, body = upload_round(payload, upload_url, upload_token)
-            print(f"  [上传] Worker 返回 {code}：{body}")
+            sync_path = os.path.join(os.path.dirname(os.path.abspath(export_dir)), "sync_state.json")
+            code, body, n = upload_round_dedup(
+                payload, upload_url, upload_token, sync_state_path=sync_path)
+            print(f"  [上传] Worker 返回 {code}：{body}（本轮新增上传 {n} 条）")
         except Exception as e:
             print(f"  [上传][!] 上传失败（已忽略，不影响本地）: {e}")
 
