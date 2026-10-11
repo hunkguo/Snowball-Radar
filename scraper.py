@@ -1390,6 +1390,9 @@ class XueqiuScraper:
                     "time_str":    self._ts_to_str(c.get("created_at", 0)),
                     "like_count":  c.get("like_count", 0),
                     "reply_count": c.get("reply_count", 0) or 0,
+                    # 顶层 user_id / post_id：供前端拼「用户主页 / 原文」跳转链接
+                    "user_id":     str(cu.get("id", "")),
+                    "post_id":     str(post_id or ""),
                     "user": {
                         "id":          str(cu.get("id", "")),
                         "screen_name": cu.get("screen_name") or "",

@@ -503,9 +503,13 @@ def extract_clues(comments, threshold=5, max_candidates=80, jev_api_key=None):
         if score < threshold:
             continue
         cand_created_at = c.get("created_at", 0) or 0
+        # 数值型 user_id（雪球用户主页用）：hashtag 引擎直接给顶层 user_id，
+        # scraper 引擎给嵌套 user.id，两者都兼容
+        _uid = c.get("user_id") or (c.get("user") or {}).get("id", "") or ""
         candidates.append({
             "id": c.get("id", ""),
             "user_name": c.get("user_name", "") or "",
+            "user_id": str(_uid) if _uid else "",
             "post_author": c.get("post_author", "") or "",
             # 用 created_at（API 真实发布时间）把混杂的相对/半截时间串
             # 规范为北京时间绝对串 'YYYY-MM-DD HH:MM'，保证可按日期排序

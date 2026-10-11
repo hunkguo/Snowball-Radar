@@ -171,6 +171,8 @@ input:focus, select:focus { border-color: var(--accent); }
   font-variant-numeric: tabular-nums;
 }
 .clue .who { color: var(--accent); font-weight: 500; }
+.clue .who .who-link { color: var(--accent); font-weight: 600; text-decoration: none; }
+.clue .who .who-link:hover { text-decoration: underline; }
 .clue .src {
   font-size: 10px;
   padding: 1px 7px;
@@ -227,6 +229,20 @@ input:focus, select:focus { border-color: var(--accent); }
   overflow-wrap: anywhere;
   word-break: break-word;
 }
+/* 「原文」按钮：跳雪球原页查看上下文 */
+.clue .meta .orig {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  border-radius: 6px;
+  padding: 1px 7px;
+  margin-left: 2px;
+  text-decoration: none;
+  cursor: pointer;
+}
+.clue .meta .orig:hover { background: rgba(56, 189, 248, 0.22); border-color: var(--accent); }
 .score-dot {
   font-size: 12px;
   font-weight: 600;

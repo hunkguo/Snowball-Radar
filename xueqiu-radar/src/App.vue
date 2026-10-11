@@ -195,6 +195,17 @@ function scoreClass(s) {
   if (s >= 7) return "score-mid";
   return "score-lo";
 }
+
+// 点击用户名 → 雪球用户主页（便于关注）
+function userUrl(c) {
+  return c.user_id ? "https://xueqiu.com/u/" + encodeURIComponent(c.user_id) : "";
+}
+// 「原文」按钮 → 评论原页（雪球状态页含所属帖上下文，便于查看原文语境）
+// 雪球状态页格式：/<用户ID>/<状态ID>，评论 ID 即其状态 ID
+function origUrl(c) {
+  if (!c.user_id || !c.clue_id) return "";
+  return "https://xueqiu.com/" + encodeURIComponent(c.user_id) + "/" + encodeURIComponent(c.clue_id);
+}
 </script>
 
 <template>
@@ -252,7 +263,10 @@ function scoreClass(s) {
         <div v-for="c in items" :key="c.round_id + '_' + c.clue_id" class="clue">
           <div class="head">
             <span class="time" :title="c.time_str">{{ relTime(c) }}</span>
-            <span class="who">{{ c.user_name || "（匿名）" }}</span>
+            <span class="who">
+              <a v-if="c.user_id" class="who-link" :href="userUrl(c)" target="_blank" rel="noopener noreferrer">{{ c.user_name || "（匿名）" }}</a>
+              <template v-else>{{ c.user_name || "（匿名）" }}</template>
+            </span>
             <span
               class="src"
               :class="sectionOf(c)"
@@ -268,6 +282,7 @@ function scoreClass(s) {
             <span>赞 {{ c.like_count || 0 }}</span>
             <span v-if="c.reply_count">· 回 {{ c.reply_count }}</span>
             <span v-for="(s, i) in (c.stocks || [])" :key="i" class="stock">{{ s }}</span>
+            <a v-if="origUrl(c)" class="orig" :href="origUrl(c)" target="_blank" rel="noopener noreferrer" title="在新标签打开雪球原文（含上下文）">原文 ↗</a>
           </div>
 
           <div class="tags" v-if="c.tags && c.tags.length">
