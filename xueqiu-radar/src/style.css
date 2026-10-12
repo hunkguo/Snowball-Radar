@@ -258,18 +258,69 @@ input:focus, select:focus { border-color: var(--accent); }
 .loading { color: var(--muted); padding: 20px 0; }
 .error { color: var(--red); padding: 20px 0; }
 
-.more { text-align: center; padding: 18px 0 32px; }
-.more button {
-  background: var(--panel-2);
+/* 分页条：页码 + 上一页 / 下一页（整页替换） */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 26px 0 6px;
+}
+.pager .pg-nums {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pg-btn {
+  min-width: 36px;
+  height: 34px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
   color: var(--text);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 8px 22px;
-  font-size: 14px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
   cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s, background 0.15s, color 0.15s, transform 0.1s;
 }
-.more button:disabled { opacity: 0.6; cursor: default; }
-.more .end { color: var(--muted); font-size: 12px; }
+.pg-btn:hover:not(:disabled):not(.active):not(.ellipsis) {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+.pg-btn:active:not(:disabled) { transform: translateY(1px); }
+.pg-btn:disabled:hover { border-color: var(--border); }
+.pg-btn.nav { font-weight: 500; white-space: nowrap; }
+.pg-btn.num { min-width: 38px; }
+.pg-btn.ellipsis {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: default;
+  padding: 0 2px;
+}
+.pg-btn.ellipsis:hover { border: none; background: transparent; }
+.pg-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06283d;
+  font-weight: 700;
+  box-shadow: 0 4px 12px rgba(56, 189, 248, 0.28);
+}
+.pg-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.pg-caption {
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  margin: 2px 0 30px;
+  font-variant-numeric: tabular-nums;
+}
 
 /* 返回顶部浮动按钮 */
 .to-top {

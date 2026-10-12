@@ -5,14 +5,30 @@ import { fetchRounds, fetchCluesPage } from "./api.js";
 const rounds = ref([]);
 const clues = ref([]);
 const loading = ref(false);
-const loadingMore = ref(false);
 const error = ref("");
 
-// 分页状态
+// 分页状态（整页替换模式：页码 + 上一页/下一页）
 const total = ref(0);
-const hasMore = ref(false);
-const offset = ref(0);
+const page = ref(1);
 const PAGE = 50;
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)));
+// 页码序列：当前页 ±1、首末页常驻，缺口用 … 省略
+const pageList = computed(() => {
+  const tp = totalPages.value;
+  const cur = page.value;
+  const set = new Set([1, tp]);
+  for (let p = cur - 1; p <= cur + 1; p++) {
+    if (p >= 1 && p <= tp) set.add(p);
+  }
+  const out = [];
+  let prev = 0;
+  for (const p of [...set].sort((a, b) => a - b)) {
+    if (prev && p - prev > 1) out.push("…");
+    out.push(p);
+    prev = p;
+  }
+  return out;
+});
 
 // 筛选（全部在服务端执行）
 const stockFilter = ref("");
@@ -56,18 +72,26 @@ const currentParams = computed(() => ({
 }));
 
 async function loadInitial() {
+  page.value = 1;
+  await loadPage(true);
+}
+
+// 拉取当前页（默认不重复拉 rounds；首屏/刷新时才需要）
+async function loadPage(withRounds = false) {
   loading.value = true;
   error.value = "";
   try {
-    const [r, page] = await Promise.all([
-      fetchRounds(),
-      fetchCluesPage({ ...currentParams.value, offset: 0 }),
-    ]);
-    rounds.value = r || [];
-    clues.value = page.clues || [];
-    total.value = page.total || 0;
-    hasMore.value = !!page.has_more;
-    offset.value = page.clues.length || 0;
+    const params = { ...currentParams.value, offset: (page.value - 1) * PAGE };
+    if (withRounds) {
+      const [r, pg] = await Promise.all([fetchRounds(), fetchCluesPage(params)]);
+      rounds.value = r || [];
+      clues.value = pg.clues || [];
+      total.value = pg.total || 0;
+    } else {
+      const pg = await fetchCluesPage(params);
+      clues.value = pg.clues || [];
+      total.value = pg.total || 0;
+    }
   } catch (e) {
     error.value = e.message;
   } finally {
@@ -75,24 +99,14 @@ async function loadInitial() {
   }
 }
 
-async function loadMore() {
-  if (loadingMore.value || !hasMore.value) return;
-  loadingMore.value = true;
-  try {
-    const page = await fetchCluesPage({ ...currentParams.value, offset: offset.value });
-    const seen = new Set(clues.value.map((c) => c.round_id + "_" + c.clue_id));
-    for (const c of page.clues) {
-      const k = c.round_id + "_" + c.clue_id;
-      if (!seen.has(k)) clues.value.push(c);
-    }
-    hasMore.value = !!page.has_more;
-    offset.value += page.clues.length;
-  } catch (e) {
-    error.value = e.message;
-  } finally {
-    loadingMore.value = false;
-  }
+function goPage(p) {
+  if (p === page.value || p < 1 || p > totalPages.value) return;
+  page.value = p;
+  loadPage();
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
+function prevPage() { goPage(page.value - 1); }
+function nextPage() { goPage(page.value + 1); }
 
 // 筛选条件变化时，回到第一页重新拉取
 function onFilterChange() {
@@ -217,7 +231,7 @@ function origUrl(c) {
         <div class="sub">
           按时间线浏览 xueqiu.exe 上传的雪球评论内容
           <template v-if="total">
-            · 共 {{ total }} 条（已加载 {{ clues.length }}）
+            · 共 {{ total }} 条 · 第 {{ page }} / {{ totalPages }} 页
           </template>
         </div>
       </div>
@@ -292,12 +306,20 @@ function origUrl(c) {
         </div>
       </div>
 
-      <div class="more">
-        <button v-if="hasMore" :disabled="loadingMore" @click="loadMore">
-          {{ loadingMore ? "加载中…" : "加载更多" }}
-        </button>
-        <span v-else class="end">— 没有更多了 —</span>
+      <div class="pager" v-if="total > 0">
+        <button class="pg-btn nav" :disabled="page <= 1 || loading" @click="prevPage">‹ 上一页</button>
+        <span class="pg-nums">
+          <button
+            v-for="(p, i) in pageList"
+            :key="i"
+            :class="['pg-btn', 'num', { active: p === page, ellipsis: p === '…' }]"
+            :disabled="p === '…' || loading"
+            @click="p !== '…' && goPage(p)"
+          >{{ p }}</button>
+        </span>
+        <button class="pg-btn nav" :disabled="page >= totalPages || loading" @click="nextPage">下一页 ›</button>
       </div>
+      <div class="pg-caption" v-if="total > 0">第 {{ page }} / {{ totalPages }} 页 · 每页 {{ PAGE }} 条 · 共 {{ total }} 条</div>
     </div>
 
     <button class="to-top" v-show="showToTop" @click="scrollToTop" aria-label="返回顶部" title="返回顶部">↑</button>
