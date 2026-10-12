@@ -229,7 +229,7 @@ input:focus, select:focus { border-color: var(--accent); }
   overflow-wrap: anywhere;
   word-break: break-word;
 }
-/* 「原文」按钮：跳雪球原页查看上下文 */
+/* 「原文」按钮：跳转来源站原页查看上下文 */
 .clue .meta .orig {
   font-size: 11px;
   font-weight: 600;

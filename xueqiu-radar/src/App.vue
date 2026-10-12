@@ -210,12 +210,12 @@ function scoreClass(s) {
   return "score-lo";
 }
 
-// 点击用户名 → 雪球用户主页（便于关注）
+// 点击用户名 → 来源站用户主页（便于关注）
 function userUrl(c) {
   return c.user_id ? "https://xueqiu.com/u/" + encodeURIComponent(c.user_id) : "";
 }
-// 「原文」按钮 → 帖子原文页（雪球原文地址格式为 /<帖子作者ID>/<帖子ID>）
-// 注意：不能用「评论者ID + 评论ID(clue_id)」，雪球对该形式返回 404；
+// 「原文」按钮 → 来源站帖子页（地址格式 /<帖子作者ID>/<帖子ID>）
+// 注意：不能用「评论者ID + 评论ID(clue_id)」，该形式在来源站返回 404；
 // 必须用帖子作者的数字 ID（post_author_id）+ 帖子 ID（post_id）才能正确打开。
 function origUrl(c) {
   if (!c.post_author_id || !c.post_id) return "";
@@ -227,9 +227,9 @@ function origUrl(c) {
   <div>
     <div class="topbar">
       <div>
-        <h1>雪球雷达 · 评论时间线</h1>
+        <h1>股票评论雷达 · 评论时间线</h1>
         <div class="sub">
-          按时间线浏览 xueqiu.exe 上传的雪球评论内容
+          按时间线浏览自动抓取的高价值股票社区评论
           <template v-if="total">
             · 共 {{ total }} 条 · 第 {{ page }} / {{ totalPages }} 页
           </template>
@@ -270,7 +270,7 @@ function origUrl(c) {
     <div v-else-if="error" class="error">错误：{{ error }}</div>
     <div v-else-if="!total" class="empty">
       <template v-if="hasActiveFilter">当前筛选条件下暂无数据，试试切换板块或清空筛选条件。</template>
-      <template v-else>暂无数据。请先让 xueqiu.exe 上传一轮线索（加 --upload 与 Worker 地址）。</template>
+      <template v-else>暂无数据。请先让上传工具运行一轮并开启上传（--upload 指定 Worker 地址）。</template>
     </div>
     <div v-else>
       <div v-for="[day, items] in timeline" :key="day">
@@ -297,7 +297,7 @@ function origUrl(c) {
             <span>赞 {{ c.like_count || 0 }}</span>
             <span v-if="c.reply_count">· 回 {{ c.reply_count }}</span>
             <span v-for="(s, i) in (c.stocks || [])" :key="i" class="stock">{{ s }}</span>
-            <a v-if="origUrl(c)" class="orig" :href="origUrl(c)" target="_blank" rel="noopener noreferrer" title="在新标签打开雪球原文（含上下文）">原文 ↗</a>
+            <a v-if="origUrl(c)" class="orig" :href="origUrl(c)" target="_blank" rel="noopener noreferrer" title="在新标签打开原文（含上下文）">原文 ↗</a>
           </div>
 
           <div class="tags" v-if="c.tags && c.tags.length">
