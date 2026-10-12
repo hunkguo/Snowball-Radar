@@ -523,6 +523,7 @@ def extract_clues(comments, threshold=5, max_candidates=80, jev_api_key=None):
             "stocks": stocks,
             "section": c.get("section", "") or "",
             "post_id": c.get("post_id", "") or "",
+            "post_author_id": c.get("post_author_id", "") or "",
             "hashtag": c.get("hashtag", "") or "",
             # Jev 语义打分（默认 0，启用后由 _enrich_with_jev 填充）
             "jev_value": 0.0,

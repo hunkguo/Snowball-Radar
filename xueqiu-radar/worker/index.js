@@ -110,14 +110,15 @@ async function ingest(body, env) {
     stmts.push(
       env.DB.prepare(
         `INSERT OR REPLACE INTO clues
-           (round_id, clue_id, user_name, user_id, post_id, time_str, like_count, reply_count, text, score, tags, stocks, section, ts, date, jev_value)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           (round_id, clue_id, user_name, user_id, post_id, post_author_id, time_str, like_count, reply_count, text, score, tags, stocks, section, ts, date, jev_value)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         roundId,
         String(c.id != null ? c.id : ""),
         c.user_name || "",
         String(c.user_id || ""),
         String(c.post_id || ""),
+        String(c.post_author_id || ""),
         c.time_str || "",
         Number(c.like_count) || 0,
         Number(c.reply_count) || 0,

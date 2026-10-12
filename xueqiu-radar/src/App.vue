@@ -200,11 +200,12 @@ function scoreClass(s) {
 function userUrl(c) {
   return c.user_id ? "https://xueqiu.com/u/" + encodeURIComponent(c.user_id) : "";
 }
-// 「原文」按钮 → 评论原页（雪球状态页含所属帖上下文，便于查看原文语境）
-// 雪球状态页格式：/<用户ID>/<状态ID>，评论 ID 即其状态 ID
+// 「原文」按钮 → 帖子原文页（雪球原文地址格式为 /<帖子作者ID>/<帖子ID>）
+// 注意：不能用「评论者ID + 评论ID(clue_id)」，雪球对该形式返回 404；
+// 必须用帖子作者的数字 ID（post_author_id）+ 帖子 ID（post_id）才能正确打开。
 function origUrl(c) {
-  if (!c.user_id || !c.clue_id) return "";
-  return "https://xueqiu.com/" + encodeURIComponent(c.user_id) + "/" + encodeURIComponent(c.clue_id);
+  if (!c.post_author_id || !c.post_id) return "";
+  return "https://xueqiu.com/" + encodeURIComponent(c.post_author_id) + "/" + encodeURIComponent(c.post_id);
 }
 </script>
 

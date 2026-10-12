@@ -310,6 +310,7 @@ class HashtagDB:
                 id TEXT PRIMARY KEY,
                 post_id TEXT,
                 post_author TEXT,
+                post_author_id TEXT,
                 hashtag TEXT,
                 text TEXT,
                 user_id TEXT,
@@ -322,11 +323,13 @@ class HashtagDB:
                 last_updated TEXT
             )
         """)
-        # 迁移：老库 comments 表可能无 reply_count 列，补齐（评论收到的回复数，用于「有交互」打分）
+        # 迁移：老库 comments 表可能无 reply_count / post_author_id 列，补齐
         try:
             cols = [r[1] for r in c.execute("PRAGMA table_info(comments)")]
             if "reply_count" not in cols:
                 c.execute("ALTER TABLE comments ADD COLUMN reply_count INTEGER DEFAULT 0")
+            if "post_author_id" not in cols:
+                c.execute("ALTER TABLE comments ADD COLUMN post_author_id TEXT")
         except Exception:
             pass
         c.execute("CREATE INDEX IF NOT EXISTS idx_hc_post ON comments(post_id)")
@@ -355,13 +358,14 @@ class HashtagDB:
     def save_comment(self, c):
         now = datetime.now().isoformat()
         self.conn.execute(
-            """INSERT INTO comments(id,post_id,post_author,hashtag,text,user_id,user_name,
+            """INSERT INTO comments(id,post_id,post_author,post_author_id,hashtag,text,user_id,user_name,
                like_count,created_at,time_str,reply_count,first_seen,last_updated)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
                  text=excluded.text, like_count=excluded.like_count,
                  reply_count=excluded.reply_count, last_updated=excluded.last_updated""",
-            (c["id"], c["post_id"], c["post_author"], c.get("hashtag", HASHTAG_NAME), c["text"],
+            (c["id"], c["post_id"], c["post_author"], c.get("post_author_id", "") or "",
+             c.get("hashtag", HASHTAG_NAME), c["text"],
              c["user_id"], c["user_name"], c["like_count"], c["created_at"],
              c["time_str"], c.get("reply_count", 0) or 0, now, now))
         self.conn.commit()
@@ -387,6 +391,7 @@ class HashtagDB:
                 "id": r["id"],
                 "post_id": r["post_id"],
                 "post_author": r["post_author"],
+                "post_author_id": r["post_author_id"],
                 "user_id": r["user_id"],
                 "user_name": r["user_name"],
                 "text": r["text"],
@@ -1116,6 +1121,10 @@ class XueqiuHashtagScraper:
             pid = p["id"]
             author = p.get("author", "")
             href = p.get("href", "")
+            # 从帖子 href (/<作者ID>/<帖子ID>) 解析帖子作者数字 ID，
+            # 供前端拼「原文」链接（雪球原文地址需作者 ID + 帖子 ID）
+            m = re.match(r'^/(\d+)/(\d+)$', href or '')
+            post_author_id = m.group(1) if m else ''
             self.db.save_post(pid, author, title)
             _log(f"  ({idx}/{len(posts)}) 抓取帖子 {pid} 的评论…")
 
@@ -1152,6 +1161,7 @@ class XueqiuHashtagScraper:
                     "id": str(cm.get("id")),
                     "post_id": pid,
                     "post_author": author,
+                    "post_author_id": post_author_id,
                     "text": text,
                     "hashtag": title,
                     "user_id": str(user.get("id", "")),

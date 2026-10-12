@@ -93,10 +93,11 @@ def build_comment_dicts(rows):
     for r in rows:
         out.append({
             "id": _g(r, "id"),
-            # 数值型 user_id / post_id：供前端拼「用户主页 / 原文」跳转链接
-            # （hashtag_comments.db 的 comments 表已存这两列，此前漏映射导致线上为空）
+            # 数值型 user_id / post_id / post_author_id：供前端拼「用户主页 / 原文」跳转链接
+            # （hashtag_comments.db 的 comments 表已存这三列，此前漏映射导致线上为空）
             "user_id": _g(r, "user_id") or "",
             "post_id": _g(r, "post_id") or "",
+            "post_author_id": _g(r, "post_author_id") or "",
             "user_name": _g(r, "user_name") or "",
             "post_author": _g(r, "post_author") or "",
             "time_str": _g(r, "time_str") or "",
