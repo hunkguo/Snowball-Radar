@@ -671,7 +671,7 @@ class XueqiuDB:
         c = self.conn.cursor()
         c.execute("""
             SELECT c.id, c.post_id, c.text, c.like_count,
-                   c.user_screen_name, c.time_str, c.created_at, p.section
+                   c.user_id, c.user_screen_name, c.time_str, c.created_at, p.section
             FROM comments c
             LEFT JOIN posts p ON c.post_id = p.id
             ORDER BY c.like_count DESC
@@ -679,11 +679,13 @@ class XueqiuDB:
         rows = c.fetchall()
         out = []
         for r in rows:
+            uid = r["user_id"] or ""
             out.append({
                 "id": r["id"],
                 "post_id": r["post_id"],
                 "text": r["text"] or "",
                 "like_count": r["like_count"] or 0,
+                "user_id": str(uid) if uid else "",
                 "user_name": r["user_screen_name"] or "",
                 "time_str": r["time_str"] or "",
                 "created_at": r["created_at"] or 0,
