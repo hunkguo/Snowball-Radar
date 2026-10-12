@@ -139,7 +139,7 @@ python xueqiu.py --upload --worker-url https://xueqiu.你的域名.com/api/inges
   # 1) 命令行（token 直接作为 --jev-token 参数传入；--jev-key 仍兼容）
   python xueqiu.py --upload --jev --jev-token <你的JevToken>
   # 或回填历史：
-  python backfill_d1.py --worker-url https://xueqiu.cn24.org/api/ingest --worker-token <token> --jev --jev-token <你的JevToken>
+  python backfill_d1.py --worker-url https://radar.cn24.org/api/ingest --worker-token <token> --jev --jev-token <你的JevToken>
 
   # 2) 环境变量（免每次传参）
   export JEV_API_KEY=<你的JevKey>     # 也可用 TYPESAFE_API_KEY

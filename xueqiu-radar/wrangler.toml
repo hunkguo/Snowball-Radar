@@ -6,6 +6,11 @@ compatibility_flags = ["nodejs_compat"]
 # 静态资源（Vue 构建产物）+ SPA 路由
 assets = { directory = "./dist", binding = "ASSETS", not_found_handling = "single-page-application" }
 
+# 自定义域名（雪球雷达正式入口；custom_domain=true 时 wrangler 自动创建 DNS 记录）
+routes = [
+  { pattern = "radar.cn24.org", custom_domain = true }
+]
+
 # D1 数据库绑定
 [[d1_databases]]
 binding = "DB"
