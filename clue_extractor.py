@@ -278,6 +278,29 @@ EVENT_KEYWORDS = {
     "辟谣": 2, "澄清": 1, "否认": 1,
 }
 
+# 操作 / 仓位 / 多空 / 技术 / 估值 类高频词（2026-10-13 新增）
+# 实测（运行时库 76486 条推荐/热门评论）：原 EVENT_KEYWORDS 只覆盖「消息面」
+# （利好/合作/订单/涨停…），而股票评论区最高频的是「仓位操作 / 买卖点 / 估值分红」
+# 这类表达。它们拿不到分 → 大量有实质观点的高赞评论被挡在阈值外。
+# 统一权重 +1（弱于「利好/利空」等方向词，避免情绪帖过量涌入）。
+# 注意：与 EVENT_KEYWORDS 的去重由 _get_matchers 合并时自动处理（后者权重优先）。
+SIGNAL_KEYWORDS = {
+    # 仓位 / 操作
+    "满仓": 1, "空仓": 1, "加仓": 1, "减仓": 1, "补仓": 1, "清仓": 1,
+    "建仓": 1, "重仓": 1, "轻仓": 1, "梭哈": 1,
+    "抄底": 1, "逃顶": 1, "割肉": 1, "套牢": 1, "解套": 1,
+    "止盈": 1, "止损": 1, "买入": 1, "卖出": 1, "持有": 1,
+    # 多空 / 判断
+    "看多": 1, "看空": 1, "看好": 1, "目标价": 1, "确定性": 1,
+    "性价比": 1, "预期差": 1, "龙头": 1,
+    # 技术 / 价格
+    "支撑": 1, "压力": 1, "回调": 1, "反弹": 1, "新高": 1, "新低": 1,
+    "补涨": 1, "滞涨": 1, "反转": 1,
+    # 估值 / 业绩 / 分红
+    "估值": 1, "市盈率": 1, "股息": 1, "分红": 1, "财报": 1,
+    "收益率": 1, "浮盈": 1, "浮亏": 1, "翻倍": 1, "腰斩": 1,
+}
+
 # ──────────────────────────────────────────────
 # 6 位数字代码白名单：只对「长得像 A 股 / 基金 / 指数代码」的 6 位数字加分。
 # 实测（33749 条真实评论）：候选中 583 个 6 位数字里约 20% 是 ETF/基金/指数
@@ -325,7 +348,11 @@ def _effective_stock_names():
 
 
 def _get_matchers():
-    """惰性构建并缓存 (股票名表, 股票正则, 事件正则)。"""
+    """惰性构建并缓存 (股票名表, 股票正则, 事件正则, 事件权重表)。
+
+    事件权重表 = EVENT_KEYWORDS（消息面）+ SIGNAL_KEYWORDS（操作/技术/估值），
+    同名键以后者为准（update 覆盖），保证一个词只有一个权重。
+    """
     global _matchers_cache
     if _matchers_cache is None:
         names = _effective_stock_names()
@@ -333,8 +360,10 @@ def _get_matchers():
         for alias in sorted(names, key=len, reverse=True):  # 长名优先，避免短名截胡
             parts.append(_SHORT_NAME_GUARDS.get(alias) or re.escape(alias))
         stock_re = re.compile("(" + "|".join(parts) + ")") if parts else None
-        event_re = re.compile("(" + "|".join(re.escape(k) for k in EVENT_KEYWORDS) + ")")
-        _matchers_cache = (names, stock_re, event_re)
+        weights = dict(EVENT_KEYWORDS)
+        weights.update(SIGNAL_KEYWORDS)
+        event_re = re.compile("(" + "|".join(re.escape(k) for k in weights) + ")")
+        _matchers_cache = (names, stock_re, event_re, weights)
     return _matchers_cache
 
 # 灌水 / 无意义词（不区分大小写）
@@ -393,6 +422,12 @@ def score_comment(text, like_count=0, reply_count=0):
                  2026-09-26 校准（33749 条真实数据实测）：候选中 38% 靠「回复 1-4 条 +2」
                  抬升，楼中楼闲聊回复与「利好」等关键词等价权重偏高，故降为
                  reply>=1 → +1、reply>=5 → +2（有讨论价值但次于实质信息词）。
+
+    2026-10-13 扩表（实测 76486 条推荐/热门评论，目标「收录更多有价值评论」）：
+      - 事件词表并入 SIGNAL_KEYWORDS（操作/仓位/多空/技术/估值，约 47 词，各 +1），
+        补上原「消息面」词表遗漏的高频表达（满仓/加仓/抄底/止损/支撑/目标价/估值/分红…）
+      - 长度分档：>=100 字 +3、>=50 字 +2、>=30 字 +1（原统一 +1），长文多为实质分析
+      效果：阈值 4 下候选 5435 → ~10770（约 +98%），质量仍属「市场观点」层级。
     """
     if is_meaningless(text):
         return -100, [], []
@@ -401,7 +436,7 @@ def score_comment(text, like_count=0, reply_count=0):
     tags = []
     stocks = []
 
-    names, stock_re, event_re = _get_matchers()
+    names, stock_re, event_re, ev_weights = _get_matchers()
 
     # 1) 6 位数字代码：合法 A 股/基金/指数代码才 +3；其余（日期/金额等）仅记 num: 不加分
     all_nums = list(dict.fromkeys(_SIX_DIGIT_RE.findall(text)))  # 保序去重
@@ -424,16 +459,22 @@ def score_comment(text, like_count=0, reply_count=0):
         tags.append("stock:" + ",".join(stocks))
 
     # 3) 方向 / 事件 / 传闻 关键词（每词只计一次，与原 `k in text` 语义一致）
+    #    权重表 = EVENT_KEYWORDS + SIGNAL_KEYWORDS 合并（2026-10-13 起）
     ev = []
     for m in event_re.findall(text):
         if m not in ev:
             ev.append(m)
-            s += EVENT_KEYWORDS[m]
+            s += ev_weights[m]
     if ev:
         tags.append("event:" + ",".join(ev))
 
-    # 4) 信息密度
-    if len(text) >= 30:
+    # 4) 信息密度（长文本分级：越长越可能是有实质内容的分析/推演，2026-10-13 起分级）
+    L = len(text)
+    if L >= 100:
+        s += 3
+    elif L >= 50:
+        s += 2
+    elif L >= 30:
         s += 1
     if re.search(r"\d", text) or "%" in text:
         s += 1
