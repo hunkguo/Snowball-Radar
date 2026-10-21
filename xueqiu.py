@@ -420,6 +420,8 @@ def main():
                 os.rename(_prof, _bak)
                 _print(f"  [换号] 旧 Chrome Profile 已备份为: {_bak}")
                 _print("         启动后请在弹出的 Chrome 窗口用【新账号】登录雪球。")
+                _print("         ⚠ 该参数只需用一次：登录成功后请从启动命令/run.bat 中删除 --reset-profile，")
+                _print("           否则每次启动都会再次备份并强制重新登录。")
             except Exception as e:
                 _print(f"  [!] Profile 备份失败（可能仍被 Chrome 占用）: {e}")
                 _print("      请先关闭所有使用该 Profile 的 Chrome 窗口，再重试。")
