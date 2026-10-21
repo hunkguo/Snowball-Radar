@@ -202,6 +202,91 @@ def is_challenge_text(text):
     return any(m in t for m in WAF_MARKERS)
 
 
+# ──────────────────────────────────────────────
+# 登录态检测 / 等待人工重新登录（两个引擎共用，避免口径漂移）
+# ──────────────────────────────────────────────
+_LOGIN_STATE_JS = """
+    () => {
+        const body = document.body ? document.body.innerText : '';
+        const hasLoginForm = body.includes('立即登录') || body.includes('验证码登录') || body.includes('账号密码登录');
+        const hasAvatar = document.querySelector('.user-avatar, .nav__avatar, [class*="avatar"] img, .nav__user__info') !== null;
+        const hasToken = document.cookie.includes('xq_a_token');
+        return {
+            has_login_form: hasLoginForm,
+            has_avatar: hasAvatar,
+            has_token: hasToken,
+            is_logged_in: hasToken || (hasAvatar && !hasLoginForm)
+        };
+    }
+"""
+
+
+def login_state(page):
+    """读取当前页面的登录态。
+
+    返回 dict: is_logged_in / has_token / has_login_form / has_avatar。
+    页面已关闭或求值异常时一律返回 is_logged_in=False（交给上层提示重新登录）。
+    """
+    try:
+        r = page.evaluate(_LOGIN_STATE_JS)
+        if isinstance(r, dict):
+            return r
+    except Exception:
+        pass
+    return {"is_logged_in": False, "has_token": False,
+            "has_login_form": False, "has_avatar": False}
+
+
+def wait_for_login(page, timeout=300, log=None, interval=5, goto_login=True):
+    """提示人工重新登录并等待，超时返回 False。
+
+    设计口径：**登录失效时暂停抓取，不做匿名硬抓**（匿名抓 comments.json 只会
+    拿到空列表，既浪费时间又容易被风控判定为异常流量）。
+
+    - 已登录 → 立即返回 True
+    - 未登录 → 切到登录页，轮询检测；成功则回首页并返回 True
+    - 超时   → 返回 False，由调用方跳过本轮（下一轮再检查，恢复后自动继续）
+    """
+    _log = log or (lambda *_a, **_k: None)
+    if login_state(page).get("is_logged_in"):
+        return True
+
+    _log("  [!] 登录态已失效（cookie 中无 xq_a_token）")
+    _log("=" * 60)
+    _log("  ✨ 请在 Chrome 窗口中重新登录雪球（扫码 / 短信 / 密码均可）")
+    _log(f"  已暂停抓取，最多等待 {timeout} 秒；超时则跳过本轮，不会硬抓。")
+    _log("=" * 60)
+    if goto_login:
+        try:
+            page.goto("https://xueqiu.com/user/login", wait_until="domcontentloaded")
+        except Exception:
+            try:
+                page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
+            except Exception:
+                pass
+
+    elapsed = 0
+    while elapsed < timeout:
+        time.sleep(interval)
+        elapsed += interval
+        try:
+            if login_state(page).get("is_logged_in"):
+                _log(f"  ✓ 登录已恢复（等待 {elapsed} 秒），继续抓取")
+                try:
+                    page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+        if elapsed % 60 == 0:
+            _log(f"    仍在等待登录… 剩余 {max(0, timeout - elapsed)} 秒")
+
+    _log("  [!] 等待超时，仍未检测到登录态：本轮跳过（下一轮会再次检查，恢复后自动继续）")
+    return False
+
+
+
 # ── 页内 XHR 取数（真人流量模式）──
 _XHR_JS = """async (args) => {
     const [path, tmo] = args;

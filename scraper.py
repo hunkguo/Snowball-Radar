@@ -94,13 +94,37 @@ def _kill_stale_chrome(profile_dir, log=None):
         else:
             subprocess.run(["pkill", "-f", pd_bs], capture_output=True, text=True, timeout=30)
         if log:
-            log(f"    已清理残留 Chrome 进程（仅限本 profile，若有的话）")
+            log(f"    已尝试关闭占用本 profile 的残留 Chrome（仅限本 profile）")
         time.sleep(1.5)  # 等待 SingletonLock 释放
         return 1
     except Exception as e:
         if log:
             log(f"    清理残留 Chrome 异常(可忽略): {e}")
         return 0
+
+
+# Chrome 单例锁文件：进程异常退出（崩溃/被强杀）后会残留。
+# 残留时新进程启动会「把命令行转交给不存在的实例并立即 exit(0)」，
+# Playwright 侧表现即 "Target page, context or browser has been closed"。
+_SINGLETON_FILES = ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile")
+
+
+def _clear_stale_singleton(profile_dir, log=None):
+    """删除上次异常退出遗留的 Chrome 单例锁文件（仅在已确认无进程占用后调用）。"""
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return []
+    removed = []
+    for name in _SINGLETON_FILES:
+        p = os.path.join(profile_dir, name)
+        try:
+            if os.path.lexists(p):
+                os.remove(p)
+                removed.append(name)
+        except Exception:
+            pass
+    if removed and log:
+        log(f"    已清理残留锁文件: {', '.join(removed)}")
+    return removed
 
 
 def _cleanup_restored_tabs(context):
@@ -981,8 +1005,38 @@ class XueqiuScraper:
             except Exception:
                 pass
 
-        self._log("\n  ⚠ 登录等待超时，将尝试继续抓取\n")
+        self._log("\n  ⚠ 登录等待超时：未取得登录态\n")
         return False
+
+    def ensure_login_for_round(self, page, wait=None):
+        """每轮抓取前的登录校验（核心口径：登录失效就停手，绝不匿名硬抓）。
+
+        未登录时匿名抓 comments.json 只会拿到空列表——既白跑一轮，又会让连续异常
+        请求加重风控。故这里改为：暂停 → 提示人工登录 → 轮询等待 → 仍未登录则
+        跳过本轮（下一轮自动再检查，登录恢复后无需重启）。
+
+        返回 True=可以抓取；False=跳过本轮。
+        """
+        try:
+            if page is None or page.is_closed():
+                return False
+            if self._check_login(page).get("isLoggedIn"):
+                return True
+        except Exception:
+            return False
+
+        # 无头模式没有可操作的窗口，只能告警跳过，不能傻等
+        if getattr(self, "headless", False):
+            self._log("  [!] 登录态已失效，且当前为无头模式（无法人工登录）→ 本轮跳过抓取")
+            self._log("      处理：改用有头模式启动（去掉 --headless），在弹出的 Chrome 中登录后即自动恢复。")
+            return False
+
+        import stealth
+        return stealth.wait_for_login(
+            page,
+            timeout=self.login_wait if wait is None else wait,
+            log=self._log,
+        )
 
     # ──────────────────────────────────────────────
     #  API 调用
@@ -1459,27 +1513,51 @@ class XueqiuScraper:
         else:
             self._log("  已有持久化 Profile，直接复用。")
 
-        try:
-            # 先清理上一次运行可能残留的 Chrome 窗口（同一 profile 只允许一个实例）
-            _kill_stale_chrome(persistent_profile, log=self._log)
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=persistent_profile,
-                channel="chrome",
-                headless=False,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--window-size=1366,768",
-                    "--lang=zh-CN",
-                ],
-            )
-            _cleanup_restored_tabs(context)  # 关掉 Chrome 自动恢复的旧标签页，只留一个干净页面
-            context.add_init_script(STEALTH_JS)
-            return context
-        except Exception as e:
-            self._log(f"Profile 启动失败: {e}")
-            return None
+        # 启动带重试：最常见的失败是「该 Profile 仍被另一个 Chrome 占用」——
+        # Chrome 会把命令行转交给已有实例并立即 exit(0)，Playwright 端表现为
+        # "Target page, context or browser has been closed"。
+        # 这里逐次升级清理（杀本 profile 的 Chrome → 删残留单例锁 → 退避重试）。
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                _kill_stale_chrome(persistent_profile,
+                                   log=self._log if attempt == 1 else None)
+                context = playwright.chromium.launch_persistent_context(
+                    user_data_dir=persistent_profile,
+                    channel="chrome",
+                    headless=False,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--window-size=1366,768",
+                        "--lang=zh-CN",
+                    ],
+                )
+                _cleanup_restored_tabs(context)  # 关掉 Chrome 自动恢复的旧标签页，只留一个干净页面
+                context.add_init_script(STEALTH_JS)
+                if attempt > 1:
+                    self._log(f"  ✓ 第 {attempt} 次尝试启动成功")
+                return context
+            except Exception as e:
+                last_err = e
+                brief = (str(e).strip().splitlines() or [type(e).__name__])[0][:180]
+                self._log(f"  [!] 启动 Chrome 失败（第 {attempt}/3 次）: {brief}")
+                if attempt == 1:
+                    self._log("      常见原因：该 Profile 仍被另一个 Chrome 占用"
+                              "（程序被重复启动 / 上次浏览器未完全退出）。")
+                    self._log("      正在强制清理占用进程与残留锁文件后重试…")
+                _kill_stale_chrome(persistent_profile, log=None)
+                _clear_stale_singleton(persistent_profile, log=self._log)
+                time.sleep(1.5 * attempt)   # 等锁释放
+
+        self._log(f"Profile 启动失败: {last_err}")
+        self._log("  处理建议：")
+        self._log("    1) 关闭所有使用该 Profile 的 Chrome 窗口"
+                  f"（{persistent_profile}）；")
+        self._log("    2) 确认没有另一个 xueqiu.exe 在运行（旧实例请 Ctrl+C 退出）；")
+        self._log("    3) 重新启动本程序；若仍失败，可备份后删除 data\\chrome_profile 重新登录。")
+        return None
 
     # ──────────────────────────────────────────────
     #  单轮抓取
@@ -1693,7 +1771,8 @@ class XueqiuScraper:
         self._human_move(page)
         self._rsleep(2, 4)
         # 登录检测（仅在无登录态时等待人工登录；有持久化 Profile 则秒过）
-        self._ensure_login(page)
+        if not self._ensure_login(page):
+            self._log("  [!] 未取得登录态：后续每轮抓取前会再次检查，未登录则跳过（不会匿名硬抓）。")
         return (context, page)
 
     def close_session(self):
@@ -1775,8 +1854,10 @@ class XueqiuScraper:
             self._human_move(page)
             self._rsleep(2, 4)
 
-            # 登录检测（仅第一次需要）
-            self._ensure_login(page)
+            # 登录检测（仅第一次需要）；未登录时不匿名硬抓，交由循环内每轮复查
+            if not self._ensure_login(page):
+                self._log("  [!] 首次未取得登录态：程序不会匿名抓取，"
+                          "将在每轮前继续提示登录，登录后自动恢复。")
 
             # ── 持续运行循环 ──
             last_export_time = time.time()
@@ -1789,25 +1870,29 @@ class XueqiuScraper:
                 self._log(f"*  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 self._log(f"{'*'*60}")
 
-                # 执行一轮抓取
-                try:
-                    self._do_one_scrape(page)
-                except Exception as e:
-                    self._log(f"  抓取出错: {e}")
-                    # 检查浏览器是否还活着
+                # 登录校验：失效则暂停并提示人工登录；仍未登录就跳过本轮（绝不匿名硬抓）
+                if self.ensure_login_for_round(page):
+                    # 执行一轮抓取
                     try:
-                        page.evaluate("1+1")
-                    except Exception:
-                        self._log("  浏览器可能已关闭，尝试重新连接…")
+                        self._do_one_scrape(page)
+                    except Exception as e:
+                        self._log(f"  抓取出错: {e}")
+                        # 检查浏览器是否还活着
                         try:
-                            page = context.pages[0] if context.pages else context.new_page()
-                            page.set_default_timeout(60000)
-                            self._page = page
-                            page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
-                            self._rsleep(3, 5)
+                            page.evaluate("1+1")
                         except Exception:
-                            self._log("  无法恢复浏览器连接，退出循环。")
-                            break
+                            self._log("  浏览器可能已关闭，尝试重新连接…")
+                            try:
+                                page = context.pages[0] if context.pages else context.new_page()
+                                page.set_default_timeout(60000)
+                                self._page = page
+                                page.goto("https://xueqiu.com/", wait_until="domcontentloaded")
+                                self._rsleep(3, 5)
+                            except Exception:
+                                self._log("  无法恢复浏览器连接，退出循环。")
+                                break
+                else:
+                    self._log("  本轮跳过抓取（登录态无效，登录恢复后自动继续）。")
 
                 # 检查是否到了 JSON 导出时间
                 now = time.time()

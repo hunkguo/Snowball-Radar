@@ -427,13 +427,54 @@ def main():
     if do_recommend or do_hashtag:
         pw_cm = sync_playwright()
         pw = pw_cm.__enter__()
-        if do_recommend:
-            rec.start_session(pw)            # 推荐引擎拥有登录持久化 context
-        if do_hashtag:
+
+        def _start_engines():
             if do_recommend:
-                htag.start_session(pw, login_ctx=rec._context, login_page=rec._page)  # 借用同一 context
-            else:
-                htag.start_session(pw)       # 话题单独运行，自行拥有登录 context
+                rec.start_session(pw)            # 推荐引擎拥有登录持久化 context
+            if do_hashtag:
+                if do_recommend:
+                    htag.start_session(pw, login_ctx=rec._context, login_page=rec._page)  # 借用同一 context
+                else:
+                    htag.start_session(pw)       # 话题单独运行，自行拥有登录 context
+
+        # 启动浏览器带重试：Profile 被占用时 Chrome 会把命令行转交给已有实例并 exit(0)，
+        # 表现为 "Target page, context or browser has been closed"。给 3 次机会，
+        # 仍失败则打印可操作的处理建议后**优雅退出**（不再抛未捕获异常刷 traceback）。
+        _started = False
+        for _attempt in range(1, 4):
+            try:
+                _start_engines()
+                _started = True
+                break
+            except Exception as e:
+                _print(f"  [!] 浏览器启动失败（第 {_attempt}/3 次）: {e}")
+                for _eng in (rec, htag):
+                    try:
+                        if _eng is not None:
+                            _eng.close_session()
+                    except Exception:
+                        pass
+                if _attempt < 3:
+                    _print("      60 秒后重试（请关闭占用该 Profile 的 Chrome 窗口 / 其他 xueqiu 实例）…")
+                    time.sleep(60)
+
+        if not _started:
+            _print("")
+            _print("  [x] 无法启动浏览器，程序退出（未做任何抓取）。")
+            _print("      请依次确认：")
+            _print("        1) 没有另一个 xueqiu.exe 在运行（旧实例请在其窗口按 Ctrl+C 退出）")
+            _print("        2) 没有 Chrome 窗口占用 data\\chrome_profile（关掉它）")
+            _print("        3) 仍失败：备份后删除 data\\chrome_profile，重新启动并登录一次")
+            try:
+                pw_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            for _db in ([rec.db] if rec is not None else []) + ([hdb] if hdb is not None else []):
+                try:
+                    _db.close()
+                except Exception:
+                    pass
+            return
     try:
         while state["running"]:
             round_no += 1
@@ -442,14 +483,23 @@ def main():
             _print(f"{'='*60}")
 
             # ── 会话健康检查（自愈）：浏览器被关闭/崩溃时自动重连，而不是此后每轮都失败 ──
-            if do_recommend and not rec.is_session_alive():
-                _print("  [!] 检测到浏览器已关闭/失效（可能被外部关闭或崩溃），正在自动重连…")
-                try:
-                    rec.close_session()
-                    rec.start_session(pw)
-                    _print("  [ok] 浏览器已重连")
-                except Exception as e:
-                    _print(f"  [!] 浏览器重连失败: {e}（本轮跳过抓取，下一轮自动重试）")
+            rec_ready = False
+            if do_recommend:
+                if not rec.is_session_alive():
+                    _print("  [!] 检测到浏览器已关闭/失效（可能被外部关闭或崩溃），正在自动重连…")
+                    try:
+                        rec.close_session()
+                        rec.start_session(pw)
+                        _print("  [ok] 浏览器已重连")
+                    except Exception as e:
+                        _print(f"  [!] 浏览器重连失败: {e}（本轮跳过抓取，下一轮自动重试）")
+                if rec.is_session_alive():
+                    # 登录校验：失效 → 暂停并提示人工登录；仍未登录则跳过，绝不匿名硬抓
+                    rec_ready = rec.ensure_login_for_round(rec._page)
+                    if not rec_ready:
+                        _print("  [!] 登录态无效：本轮跳过推荐/热门抓取（登录恢复后自动继续）")
+
+            hashtag_ready = False
             if do_hashtag:
                 if do_recommend:
                     # 推荐侧可能刚重连换了 context → 话题引擎同步其借用的登录上下文
@@ -460,39 +510,51 @@ def main():
                             htag._browser = rec._context.browser
                         except Exception:
                             htag._browser = None
+                    # 与推荐引擎共用同一登录 context → 登录态一致
+                    hashtag_ready = rec_ready
                     # 非登录 guest context 已改为【惰性创建】：热点发现走登录态首页右侧
                     # 「热门话题」榜，匿名 context 仅在登录态取不到榜单时由 _scrape_round
                     # 内部按需建立，这里不再每轮强制重建（少一个 context，省内存 + 少一份指纹）。
                 else:
                     if not htag.ensure_session_alive(pw):
                         _print("  [!] 热点引擎会话不可用（本轮跳过，下一轮自动重试）")
+                    else:
+                        hashtag_ready = htag.ensure_login(htag._login_page)
+                        if not hashtag_ready:
+                            _print("  [!] 登录态无效：本轮跳过话题抓取（登录恢复后自动继续）")
 
             if do_recommend:
-                try:
-                    rid = rec._do_one_scrape(rec._page)
-                    _print(f"  推荐/热门抓取完成 (run_id={rid})")
-                except Exception as e:
-                    _print(f"  [!] 推荐抓取异常: {e}")
+                if not rec_ready:
+                    _print("  本轮跳过推荐/热门抓取（登录态无效，不匿名硬抓）。")
+                else:
+                    try:
+                        rid = rec._do_one_scrape(rec._page)
+                        _print(f"  推荐/热门抓取完成 (run_id={rid})")
+                    except Exception as e:
+                        _print(f"  [!] 推荐抓取异常: {e}")
 
             if do_hashtag:
-                try:
-                    n = htag._scrape_round(htag._login_page, htag._guest_page)
-                    _print(f"  话题抓取完成 (新增 {n} 条评论)")
-                    if not args.no_clues:
-                        # 注：各话题已在 _scrape_topic 内按话题独立生成 insight_<话题>_*.md；
-                        # 这里额外产出一份「全部热门话题」汇总（名称中立，不再沿用写死的旧话题名）。
-                        md, _, c = gen_hashtag_clues(
-                            name="雪球热门话题（全部）", short="hashtag_all",
-                            write_json=args.write_json, incremental=_do_incremental,
-                            include_prompt=args.include_prompt,
-                            upload=upload_enabled, upload_url=worker_url,
-                            upload_token=worker_token, jev_api_key=jev_api_key)
-                        _print(f"  话题线索 {len(c)} 条 -> {md}")
-                except Exception as e:
-                    _print(f"  [!] 话题抓取/线索异常: {e}")
+                if not hashtag_ready:
+                    _print("  本轮跳过话题抓取（登录态无效，不匿名硬抓）。")
+                else:
+                    try:
+                        n = htag._scrape_round(htag._login_page, htag._guest_page)
+                        _print(f"  话题抓取完成 (新增 {n} 条评论)")
+                        if not args.no_clues:
+                            # 注：各话题已在 _scrape_topic 内按话题独立生成 insight_<话题>_*.md；
+                            # 这里额外产出一份「全部热门话题」汇总（名称中立，不再沿用写死的旧话题名）。
+                            md, _, c = gen_hashtag_clues(
+                                name="雪球热门话题（全部）", short="hashtag_all",
+                                write_json=args.write_json, incremental=_do_incremental,
+                                include_prompt=args.include_prompt,
+                                upload=upload_enabled, upload_url=worker_url,
+                                upload_token=worker_token, jev_api_key=jev_api_key)
+                            _print(f"  话题线索 {len(c)} 条 -> {md}")
+                    except Exception as e:
+                        _print(f"  [!] 话题抓取/线索异常: {e}")
 
             # ── 价值线索提取（推荐侧，统一策略）──
-            if not args.no_clues and do_recommend:
+            if not args.no_clues and do_recommend and rec_ready:
                 try:
                     md, _, c = gen_recommend_clues(write_json=args.write_json,
                                                    incremental=_do_incremental,

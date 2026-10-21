@@ -979,6 +979,30 @@ class XueqiuHashtagScraper:
                 return False
         return self._page_alive(self._login_page)
 
+    def ensure_login(self, page=None, wait=None):
+        """每轮抓取前的登录校验（与推荐引擎同口径：未登录就停手，不匿名硬抓）。
+
+        话题的评论接口必须登录态，匿名只会返回空列表——继续抓就是白跑 + 加重风控。
+        故未登录时：暂停 → 提示人工登录 → 等待；仍未登录则跳过本轮。
+
+        返回 True=可以抓取；False=跳过本轮。
+        """
+        page = page or self._login_page
+        if not self._page_alive(page):
+            return False
+        try:
+            if stealth.login_state(page).get("is_logged_in"):
+                return True
+        except Exception:
+            return False
+
+        if getattr(self, "headless", True):
+            _log("  [!] 话题引擎登录态已失效，且当前为无头模式（无法人工登录）→ 本轮跳过抓取")
+            _log("      处理：改用有头模式启动，在 Chrome 中登录后即自动恢复。")
+            return False
+
+        return stealth.wait_for_login(page, timeout=wait or 300, log=_log)
+
     def _scrape_round(self, login_page, guest_page=None, state=None):
         """执行一轮热点抓取（发现 + 逐话题抓评论），不负责浏览器的开关。
 
