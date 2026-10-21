@@ -55,6 +55,7 @@ from scraper import (  # noqa: E402
     CLUE_THRESHOLD,
     CLUE_MAX_CANDIDATES,
     CLUE_SEEN_PATH,
+    LIMIT_SUSPECT_ROUNDS,
 )
 import hashtag_comments as hm  # noqa: E402
 from hashtag_comments import (  # noqa: E402
@@ -220,6 +221,35 @@ def acquire_single_instance(allow_multi=False):
 
 
 # ──────────────────────────────────────────────
+#  夜间停抓（降低「7×24 不间断轮询」的机器人特征）
+# ──────────────────────────────────────────────
+NIGHT_PAUSE_START = 23   # 23:00 起停止抓取
+NIGHT_PAUSE_END = 7      # 07:00 恢复（设为 None 可关闭夜间停抓）
+
+
+def _in_night_pause(now=None):
+    """当前是否处于夜间停抓时段。"""
+    if NIGHT_PAUSE_START is None or NIGHT_PAUSE_END is None:
+        return False
+    h = (now or datetime.now()).hour
+    if NIGHT_PAUSE_START <= NIGHT_PAUSE_END:
+        return NIGHT_PAUSE_START <= h < NIGHT_PAUSE_END
+    return h >= NIGHT_PAUSE_START or h < NIGHT_PAUSE_END
+
+
+def _sleep_until_night_end(state):
+    """睡到 NIGHT_PAUSE_END 点；每 30 秒检查一次 Ctrl+C，保证可随时退出。"""
+    now = datetime.now()
+    target = now.replace(hour=NIGHT_PAUSE_END, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    _print(f"  [夜间停抓] 当前 {now:%H:%M}，暂停抓取至 {target:%m-%d %H:%M}"
+           f"（降低风控风险，Ctrl+C 可退出）")
+    while state["running"] and datetime.now() < target:
+        time.sleep(30)
+
+
+# ──────────────────────────────────────────────
 #  参数
 # ──────────────────────────────────────────────
 def parse_args():
@@ -253,10 +283,10 @@ def parse_args():
     p.add_argument("--url", default=None, help="话题页 URL（覆盖默认）")
     p.add_argument("--name", default=None, help="话题标题（覆盖默认，用于标注）")
     p.add_argument("--short", default=None, help="文件名短标识（覆盖默认）")
-    p.add_argument("--interval-min", type=int, default=45,
-                   help="抓取间隔下限（分钟）")
-    p.add_argument("--interval-max", type=int, default=60,
-                   help="抓取间隔上限（分钟）")
+    p.add_argument("--interval-min", type=int, default=120,
+                   help="抓取间隔下限（分钟）。默认 120；2026-10-21 因账号被封由 45 上调，勿随意调小")
+    p.add_argument("--interval-max", type=int, default=180,
+                   help="抓取间隔上限（分钟）。默认 180；高频轮询是封号主因之一")
     p.add_argument("--allow-multi", dest="allow_multi", action="store_true",
                    help="允许并行运行多个实例（默认单实例保护：两实例会争抢同一 Chrome Profile、互相关闭浏览器）")
     # ── 上传到 Cloudflare Worker（雪球雷达 · 线索台）──
@@ -390,7 +420,7 @@ def main():
     hdb = None
     if do_recommend:
         rec = XueqiuScraper(
-            max_pages=3, max_comment_pages=2, max_comment_posts=15, login_wait=300)
+            max_pages=3, max_comment_pages=1, max_comment_posts=8, login_wait=300)
     if do_hashtag:
         hurl = args.url or HASHTAG_URL
         hname = args.name or HASHTAG_NAME
@@ -420,6 +450,7 @@ def main():
         signal.signal(signal.SIGTERM, _handler)
 
     round_no = 0
+    limit_streak = 0   # 连续「疑似账号受限」轮数（见下方账号受限检测）
     # 单一浏览器常驻：所有引擎共用一个 Chrome 进程（登录持久化 profile），
     # 推荐与话题顺序复用同一 context/page；话题在其上另开非登录 guest context 做热点发现。
     # 只刷新页面不复开，避免每轮重复启动 Chrome 导致标签页堆积、内存膨胀。
@@ -533,6 +564,27 @@ def main():
                     except Exception as e:
                         _print(f"  [!] 推荐抓取异常: {e}")
 
+            # ── 账号受限检测 ──
+            # 账号被封时 cookie 里的 xq_a_token 可能仍在 → 登录检测查不出来，
+            # 表现为「接口都拿到了，但评论全是空」。这里用「明确受限信息」或
+            # 「连续多轮全部取不到评论」判定，命中即停手，不再空转（避免加重处罚）。
+            if do_recommend and rec_ready:
+                _suspect, _reason, _hard = rec.account_suspect
+                if _suspect:
+                    limit_streak = LIMIT_SUSPECT_ROUNDS if _hard else limit_streak + 1
+                    _print(f"  [!] 疑似账号受限（{limit_streak}/{LIMIT_SUSPECT_ROUNDS} 轮）：{_reason}")
+                else:
+                    if limit_streak:
+                        _print("  [ok] 本轮数据正常，账号受限计数清零")
+                    limit_streak = 0
+                if limit_streak >= LIMIT_SUSPECT_ROUNDS:
+                    _print("")
+                    _print("  [x] 连续多轮取不到数据，判定账号已被限制/封禁 → 已停止抓取。")
+                    _print("      请用该 Chrome 窗口打开 xueqiu.com，确认账号是否被禁言/封禁；")
+                    _print("      确为封禁请申诉或更换账号后再启动（不要继续空转，以免加重处罚）。")
+                    state["running"] = False
+                    break
+
             if do_hashtag:
                 if not hashtag_ready:
                     _print("  本轮跳过话题抓取（登录态无效，不匿名硬抓）。")
@@ -569,6 +621,12 @@ def main():
 
             if args.once or not state["running"]:
                 break
+
+            # ── 夜间停抓（降低机器人特征）：睡到次日 NIGHT_PAUSE_END，期间可 Ctrl+C 退出 ──
+            if _in_night_pause():
+                _sleep_until_night_end(state)
+                if not state["running"]:
+                    break
 
             wait = random.randint(args.interval_min, args.interval_max)
             next_t = datetime.now() + timedelta(minutes=wait)

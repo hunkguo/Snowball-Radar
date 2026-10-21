@@ -170,10 +170,21 @@ def _detect_chrome_user_data():
 CHROME_USER_DATA = _detect_chrome_user_data()
 
 # ── 抓取间隔配置 ──
-SCRAPE_INTERVAL_MIN = 30 * 60   # 30 分钟（最小间隔）
-SCRAPE_INTERVAL_MAX = 45 * 60   # 45 分钟（最大间隔）
+# 2026-10-21 降频：雪球账号被封后大幅拉长间隔，降低「7×24 高频轮询」的机器人特征。
+# 原 30~45 分钟 → 120~180 分钟（配合话题每帖翻页 25→5）。
+SCRAPE_INTERVAL_MIN = 120 * 60  # 120 分钟（最小间隔）
+SCRAPE_INTERVAL_MAX = 180 * 60  # 180 分钟（最大间隔）
 JSON_EXPORT_INTERVAL = 6 * 3600  # 6 小时导出一次 JSON
 EXPORT_JSON = False            # 是否导出原始抓取数据 JSON（默认关闭，只产出价值线索 md）
+
+# ── 账号受限检测（2026-10-21：账号被封但 cookie 未清时，登录检测查不出来）──
+# 接口错误信息里出现这些词 → 判定账号被限制（封禁/冻结/无权），立即停手。
+LIMIT_MARKERS = (
+    "账号异常", "账号被封", "账号被冻结", "账号受限", "封禁", "冻结",
+    "无权访问", "禁止访问", "登录已过期", "登录失效", "请重新登录",
+)
+# 兜底信号：抓到了帖子但**所有**评论接口都返回空，连续 N 轮判定为账号受限。
+LIMIT_SUSPECT_ROUNDS = 3
 
 # ── 价值线索提取（Layer 1）──
 GEN_CLUES = True               # 每轮导出时同时生成价值线索文件
@@ -743,6 +754,15 @@ class XueqiuScraper:
         # 测试若自建 headless context，可在调用前置 True，避免白白等待人工验证。
         self.headless = False
 
+        # ── 单轮统计（账号受限检测用）──
+        # comment_posts: 本轮尝试抓评论的帖子数；zero_comment_posts: 其中返回 0 条的个数
+        # api_errors: 接口返回错误体的次数；limit_hits: 错误体命中受限关键字的次数
+        self.round_stats = {"comment_posts": 0, "zero_comment_posts": 0,
+                            "comments": 0, "api_errors": 0, "limit_hits": 0}
+        self._last_limit_msg = ""
+        # 本轮判定结果（由 _judge_account_limit 写入）：(是否可疑, 原因, 是否硬证据)
+        self.account_suspect = (False, "", False)
+
         # 初始化 SQLite
         self.db = XueqiuDB(DB_PATH)
 
@@ -1138,6 +1158,45 @@ class XueqiuScraper:
         self._log(f"  [!] 等待人工验证超时（{timeout}s），本轮跳过")
         return False
 
+    def _note_api_payload(self, data):
+        """识别接口里的错误/受限响应（封号、登录失效、限流），并累计到本轮统计。
+
+        为什么需要：账号被封后 cookie 里仍可能有 xq_a_token，登录检测会误判为"已登录"，
+        于是程序继续抓、继续拿到空结果 —— 这正是要避免的"硬抓"。
+        """
+        if not isinstance(data, dict):
+            return
+        err = (data.get("error_description") or data.get("error_message")
+               or data.get("error") or "")
+        code = data.get("error_code") or ""
+        if isinstance(err, (dict, list)):
+            err = json.dumps(err, ensure_ascii=False)
+        msg = (f"{code} {err}").strip()
+        if not msg or msg == "None":
+            return
+        self.round_stats["api_errors"] += 1
+        if any(m in msg for m in LIMIT_MARKERS):
+            self.round_stats["limit_hits"] += 1
+            self._last_limit_msg = msg[:200]
+            self._log(f"    [!] 接口返回受限信息: {msg[:160]}")
+        else:
+            self._log(f"    接口返回错误: {msg[:160]}")
+
+    def _judge_account_limit(self):
+        """判定本轮是否像「账号受限」（封禁/冻结/无权限）。
+
+        两个独立信号：
+          1) 硬证据：接口错误体命中受限关键字 → 立即可疑（无需累计）
+          2) 兜底：抓了 >=3 个帖子，但**全部**评论接口都返回空
+        """
+        st = self.round_stats
+        if st.get("limit_hits", 0) > 0:
+            return True, f"接口返回受限信息: {self._last_limit_msg[:120]}", True
+        total = st.get("comment_posts", 0)
+        if total >= 3 and st.get("zero_comment_posts", 0) >= total:
+            return True, f"{total} 个帖子全部取不到评论（接口正常但无数据）", False
+        return False, "", False
+
     def _fetch_api(self, page, url, max_retry=3):
         """拉取雪球 JSON 接口。
 
@@ -1168,6 +1227,7 @@ class XueqiuScraper:
                     parsed_json = json.loads(text)
                     if attempt == 1:
                         self._log("    ✓ 页内 XHR 已拿到接口 JSON")
+                    self._note_api_payload(parsed_json)
                     return parsed_json
                 except Exception:
                     pass
@@ -1216,6 +1276,7 @@ class XueqiuScraper:
             try:
                 parsed_json = json.loads(text)
                 self._log(f"    ✓ 浏览器导航兜底成功(第{attempt}次)，已拿到接口 JSON")
+                self._note_api_payload(parsed_json)
                 return parsed_json
             except Exception:
                 self._log(f"    导航响应非 JSON: {text[:120]}")
@@ -1425,6 +1486,11 @@ class XueqiuScraper:
                     continue
                 comments = self._fetch_comments(page, pid)
                 post["comments"] = comments
+                # 单轮统计（账号受限检测：有帖子但全部 0 评论 = 可疑）
+                self.round_stats["comment_posts"] += 1
+                self.round_stats["comments"] += len(comments)
+                if not comments:
+                    self.round_stats["zero_comment_posts"] += 1
                 preview = (post["title"] or post["description"] or "")[:30]
                 self._log(f"  [{done}/{total}] {section_key}  {pid}  "
                           f"{len(comments)} 评论  «{preview}»")
@@ -1574,6 +1640,11 @@ class XueqiuScraper:
         self.sections_data = {}
         self._waf_hit = False
         self._challenge_waited = False   # 每轮重置：一轮内最多只等一次人工验证
+        # 重置单轮统计（账号受限检测）
+        self.round_stats = {"comment_posts": 0, "zero_comment_posts": 0,
+                            "comments": 0, "api_errors": 0, "limit_hits": 0}
+        self._last_limit_msg = ""
+        self.account_suspect = (False, "", False)
 
         # 访问首页
         self._log("正在访问雪球首页 …")
@@ -1643,6 +1714,14 @@ class XueqiuScraper:
         self._log(f"  累计轮次: {stats['runs']}")
         self._log(f"    推荐: {stats['recommend']}")
         self._log(f"    热门: {stats['hot']}")
+
+        # 账号受限判定（cookie 仍有效但账号被封时，登录检测查不出来）
+        self.account_suspect = self._judge_account_limit()
+        if self.account_suspect[0]:
+            _suspect, _reason, _hard = self.account_suspect
+            self._log("")
+            self._log(f"  ⚠ 疑似账号受限（{'明确信号' if _hard else '连续空数据'}）：{_reason}")
+            self._log("    请用该 Chrome 窗口打开 xueqiu.com 确认账号状态（是否被禁言/封禁）。")
 
         if self._waf_hit:
             self._log("")
@@ -1995,8 +2074,8 @@ if __name__ == "__main__":
 
     scraper = XueqiuScraper(
         max_pages=3,
-        max_comment_pages=2,
-        max_comment_posts=15,
+        max_comment_pages=1,     # 2026-10-21 降频：每帖评论 2→1 页
+        max_comment_posts=8,     # 2026-10-21 降频：每轮帖子 15→8
         login_wait=300,
     )
     if args.no_clues:
