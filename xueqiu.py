@@ -56,6 +56,7 @@ from scraper import (  # noqa: E402
     CLUE_MAX_CANDIDATES,
     CLUE_SEEN_PATH,
     LIMIT_SUSPECT_ROUNDS,
+    resolve_profile_dir,
 )
 import hashtag_comments as hm  # noqa: E402
 from hashtag_comments import (  # noqa: E402
@@ -302,6 +303,9 @@ def parse_args():
                         "需同时提供 token（--jev-token 或环境变量 JEV_API_KEY / TYPESAFE_API_KEY）")
     p.add_argument("--jev-token", "--jev-key", default=None, dest="jev_token",
                    help="Jev API Token / Key（也可设环境变量 JEV_API_KEY 或 TYPESAFE_API_KEY）")
+    p.add_argument("--reset-profile", action="store_true",
+                   help="启动前把旧 Chrome Profile 改名备份（chrome_profile.bak-时间戳）。"
+                        "换账号 / 登录态损坏时用：备份后启动会弹 Chrome，请用新账号登录。不删数据。")
     return p.parse_args()
 
 
@@ -401,6 +405,26 @@ def main():
             except Exception as e:
                 _print(f"话题线索提取失败: {e}")
         return
+
+    # ── 换号 / 登录态重置：把旧 Profile 改名备份（不删除），启动后用新账号登录 ──
+    if args.reset_profile:
+        _prof = resolve_profile_dir()
+        if os.path.isdir(_prof):
+            try:
+                from scraper import _kill_stale_chrome
+                _kill_stale_chrome(_prof)   # 先释放占用，否则 Windows 上改不了名
+            except Exception:
+                pass
+            _bak = f"{_prof}.bak-{datetime.now():%Y%m%d_%H%M%S}"
+            try:
+                os.rename(_prof, _bak)
+                _print(f"  [换号] 旧 Chrome Profile 已备份为: {_bak}")
+                _print("         启动后请在弹出的 Chrome 窗口用【新账号】登录雪球。")
+            except Exception as e:
+                _print(f"  [!] Profile 备份失败（可能仍被 Chrome 占用）: {e}")
+                _print("      请先关闭所有使用该 Profile 的 Chrome 窗口，再重试。")
+        else:
+            _print(f"  [换号] 未发现旧 Profile（{_prof}），将以全新 Profile 启动。")
 
     # ── 构建引擎 ──
     hashtag_headless = HASH_HEADLESS
