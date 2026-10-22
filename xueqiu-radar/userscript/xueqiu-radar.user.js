@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         雪球雷达 · 抓取上传（油猴版）
-// @namespace    https://cn24.org
+// @namespace    https://snowball-radar.local/userscript
 // @version      0.1.0
-// @description  在雪球页面内直接抓取「推荐/热门」评论，JS 版价值打分后上传到你的 Cloudflare Worker（地址与 token 可自定义）。替代 xueqiu.exe 的抓取+打分+上传一段，Worker 与前端零改动。
+// @description  在雪球页面内直接抓取「推荐/热门」评论，JS 版价值打分后上传到你的 Cloudflare Worker（地址与 token 可自定义）。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
 // @match        https://*.xueqiu.com/*
@@ -65,7 +65,7 @@
   }
 
   // ──────────────────────────────────────────────
-  // 股票名 / 事件词 表（1:1 移植自 clue_extractor.py）
+  // 股票名 / 事件词 表
   // ──────────────────────────────────────────────
   const STOCK_NAMES = {
     "澜起科技": "澜起科技", "澜起": "澜起科技",

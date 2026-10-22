@@ -29,5 +29,5 @@ crons = ["0 16 * * *"]
 #          `wrangler d1 execute xueqiu-radar-db --remote --file=./migrations/0001_init.sql`（线上）
 # 3) 上传鉴权 token（务必用 secret，别写进仓库）：
 #          `wrangler secret put INGEST_TOKEN`
-#    然后粘贴 token（与 xueqiu.exe 配置里的 --worker-token 一致）
+#    然后粘贴 token（与油猴脚本「设置」里填的上传 Token 一致）
 # 4) 自定义域名 + 优选 IP 的访问方案见 README.md

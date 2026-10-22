@@ -1,23 +1,20 @@
-# ── Python ──
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-*.egg
-
-# ── 虚拟环境 ──
-venv/
-.venv/
-env/
-
-# ── PyInstaller 构建产物 ──
-build/
-dist/
-*.spec
-
-# ── 运行时数据（含敏感信息：cookie、登录态、抓取数据）──
+# ── 运行时数据（含敏感信息：登录态等）──
 data/
+
+# ── D1 线上库导出备份（含真实线索数据，不入库）──
+backup-*.sql
+xueqiu-radar/backup-*.sql
+
+# ── Node / 前端依赖 ──
+node_modules/
+
+# ── Wrangler（本地 D1 状态、密钥；.dev.vars 绝不入库）──
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# ── 构建产物 ──
+dist/
 
 # ── WorkBuddy 内部文件 ──
 .workbuddy/
