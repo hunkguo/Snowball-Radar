@@ -614,7 +614,12 @@
         lastFlushAt = now();
         persist();
         log("· 本批全部为重复线索，无需写入");
-        bump("uploads");
+        // 注意：不计入 uploads —— 这次并没有真正写入任何行，
+        // 计入会让面板误报「上传正常」
+        stat.lastOk = new Date().toLocaleString("zh-CN");
+        persist();
+        setStatus("无新线索（全部重复）");
+        updatePanel();
         return { ok: true, skipped: skipped };
       }
 
@@ -624,7 +629,10 @@
       const up = await upload(payload);
       if (!up.ok) {
         log("✗ 攒批上传失败：" + (up.msg || up.code));
+        setStatus("上传失败 · " + (up.msg || up.code));
+        updatePanel();
         bump("fails");
+        notify("雪球雷达", "上传失败：" + (up.msg || up.code) + "（缓冲已保留，会重试）");
         return { ok: false, msg: up.msg || String(up.code) };
       }
       for (const c of toSend) seenSet.add(c.id);
@@ -635,6 +643,12 @@
       stat.lastOk = new Date().toLocaleString("zh-CN");
       persist();
       log(`✓ 上传成功 · 新增 ${toSend.length} 条${skipped ? "（跳过重复 " + skipped + "）" : ""}`);
+      setStatus("上传成功 · " + new Date().toLocaleTimeString("zh-CN"));
+      updatePanel();
+      // 首次上传成功 → 桌面通知（用户可能没盯着面板）
+      if (stat.uploads === 1) {
+        try { notify("雪球雷达", "上传通道已打通 · 新增 " + toSend.length + " 条线索"); } catch (e) {}
+      }
       return { ok: true, sent: toSend.length, skipped };
     } finally {
       flushingBatch = false;
@@ -644,7 +658,7 @@
   // ══════════════════════════════════════════════════════════════
   //  主调度
   // ══════════════════════════════════════════════════════════════
-  const ST = { running:false, stopped:false, timer:null, sessionStart:now(), nextAt:0 };
+  const ST = { running:false, stopped:false, timer:null, sessionStart:now(), nextAt:0, runAfterCurrent:false };
 
   function log(t) {
     if (logEl) {
@@ -772,9 +786,12 @@
         // 攒批：候选先入缓冲，跨轮累积到阈值再一次性发出
         // ① 攒够阈值 → 立即发（减少 HTTP 往返与 D1 事务）
         // ② 没攒够 → 保留到下一轮，由 90 分钟超时兜底（防止长期滞留）
+        // ③ 例外：首轮（从未成功上传过）强制发一次 —— 否则用户配好配置后
+        //    看到的是「攒批中」，仍然不知道上传到底成没成
         for (const c of cands) pending.push(c);
+        const firstEver = stat.uploads === 0;
         log(`▲ 候选 ${cands.length} 条（阈值 ${CFG.threshold}）· 缓冲 ${pending.length} 条`);
-        const fr = await flushPending(false);
+        const fr = await flushPending(firstEver);
         if (fr.deferred) {
           log(`⏳ 攒批中（攒够 ${BATCH.minToFlush} 条或超 ${BATCH.maxIntervalMin} 分钟再发）`);
         } else if (!fr.ok) {
@@ -809,6 +826,17 @@
     } finally {
       ST.running = false;
       updatePanel();
+      // 配置后置的「立即验证」请求：本轮结束后补跑一次
+      // 但如果这一轮已经成功上传了，就不必再补跑（避免多跑一轮）
+      if (ST.runAfterCurrent) {
+        ST.runAfterCurrent = false;
+        if (stat.uploads > 0) {
+          log("✓ 本轮已成功上传，无需额外验证");
+        } else {
+          log("▶ 开始验证完整链路（配置后触发）…");
+          setTimeout(() => { if (!ST.running && !ST.stopped) loop(); }, 1200);
+        }
+      }
     }
   }
 
@@ -875,11 +903,24 @@
     const lst = accounts();
     // 登录态用探针结果（xq_a_token 是 HttpOnly，读不到 cookie）
     const loginTxt = _loginCache.ok ? "已登录" : (_loginCache.at ? "未登录" : "未检测");
+    // 上传状态行：把「能不能上传」这件事说清楚，不要埋在统计数字里
+    let upLine;
+    if (!CFG.url || !CFG.token) {
+      upLine = `<span style="color:#f87171">未配置上传地址/Token</span> · 点「设置」`;
+    } else if (stat.uploads > 0) {
+      upLine = `<span style="color:#4ade80">上传正常</span> · 成功 ${stat.uploads} 次` +
+               (stat.lastOk ? ` · 末次 ${stat.lastOk}` : "");
+    } else if (stat.fails > 0) {
+      upLine = `<span style="color:#f87171">上传失败 ${stat.fails} 次</span> · 点「设置」测试连通性`;
+    } else {
+      upLine = `<span style="color:#fbbf24">已配置 · 尚未上传</span> · 点「立即跑一轮」验证`;
+    }
     hintEl.innerHTML =
       `状态 <b>${loginTxt}</b> · 账号 <b>${acct?acct.name:"当前浏览器"}</b>${lst.length>1?"（共"+lst.length+"个轮换）":""}<br>`+
-      `轮次 ${stat.rounds||0} · 评论 ${stat.comments||0} · 线索 ${stat.clues||0} · 上传 ${stat.uploads||0}<br>`+
-      `缓冲 <b>${pending.length}</b> 条（满 ${BATCH.minToFlush} 即发）· 服务端去重 ${stat.dedup||0} 条<br>`+
-      `WAF ${stat.waf||0} · 受限 ${stat.blocked||0} · 失败 ${stat.fails||0}`+(stat.lastOk?" · 末次 "+stat.lastOk:"")+"<br>"+
+      `上传 ${upLine}<br>`+
+      `轮次 ${stat.rounds||0} · 评论 ${stat.comments||0} · 线索 ${stat.clues||0} · 服务端去重 ${stat.dedup||0}<br>`+
+      `缓冲 <b>${pending.length}</b> 条（满 ${BATCH.minToFlush} 即发）<br>`+
+      `WAF ${stat.waf||0} · 受限 ${stat.blocked||0} · 失败 ${stat.fails||0}<br>`+
       `下一轮 <b>${ST.stopped?"已停止":(nextIn>0?fmtDur(nextIn)+"后":"即将开始")}</b>`;
     if (dot) dot.className = "dot"+(ST.stopped?"":(ST.running?" on":(nextIn>0?" wait":" on")));
   }
@@ -995,37 +1036,18 @@
     wrap.querySelector('[data-t="cancel"]').addEventListener("click", close);
     wrap.querySelector(".mask").addEventListener("click", (e) => { if (e.target === wrap.querySelector(".mask")) close(); });
 
-    // 连通性测试：调用 /api/exists 探针（需要一个真实 clue_id，用不存在的即可）
+    // 连通性测试：复用 verifyUpload（与真实上传同一条鉴权路径）
     wrap.querySelector('[data-t="test"]').addEventListener("click", async () => {
       const u = $("#xr3-url").value.trim();
       const tk = $("#xr3-token").value.trim();
       if (!u || !tk) { say("请先填写地址和 Token", false); return; }
       say("测试中…");
-      const probeUrl = u.replace(/\/api\/ingest.*$/, "/api/exists");
-      const r = await new Promise((resolve) => {
-        GM_xmlhttpRequest({
-          method: "POST", url: probeUrl,
-          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + tk },
-          data: JSON.stringify({ clue_ids: ["__ping__"] }),
-          timeout: 15000,
-          onload: (res) => resolve({ code: res.status, body: res.responseText }),
-          onerror: () => resolve({ code: 0, body: "" }),
-          ontimeout: () => resolve({ code: 0, body: "" }),
-        });
-      });
-      if (r.code === 200) {
-        let n = "";
-        try { n = (JSON.parse(r.body).total != null) ? ("· 库中匹配 " + JSON.parse(r.body).total + " 条") : ""; } catch (e) {}
-        say("✓ 连通正常，地址与 Token 有效" + n, true);
-      } else if (r.code === 401) {
-        say("✗ Token 不正确（401）", false);
-      } else if (r.code === 404) {
-        say("✗ 接口不存在（404）· Worker 可能未部署新版", false);
-      } else if (r.code === 0) {
-        say("✗ 网络不通（检查地址/代理/域名）", false);
-      } else {
-        say("✗ HTTP " + r.code + " " + (r.body || "").slice(0, 60), false);
-      }
+      // 临时用输入框的值测试，不影响已保存配置
+      const saved = { url: CFG.url, token: CFG.token };
+      CFG.url = u; CFG.token = tk;
+      const res = await verifyUpload();
+      CFG.url = saved.url; CFG.token = saved.token;
+      say((res.ok ? "✓ " : "✗ ") + res.msg, res.ok);
     });
 
     // 导出配置（把配置写进剪贴板，由用户自行决定分享与否）
@@ -1052,7 +1074,7 @@
     });
 
     // 保存
-    wrap.querySelector('[data-t="save"]').addEventListener("click", () => {
+    wrap.querySelector('[data-t="save"]').addEventListener("click", async () => {
       CFG.url = $("#xr3-url").value.trim();
       CFG.token = $("#xr3-token").value.trim();
       CFG.threshold = Math.max(0, parseInt($("#xr3-thr").value, 10) || 5);
@@ -1068,14 +1090,78 @@
       CFG.batch_interval = BATCH.maxIntervalMin;
       GM_setValue(KEYS.cfg, CFG);
       persist();
-      log(CFG.url && CFG.token ? "✓ 配置已保存" : "⚠ 地址或 token 为空 → 无法上传");
-      if (CFG.url && CFG.token) {
-        // 只显示主机名，完整路径不写进日志（避免截图分享时泄露完整地址）
-        try { log("  上传目标：" + new URL(CFG.url).host); } catch (e) { log("  上传目标：已配置"); }
+
+      if (!CFG.url || !CFG.token) {
+        log("⚠ 地址或 token 为空 → 无法上传");
+        close();
+        updatePanel();
+        return;
       }
-      close();
-      updatePanel();
+
+      // 立即自检：几秒内给出成败，不必等 1.5~4 小时
+      say("正在验证上传通道…");
+      const res = await verifyUpload();
+      if (res.ok) {
+        log("✓ 上传通道验证通过（" + res.msg + "）");
+        try { log("  上传目标：" + new URL(CFG.url).host); } catch (e) { log("  上传目标：已配置"); }
+        close();
+        updatePanel();
+        // 首次配置成功 → 立刻验证完整链路，让用户马上看到真实上传结果
+        // 注意：可能正有一轮在跑（那轮多半因无配置而失败），
+        //      所以用「排一次立即执行」而非直接 loop()，避免与运行中的轮次冲突。
+        if (stat.uploads === 0 && !ST.stopped) {
+          if (ST.running) {
+            log("▶ 首次配置成功，当前轮次结束后立即验证完整链路…");
+            // 标记：当前轮次结束后立刻补跑
+            ST.runAfterCurrent = true;
+          } else {
+            log("▶ 首次配置成功，立即跑一轮验证完整链路…");
+            if (ST.timer) clearTimeout(ST.timer);
+            loop();
+          }
+        } else {
+          setStatus("已配置 · 等待下一轮");
+        }
+      } else {
+        log("✗ 上传通道验证失败：" + res.msg);
+        say("✗ " + res.msg + "\n（已保存配置，可点「测试连通性」重试，或修改后再次保存）", false);
+        // 不关闭对话框，让用户直接改
+      }
     });
+  }
+
+  // ────────────────────────────────────────────────────────────
+  //  配置自检
+  //  保存配置后立即做一次真实的上传探针，几秒内告知成败。
+  //  背景：保存后若不主动跑一轮，用户要等 1.5~4 小时才知道能不能上传，
+  //        体验上等于「保存后一片空白」。
+  //
+  //  探针做法：POST /api/exists 带一个不存在的 clue_id
+  //  → 走的是与真实上传完全相同的鉴权与网络路径，
+  //  → 但不写入任何线索数据（只是查存在性），不会污染数据库
+  // ────────────────────────────────────────────────────────────
+  async function verifyUpload() {
+    if (!CFG.url || !CFG.token) return { ok: false, msg: "未配置地址或 Token" };
+    const probeUrl = CFG.url.replace(/\/api\/ingest.*$/, "/api/exists");
+    const t0 = now();
+    const r = await new Promise((resolve) => {
+      GM_xmlhttpRequest({
+        method: "POST", url: probeUrl,
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + CFG.token },
+        data: JSON.stringify({ clue_ids: ["__xr3_probe__"] }),
+        timeout: 15000,
+        onload: (res) => resolve({ code: res.status, body: res.responseText }),
+        onerror: () => resolve({ code: 0, body: "" }),
+        ontimeout: () => resolve({ code: 0, body: "" }),
+      });
+    });
+    const ms = now() - t0;
+    if (r.code === 200) return { ok: true, msg: `连通正常（${ms}ms）· 地址与 Token 有效`, ms };
+    if (r.code === 401) return { ok: false, msg: "Token 不正确（401）· 请检查是否与 INGEST_TOKEN 一致" };
+    if (r.code === 404) return { ok: false, msg: "接口不存在（404）· Worker 可能未部署 /api/exists" };
+    if (r.code === 403) return { ok: false, msg: "被拒绝（403）· 可能是 WAF 或域名未绑定" };
+    if (r.code === 0) return { ok: false, msg: "网络不通 · 检查地址拼写、网络/代理" };
+    return { ok: false, msg: `HTTP ${r.code} · ${(r.body || "").slice(0, 80)}` };
   }
 
   function openAccounts() {

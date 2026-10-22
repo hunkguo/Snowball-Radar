@@ -7,6 +7,7 @@
 """
 import json
 import os
+import re
 import time
 
 from playwright.sync_api import sync_playwright
@@ -89,11 +90,10 @@ with sync_playwright() as p:
     # 测试专用：把闭包内的 ST 暴露出来，便于直接操控 nextAt
     # （仅修改内存中的副本，正式文件不受影响）
     src = open(SCRIPT, encoding="utf-8").read()
-    src = src.replace(
-        "const ST = { running:false, stopped:false, timer:null, sessionStart:now(), nextAt:0 };",
-        "const ST = { running:false, stopped:false, timer:null, sessionStart:now(), nextAt:0 };\n"
-        "  window.__ST = ST;")
-    assert "window.__ST = ST" in src, "未找到 ST 声明，脚本结构变了？"
+    # 用正则匹配 ST 声明（字段可能变动），避免硬编码字符串失配
+    m = re.search(r"^(\s*)const ST = \{[^;]*?\};\s*$", src, re.M)
+    assert m, "未找到 ST 声明，脚本结构变了？"
+    src = src[:m.end()] + "\n  window.__ST = ST;" + src[m.end():]
 
     page.add_script_tag(content=src)
     page.wait_for_timeout(2500)
