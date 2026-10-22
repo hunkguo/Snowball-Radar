@@ -187,6 +187,13 @@ function sectionLabel(c) {
   return s === "recommend" ? "推荐" : s === "hot" ? "热门" : "话题";
 }
 
+// 重复命中标记：该线索被多轮抓取到（全局去重后只存一行，但可看出热度）
+// hit_count > 1 表示它在热门帖里反复出现
+function hitLabel(c) {
+  const n = Number(c.hit_count) || 0;
+  return n > 1 ? `×${n}` : "";
+}
+
 // 是否有任何生效中的筛选（用于区分「无数据」与「筛选后无数据」两种空态）
 const hasActiveFilter = computed(() =>
   !!(sectionFilter.value || search.value.trim() || stockFilter.value.trim() || minScore.value)
@@ -287,6 +294,11 @@ function origUrl(c) {
               :class="sectionOf(c)"
               :title="'来源：' + ((roundMap[c.round_id] && roundMap[c.round_id].source) || '-')"
             >{{ sectionLabel(c) }}</span>
+            <span
+              v-if="hitLabel(c)"
+              class="hit"
+              :title="'该线索被 ' + c.hit_count + ' 轮抓取到（全局去重后仅存一份）'"
+            >{{ hitLabel(c) }}</span>
           </div>
 
           <div class="text">{{ c.text }}</div>

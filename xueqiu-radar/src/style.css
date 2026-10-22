@@ -184,6 +184,15 @@ input:focus, select:focus { border-color: var(--accent); }
 .clue .src.topic { color: var(--amber); border-color: var(--amber); }
 .clue .src.hashtag { color: var(--amber); border-color: var(--amber); }
 .clue .src.unknown { color: var(--muted); }
+/* 重复命中标记：同一线索被多轮抓到的次数（全局去重后仅存一份） */
+.clue .hit {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  cursor: help;
+}
 .clue .text { font-size: 15px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
 .clue .meta {
   margin-top: 8px;
