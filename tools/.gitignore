@@ -1,2 +1,3 @@
 _worker_*.cjs
 *.png
+real_samples.json

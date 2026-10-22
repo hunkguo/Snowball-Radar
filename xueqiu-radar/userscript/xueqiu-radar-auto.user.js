@@ -1119,22 +1119,33 @@
     }, LIMIT.HEARTBEAT*1000);
   }
 
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") {
-      log("◉ 页面重新可见");
-      if (ST.nextAt && now() >= ST.nextAt && !ST.running && !ST.stopped) {
-        log("  错过轮次，立即补跑");
-        if (ST.timer) clearTimeout(ST.timer);
-        loop();
-      } else updatePanel();
-    }
-  });
-  window.addEventListener("pageshow", () => {
-    if (ST.nextAt && now() >= ST.nextAt && !ST.running && !ST.stopped) {
-      log("◉ 页面恢复，错过轮次立即补跑");
+  // 页面重新可见时的处理
+  // 背景：Chrome 会对后台标签页的定时器做节流（甚至冻结），
+  //       setTimeout(loop) 可能被推迟很久才触发。
+  //       这里用「绝对时间戳 nextAt」判断是否错过了轮次，错过就立即补跑。
+  //       —— 这正是无人值守能在「用户切走一整天」后仍继续工作的关键。
+  // 互斥：三个触发点（定时器 / visibilitychange / pageshow）都过 loop() 开头的
+  //       `if (ST.running) return` 守卫，JS 单线程下不会并发执行。
+  function onPageVisible(tag) {
+    if (ST.stopped) { updatePanel(); return; }
+    if (ST.running) { log(`◉ ${tag}（本轮正在运行中）`); updatePanel(); return; }
+    if (ST.nextAt && now() >= ST.nextAt) {
+      const late = Math.round((now() - ST.nextAt) / 60000);
+      log(`◉ ${tag} · 错过了 ${late} 分钟的轮次，立即补跑`);
       if (ST.timer) clearTimeout(ST.timer);
       loop();
+    } else {
+      const left = ST.nextAt ? Math.round((ST.nextAt - now()) / 60000) : 0;
+      log(`◉ ${tag} · 下一轮还有 ${left} 分钟，正常等待`);
+      updatePanel();
     }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") onPageVisible("页面重新可见");
+  });
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted) onPageVisible("页面从缓存恢复");
   });
   window.addEventListener("beforeunload", () => {
     persist();
