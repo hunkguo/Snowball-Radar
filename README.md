@@ -57,9 +57,7 @@ Snowball-Radar/
 │   │   ├── 0009_global_dedup.sql  ← 全局去重（唯一索引）
 │   │   └── 部署去重升级.bat
 │   ├── userscript/                油猴脚本
-│   │   ├── xueqiu-radar-auto.user.js  ★ 无人值守版（主用）
-│   │   ├── xueqiu-radar-safe.user.js  半自动版
-│   │   ├── xueqiu-radar.user.js       早期手动版
+│   │   ├── xueqiu-radar-auto.user.js  ★ 无人值守版（主用，v3.2.1）
 │   │   ├── 启动雪球雷达.bat           开机自启
 │   │   └── README-无人值守版.md       完整文档
 │   ├── wrangler.toml              Worker / D1 / 域名配置

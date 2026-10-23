@@ -416,10 +416,6 @@ xueqiu-radar/
 │   └── style.css
 └── userscript/
     ├── xueqiu-radar-auto.user.js  ← 无人值守主脚本（装这个）
-    ├── xueqiu-radar-safe.user.js  ← 半自动版（被动 DOM + 手动触发）
-    ├── xueqiu-radar.user.js       ← 原版（保留参考）
     ├── 启动雪球雷达.bat            ← 开机自启启动器
     └── README-无人值守版.md        ← 本文档
 ```
-
-根目录 `Snowball-Radar/uploader.py` 的 exe 上传链路也接入了 `/api/exists` 全局去重探针（与油猴脚本共用同一套去重语义）。
