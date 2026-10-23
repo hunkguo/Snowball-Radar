@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.1.0
-// @description  油猴全自动抓取雪球评论并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
+// @version      3.2.0
+// @description  油猴全自动抓取雪球评论（推荐 / 热门 / 关注 三源）并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
 // @match        https://*.xueqiu.com/*
@@ -45,14 +45,15 @@
   const NS = "xr3_";
   const DEFAULTS = {
     url: "", token: "", threshold: 5,
-    postsPerRound: 6, commentPages: 2,
+    postsPerRound: 6, commentPages: 2,   // postsPerRound 仅用于旧配置迁移（=每板块帖数）
+    totalPostsPerRound: 12,              // 每轮总帖数预算，按启用的板块均分（新增板块不增加请求量）
     minIntervalMin: 150, maxIntervalMin: 240,
     sections: "recommend,hot",
     autoStart: true, notify: true,
     batch_min: 30, batch_interval: 90,   // 攒批阈值与最长等待
   };
   const LIMIT = {
-    MAX_POSTS: 10, MAX_PAGES: 3,
+    MAX_POSTS: 10, MAX_PAGES: 3, MAX_TOTAL_POSTS: 30,
     // 2026-10-23 由 90 下调至 30（用户要求允许更频繁）。
     // 注意：<90 分钟会明显增加风控/封号概率，保存时会给出警告；这里仍留 30 作为防呆下限。
     MIN_INTERVAL: 30,
@@ -73,9 +74,18 @@
   };
 
   function loadCfg() {
-    const c = Object.assign({}, DEFAULTS, GM_getValue(KEYS.cfg, {}) || {});
+    const raw = GM_getValue(KEYS.cfg, {}) || {};
+    const c = Object.assign({}, DEFAULTS, raw);
     c.postsPerRound = Math.min(LIMIT.MAX_POSTS, Math.max(1, +c.postsPerRound || 6));
     c.commentPages = Math.min(LIMIT.MAX_PAGES, Math.max(1, +c.commentPages || 2));
+    // 总帖数预算：旧配置只有「每板块帖数」，换算成总量，保证升级后实际抓取量不变
+    if (raw.totalPostsPerRound == null) {
+      const n = String(c.sections || "recommend,hot")
+        .split(",").map((s) => s.trim()).filter(Boolean).length || 2;
+      c.totalPostsPerRound = Math.max(1, (+raw.postsPerRound || 6) * n);
+    }
+    c.totalPostsPerRound = Math.min(LIMIT.MAX_TOTAL_POSTS,
+      Math.max(1, +c.totalPostsPerRound || 12));
     c.minIntervalMin = Math.max(LIMIT.MIN_INTERVAL, +c.minIntervalMin || 150);
     c.maxIntervalMin = Math.max(c.minIntervalMin, +c.maxIntervalMin || 240);
     return c;
@@ -394,7 +404,50 @@
     return { id: String(p.id), title: cleanText(p.title||""), screen_name: u.screen_name, created_at: p.created_at||0 };
   }
 
-  async function getPosts(section) {
+  // 「关注」时间线：雪球多次改版，路径不保证稳定 → 准备多个候选逐个试，
+  // 第一个能返回列表的记住复用；全失败也只跳过该板块，不拖垮整轮。
+  const FOLLOW_ENDPOINTS = [
+    "/v4/statuses/home_timeline.json?since_id=-1&max_id=-1&count=20",
+    "/statuses/home_timeline.json?since_id=-1&max_id=-1&count=20",
+    "/v4/statuses/home_timeline.json?page=1&count=20",
+  ];
+  let followEp = "";
+  const FOLLOW_STATE = { ok: false, msg: "未测试", at: 0 };
+
+  function pickList(d) {
+    if (!d || typeof d !== "object") return [];
+    for (const k of ["statuses", "list", "items", "data"]) {
+      if (Array.isArray(d[k])) return d[k];
+    }
+    return [];
+  }
+
+  async function getFollowPosts(limit) {
+    const order = followEp
+      ? [followEp].concat(FOLLOW_ENDPOINTS.filter((e) => e !== followEp))
+      : FOLLOW_ENDPOINTS.slice();
+    let last = { kind: "unsupported", msg: "未知原因" };
+    for (const ep of order) {
+      const r = await xqJson(ep);
+      if (!r.ok) { last = { kind: r.kind, msg: ep + " → " + (r.msg || r.kind) }; continue; }
+      const items = pickList(r.data);
+      const posts = [];
+      for (const it of items) { const p = normalizePost(it); if (p) posts.push(p); }
+      if (posts.length) {
+        followEp = ep;
+        FOLLOW_STATE.ok = true; FOLLOW_STATE.msg = ep; FOLLOW_STATE.at = now();
+        return { posts: posts.slice(0, limit), kind: "ok" };
+      }
+      last = { kind: "empty", msg: ep + " 返回 0 条可用帖子" };
+    }
+    FOLLOW_STATE.ok = false; FOLLOW_STATE.msg = last.msg; FOLLOW_STATE.at = now();
+    return { posts: [], kind: last.kind, msg: last.msg };
+  }
+
+  async function getPosts(section, limit) {
+    limit = limit || CFG.postsPerRound;
+    if (section === "follow") return await getFollowPosts(limit);
+
     const url = section === "recommend"
       ? "/statuses/fundx/public/list.json?source=fund_public&page=1"
       : "/statuses/hot/listV2.json?since=-1&max_id=-1&size=15";
@@ -403,7 +456,7 @@
     const items = section === "recommend" ? ((r.data&&r.data.list)||[]) : ((r.data&&r.data.items)||[]);
     const posts = [];
     for (const it of items) { const p = normalizePost(it); if (p) posts.push(p); }
-    return { posts: posts.slice(0, CFG.postsPerRound), kind:"ok" };
+    return { posts: posts.slice(0, limit), kind:"ok" };
   }
 
   async function getComments(postId) {
@@ -719,15 +772,33 @@
       // 抓取
       const acct = currentAccount();
       log(`▶ 新一轮（账号：${acct ? acct.name : "当前浏览器账号"}）`);
-      const sections = (CFG.sections||"recommend,hot").split(",").map(s=>s.trim()).filter(Boolean);
+      const SEC_LABEL = { recommend: "推荐", hot: "热门", follow: "关注" };
+      const ALLOWED = ["recommend", "hot", "follow"];
+      const sections = (CFG.sections || "recommend,hot")
+        .split(",").map((s) => s.trim()).filter((s) => ALLOWED.includes(s));
+      if (!sections.length) sections.push("recommend");
+      // 总预算按启用板块均分：新增「关注」不会增加每轮请求量（2 源各 6 → 3 源各 4）
+      // 仍受「每板块 ≤ 10 帖」的保号硬约束
+      const perSection = Math.min(LIMIT.MAX_POSTS,
+        Math.max(1, Math.ceil((CFG.totalPostsPerRound || 12) / sections.length)));
+      log(`板块：${sections.map((s) => SEC_LABEL[s] || s).join(" + ")}`
+        + `（每板块 ${perSection} 帖 · 总预算 ${CFG.totalPostsPerRound}）`);
       const all = [];
       let aborted = null;
 
       for (const section of sections) {
         if (ST.stopped) break;
-        log(`→ 抓「${section}」`);
-        const pr = await getPosts(section);
-        if (pr.kind !== "ok") { aborted = pr; log(`  ✗ 列表失败：${pr.kind}${pr.msg?" ("+pr.msg+")":""}`); break; }
+        log(`→ 抓「${SEC_LABEL[section] || section}」`);
+        const pr = await getPosts(section, perSection);
+        if (pr.kind !== "ok") {
+          // 「关注」是新增源，接口路径尚未在真实登录态下完全验证：
+          // 失败只跳过它自己，绝不拖垮整轮（推荐/热门照常跑）
+          if (section === "follow") {
+            log(`  ⚠ 「关注」不可用（${pr.kind}${pr.msg ? " · " + pr.msg : ""}）→ 跳过该板块，其余照常`);
+            continue;
+          }
+          aborted = pr; log(`  ✗ 列表失败：${pr.kind}${pr.msg?" ("+pr.msg+")":""}`); break;
+        }
         log(`  有效帖子 ${pr.posts.length} 条`);
         for (const p of pr.posts) {
           if (ST.stopped) break;
@@ -923,6 +994,11 @@
       `上传 ${upLine}<br>`+
       `轮次 ${stat.rounds||0} · 评论 ${stat.comments||0} · 线索 ${stat.clues||0} · 服务端去重 ${stat.dedup||0}<br>`+
       `缓冲 <b>${pending.length}</b> 条（满 ${BATCH.minToFlush} 即发）<br>`+
+      (String(CFG.sections||"").includes("follow")
+        ? `关注流 <b style="color:${FOLLOW_STATE.ok?"#4ade80":"#fbbf24"}">${
+            !FOLLOW_STATE.at ? "未测试" : (FOLLOW_STATE.ok ? "可用" : "不可用")
+          }</b>${FOLLOW_STATE.ok ? "" : "（菜单→测试「关注」流接口）"}<br>`
+        : "")+
       `WAF ${stat.waf||0} · 受限 ${stat.blocked||0} · 失败 ${stat.fails||0}<br>`+
       `下一轮 <b>${ST.stopped?"已停止":(nextIn>0?fmtDur(nextIn)+"后":"即将开始")}</b>`;
     if (dot) dot.className = "dot"+(ST.stopped?"":(ST.running?" on":(nextIn>0?" wait":" on")));
@@ -1000,9 +1076,13 @@
             <div class="sep"></div>
             <div class="grid">
               <div><label>打分阈值</label><input type="number" id="xr3-thr" min="0" max="30"></div>
-              <div><label>每板块帖数</label><input type="number" id="xr3-pp" min="1" max="10"></div>
+              <div><label>每轮总帖数</label><input type="number" id="xr3-pp" min="1" max="30"></div>
               <div><label>每帖页数</label><input type="number" id="xr3-cp" min="1" max="3"></div>
-              <div><label>板块</label><input type="text" id="xr3-sec"></div>
+              <div><label>板块</label><input type="text" id="xr3-sec" placeholder="recommend,hot,follow"></div>
+              <div style="grid-column:1/-1;font-size:11px;line-height:1.5;color:#94a3b8;margin-top:6px">
+                板块可选 <b>recommend</b>（推荐）/ <b>hot</b>（热门）/ <b>follow</b>（关注）。<br>
+                总帖数会按板块数<b>均分</b>：例如总 12 帖 + 3 个板块 → 每块 4 帖（不增加请求量）。
+              </div>
               <div><label>最小间隔(分)</label><input type="number" id="xr3-mi" min="30" max="1440"></div>
               <div><label>最大间隔(分)</label><input type="number" id="xr3-ma" min="30" max="1440"></div>
               <div style="grid-column:1/-1;font-size:11px;line-height:1.5;color:#f59e0b;margin-top:6px">
@@ -1025,7 +1105,7 @@
     $("#xr3-url").value = CFG.url || "";
     $("#xr3-token").value = CFG.token || "";
     $("#xr3-thr").value = CFG.threshold;
-    $("#xr3-pp").value = CFG.postsPerRound;
+    $("#xr3-pp").value = CFG.totalPostsPerRound;
     $("#xr3-cp").value = CFG.commentPages;
     $("#xr3-sec").value = CFG.sections;
     $("#xr3-mi").value = CFG.minIntervalMin;
@@ -1084,9 +1164,20 @@
       CFG.url = $("#xr3-url").value.trim();
       CFG.token = $("#xr3-token").value.trim();
       CFG.threshold = Math.max(0, parseInt($("#xr3-thr").value, 10) || 5);
-      CFG.postsPerRound = Math.min(LIMIT.MAX_POSTS, Math.max(1, parseInt($("#xr3-pp").value, 10) || 6));
+      // 每轮总帖数预算（按启用板块均分）；postsPerRound 为旧字段，同步成单板块值保持兼容
+      CFG.totalPostsPerRound = Math.min(LIMIT.MAX_TOTAL_POSTS,
+        Math.max(1, parseInt($("#xr3-pp").value, 10) || 12));
       CFG.commentPages = Math.min(LIMIT.MAX_PAGES, Math.max(1, parseInt($("#xr3-cp").value, 10) || 2));
-      CFG.sections = ($("#xr3-sec").value || "recommend,hot").trim();
+      // 板块：只接受已实现的三种，未知值丢弃（否则每轮都会发出无效请求）
+      const allowedSec = ["recommend", "hot", "follow"];
+      const secRaw = ($("#xr3-sec").value || "recommend,hot").split(",").map((s) => s.trim()).filter(Boolean);
+      const secIn = secRaw.filter((s) => allowedSec.includes(s));
+      const secBad = secRaw.filter((s) => !allowedSec.includes(s));
+      CFG.sections = (secIn.length ? secIn : ["recommend", "hot"]).join(",");
+      $("#xr3-sec").value = CFG.sections;
+      if (secBad.length) log("⚠ 未知板块已忽略：" + secBad.join(",") + "（仅支持 recommend/hot/follow）");
+      CFG.postsPerRound = Math.min(LIMIT.MAX_POSTS,
+        Math.max(1, Math.ceil(CFG.totalPostsPerRound / Math.max(1, secIn.length || 2))));
       // 间隔：下限 30 分钟，最大须 ≥ 最小。
       // 关键：被钳制时**明确告知**——旧版是静默改写，看起来就像"保存失败"。
       const rawMi = parseInt($("#xr3-mi").value, 10);
@@ -1333,6 +1424,23 @@
 
   GM_registerMenuCommand("立即跑一轮", ()=>{ if (ST.timer) clearTimeout(ST.timer); loop(); }, "r");
   GM_registerMenuCommand("设置", openConfig, "c");
+  // 「关注」流是新增源，接口路径需在真实登录态下验证：这个菜单逐个试候选接口，
+  // 打开雪球页面点一下，面板日志里就能看到哪个可用、能取到多少条。
+  GM_registerMenuCommand("测试「关注」流接口", async () => {
+    log("▶ 测试「关注」时间线（逐个候选接口）…");
+    let okCount = 0;
+    for (const ep of FOLLOW_ENDPOINTS) {
+      const r = await xqJson(ep);
+      if (!r.ok) { log(`  ✗ ${ep} → ${r.kind}${r.msg ? " · " + r.msg : ""}`); continue; }
+      const items = pickList(r.data);
+      const posts = items.map(normalizePost).filter(Boolean);
+      if (posts.length) okCount++;
+      log(`  ${posts.length ? "✓" : "·"} ${ep} → 原始 ${items.length} 条，可用 ${posts.length} 条`);
+      if (posts.length) log(`     例：${posts[0].screen_name} · ${(posts[0].title || "").slice(0, 30)}`);
+    }
+    log(okCount ? "  ✓ 关注流可用（自动记住能用的那个接口）"
+                : "  ✗ 全部不可用：可能没关注任何人，或接口又改版了");
+  });
   GM_registerMenuCommand("账号池", openAccounts, "a");
   GM_registerMenuCommand("停止/恢复自动抓取", ()=>{
     ST.stopped = !ST.stopped;
