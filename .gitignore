@@ -36,3 +36,6 @@ desktop.ini
 
 # ── 日志 ──
 *.log
+
+# ── 后台保活 Chrome 的独立 profile（含登录态，绝不入库）──
+chrome-radar-profile/

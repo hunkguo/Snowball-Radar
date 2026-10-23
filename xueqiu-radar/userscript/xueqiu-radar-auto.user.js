@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.4.1
+// @version      3.5.0
 // @description  油猴全自动抓取雪球评论（推荐 / 热门 / 关注 三源）并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
@@ -51,6 +51,9 @@
     sections: "recommend,hot,follow",   // 2026-10-23 默认启用「关注」；取不到会自动跳过
     autoStart: true, notify: true,
     batch_min: 30, batch_interval: 90,   // 攒批阈值与最长等待
+    // 无人值守保活（锁屏 / 远程桌面 / 标签页不在前台时仍要跑）
+    keepAwake: true,     // 播放极低音量音频，让 Chrome 判定「正在播放音频」→ 豁免冻结
+    autoLead: true,      // 主控标签若长时间无心跳，本页自动接管（原来只能刷新页面才重试）
   };
   const LIMIT = {
     MAX_POSTS: 10, MAX_PAGES: 3, MAX_TOTAL_POSTS: 30, MAX_CANDS: 200,
@@ -66,6 +69,12 @@
     MAX_EMPTY: 3,
     SESSION_TTL_MIN: 45,
     HEARTBEAT: 60,
+    // 主控锁：原来 TTL 只有 120s，而后台标签页的定时器会被 Chrome 节流到 ≥60s/次，
+    // 一旦再被拖慢就会「误判主控已死」→ 本页永久停在观察模式。TTL 必须远大于节流后的心跳间隔。
+    LEADER_TTL: 6 * 60000,   // 6 分钟无心跳才允许别的标签接管
+    LEADER_BEAT: 60000,      // 心跳写入周期
+    WATCHDOG: 20000,         // 补跑轮询：长定时器被推迟时靠它兜底
+    THROTTLE_ALERT: 3 * 60000, // 心跳间隔超过这个值 → 判定被节流/冻结并告警
   };
   const KEYS = {
     cfg: NS + "cfg", seen: NS + "seen", stat: NS + "stat",
@@ -439,7 +448,7 @@
   //  持久化
   // ══════════════════════════════════════════════════════════════
   const seenSet = new Set((GM_getValue(KEYS.seen, []) || []).slice(-8000));
-  const stat = Object.assign({ rounds:0, comments:0, clues:0, uploads:0, fails:0, empty:0, waf:0, blocked:0, dedup:0, lastOk:"" },
+  const stat = Object.assign({ rounds:0, comments:0, clues:0, uploads:0, fails:0, empty:0, waf:0, blocked:0, dedup:0, lastOk:"", throttled:0 },
                              GM_getValue(KEYS.stat, {}) || {});
   // 待上传缓冲（持久化 → 浏览器意外关闭也不丢）
   let pending = GM_getValue(KEYS.pending, []) || [];
@@ -1094,7 +1103,8 @@
   // ══════════════════════════════════════════════════════════════
   //  主调度
   // ══════════════════════════════════════════════════════════════
-  const ST = { running:false, stopped:false, timer:null, sessionStart:now(), nextAt:0, runAfterCurrent:false };
+  const ST = { running:false, stopped:false, timer:null, sessionStart:now(), nextAt:0, runAfterCurrent:false,
+               leader:false, lastTick:now(), watchdog:null, awake:false };
 
   // 单轮诊断计数：每轮开始重置、结束汇总，用来回答"到底漏了多少"
   const ROUND = { posts:0, comments:0, cands:0, seenSkip:0, fieldDrop:0,
@@ -1126,6 +1136,7 @@
     GM_setValue(NS+"next_run", ST.nextAt);
     if (ST.timer) clearTimeout(ST.timer);
     ST.timer = setTimeout(loop, delayMs);
+    startWatchdog();   // 长定时器被后台节流推迟时，由看门狗按绝对时间补跑
     updatePanel();
   }
   const nextDelay = () => rnd(CFG.minIntervalMin, CFG.maxIntervalMin) * 60000;
@@ -1417,7 +1428,13 @@
             !FOLLOW_STATE.at ? "未测试" : (FOLLOW_STATE.ok ? "可用" : "不可用")
           }</b>${FOLLOW_STATE.ok ? "" : "（菜单→测试「关注」流接口）"}<br>`
         : "")+
-      `WAF ${stat.waf||0} · 受限 ${stat.blocked||0} · 失败 ${stat.fails||0}<br>`+
+      `WAF ${stat.waf||0} · 受限 ${stat.blocked||0} · 失败 ${stat.fails||0}`
+        + (stat.throttled ? ` · <span style="color:#fbbf24">节流补跑 ${stat.throttled}</span>` : "") + `<br>`+
+      // 无人值守排障最关键的三件事：谁是主控、页面是否可见、保活是否生效
+      `主控 <b style="color:${ST.leader?"#4ade80":"#fbbf24"}">${ST.leader?"本页":"其他页"}</b>`
+        + `${ST.leader?"":"（"+Math.round(leaderAge()/60000)+"分钟无心跳）"}`
+        + ` · 页面 ${document.visibilityState === "visible" ? "可见" : "<span style=\"color:#fbbf24\">不可见</span>"}`
+        + ` · 保活 ${ST.awake?"<span style=\"color:#4ade80\">开</span>":"<span style=\"color:#f87171\">关</span>"}<br>`+
       `下一轮 <b>${ST.stopped?"已停止":(nextIn>0?fmtDur(nextIn)+"后":"即将开始")}</b>`;
     if (dot) dot.className = "dot"+(ST.stopped?"":(ST.running?" on":(nextIn>0?" wait":" on")));
   }
@@ -1509,6 +1526,19 @@
               <div><label>攒批阈值</label><input type="number" id="xr3-bt" min="1" max="200"></div>
               <div><label>攒批等待(分)</label><input type="number" id="xr3-bi" min="5" max="1440"></div>
             </div>
+            <div class="sep"></div>
+            <div style="font-size:11px;line-height:1.6;color:#94a3b8">
+              <label style="display:flex;align-items:center;gap:7px;margin:6px 0;color:#e2e8f0">
+                <input type="checkbox" id="xr3-ka" style="width:auto;margin:0">
+                后台保活（播放极低音量音频，避免 Chrome 冻结本标签）
+              </label>
+              <label style="display:flex;align-items:center;gap:7px;margin:6px 0;color:#e2e8f0">
+                <input type="checkbox" id="xr3-al" style="width:auto;margin:0">
+                自动接管主控（主控标签长时间无心跳时本页接手）
+              </label>
+              锁屏 / 远程桌面 / 标签页在另一个虚拟桌面时，Chrome 会节流甚至冻结后台标签。
+              上面两项能把影响降到最低，但**根治办法是用带参数的 Chrome 启动**（见 README）。
+            </div>
           </div>
           <div class="df">
             <span class="msg"></span>
@@ -1530,6 +1560,8 @@
     $("#xr3-ma").value = CFG.maxIntervalMin;
     $("#xr3-bt").value = BATCH.minToFlush;
     $("#xr3-bi").value = BATCH.maxIntervalMin;
+    $("#xr3-ka").checked = CFG.keepAwake !== false;
+    $("#xr3-al").checked = CFG.autoLead !== false;
 
     const msg = wrap.querySelector(".msg");
     const say = (t, ok) => { msg.textContent = t; msg.style.color = ok === false ? "#f87171" : (ok ? "#4ade80" : "#94a3b8"); };
@@ -1616,6 +1648,11 @@
       BATCH.maxBuffer = Math.max(BATCH.minToFlush * 2, 300);
       CFG.batch_min = BATCH.minToFlush;
       CFG.batch_interval = BATCH.maxIntervalMin;
+      const prevAwake = CFG.keepAwake !== false;
+      CFG.keepAwake = !!$("#xr3-ka").checked;
+      CFG.autoLead = !!$("#xr3-al").checked;
+      if (CFG.keepAwake && !prevAwake) startKeepAwake();
+      if (!CFG.keepAwake && prevAwake) log("🔇 后台保活已关闭（不可见标签可能被冻结，建议改用带启动参数的 Chrome）");
       GM_setValue(KEYS.cfg, CFG);
       persist();
       notes.forEach((n) => log("⚠ " + n));
@@ -1732,14 +1769,77 @@
   // ══════════════════════════════════════════════════════════════
   function startKeepAlive() {
     setInterval(() => {
+      // ── 节流/冻结自检：心跳间隔远超设定值，说明 Chrome 在压后台 ──
+      const gap = now() - ST.lastTick;
+      ST.lastTick = now();
+      if (ST.sessionStart && gap > LIMIT.THROTTLE_ALERT) {
+        stat.throttled = (stat.throttled || 0) + 1;
+        log(`⚠ 检测到浏览器节流/冻结：本次心跳距上次 ${Math.round(gap/60000)} 分钟`
+          + `（页面${document.visibilityState === "visible" ? "可见" : "不可见"}）`);
+        log("  → 定时器被推迟时会自动补跑；若长期如此，请用带 --disable-background-timer-throttling"
+          + " 等参数的 Chrome 启动（见 README「锁屏/远程桌面/后台标签」章节）");
+        GM_setValue(KEYS.stat, stat);
+      }
       const age = (now()-ST.sessionStart)/60000;
       if (age > LIMIT.SESSION_TTL_MIN && !ST.running) {
         log("🔄 会话运行 "+Math.round(age)+" 分钟，主动刷新续命");
         ST.sessionStart = now();
         setTimeout(()=>{ try { location.reload(); } catch(e){} }, 3000);
       }
+      tickLeader();
       updatePanel();
     }, LIMIT.HEARTBEAT*1000);
+  }
+
+  // 补跑看门狗：Chrome 会把后台标签的长 setTimeout 推迟（对齐到分钟甚至冻结），
+  // 原来的兜底只挂在 visibilitychange 上 —— 但窗口若在另一个虚拟桌面/被远程桌面遮挡，
+  // 它**永远不会变回 visible**，兜底就永远不触发。
+  // 这里改用短周期轮询 + 绝对时间戳：只要定时器还能跳，就一定能在 1 分钟内发现「超时未跑」。
+  function startWatchdog() {
+    if (ST.watchdog) return;
+    ST.watchdog = setInterval(() => {
+      if (ST.stopped || ST.running || !ST.leader || !CFG.autoStart) return;
+      if (ST.nextAt && now() >= ST.nextAt + 5000) {
+        const late = Math.round((now() - ST.nextAt) / 60000);
+        stat.throttled = (stat.throttled || 0) + 1;
+        log(`⏱ 定时器被推迟 ${late} 分钟（后台节流），按计划时间补跑`);
+        if (ST.timer) clearTimeout(ST.timer);
+        loop();
+      }
+    }, LIMIT.WATCHDOG);
+  }
+
+  // 防冻结：Chrome 对「正在播放音频」的标签页豁免 intensive throttling 与 freezing。
+  // 播一个 220Hz、增益 0.0008（约 -62dB，听不见）的正弦波，把自己伪装成「有声页面」。
+  // 这是页面内唯一能绕过冻结的手段；真正的解法还是浏览器启动参数（见 README）。
+  function startKeepAwake() {
+    if (!CFG.keepAwake || ST.awake) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      const ctx = new AC();
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      g.gain.value = 0.0008;
+      osc.frequency.value = 220;
+      osc.connect(g); g.connect(ctx.destination); osc.start();
+      ST.awake = true;
+      const resume = () => {
+        if (ctx.state !== "running") {
+          ctx.resume().then(() => {
+            if (ctx.state === "running" && !ST._awakeLogged) {
+              ST._awakeLogged = true;
+              log("🔊 后台保活已开启（极低音量音频，用于避免 Chrome 冻结本标签）");
+            }
+          }).catch(()=>{});
+        }
+      };
+      resume();
+      // 自动播放策略：首次用户手势后再尝试一次（多数情况下这次才真正 running）
+      const once = () => { resume(); window.removeEventListener("pointerdown", once); window.removeEventListener("keydown", once); };
+      window.addEventListener("pointerdown", once);
+      window.addEventListener("keydown", once);
+    } catch (e) { /* 不支持就算了，不影响主流程 */ }
   }
 
   // 页面重新可见时的处理
@@ -1772,6 +1872,8 @@
   });
   window.addEventListener("beforeunload", () => {
     persist();
+    // 主动交还主控锁：否则别的标签要等 6 分钟 TTL 才敢接管（刷新时尤其明显）
+    try { if (leaderNow() === TAB_ID) GM_setValue(NS+"leader", ""); } catch (e) {}
     // 页面关闭前尽量把缓冲发出去（用 sendBeacon 兜底，fetch 可能来不及）
     if (pending.length && CFG.url && CFG.token) {
       try {
@@ -1781,15 +1883,65 @@
     }
   });
 
-  // 多标签页协调：只让一个主控，避免重复抓取
-  const TAB_ID = NS+"tab_"+Math.random().toString(36).slice(2,8);
+  // 多标签页协调：只让一个主控，避免重复抓取。
+  // ⚠ 老实现有两个致命缺陷（锁屏/远程桌面/标签页在后台时会集中爆发）：
+  //   ① claimTab() 只在启动时调用一次 —— 一旦当时别的标签是主控，本页就**永远**是观察模式，
+  //      哪怕那个主控早就死了，也只能靠手动刷新页面才重试。
+  //   ② 锁 TTL 只有 120 秒，而心跳是 setInterval(30s)。后台标签的定时器会被 Chrome 节流到
+  //      ≥60 秒一跳（冻结时干脆不跳）→ 主控「心跳超时」被误判成死亡，各标签来回抢锁，
+  //      最后谁都抓不上。
+  // 修法：TTL 放大到 6 分钟（远大于节流后的心跳间隔），并把抢锁放进心跳里**每轮重试**。
+  // TAB_ID 必须**在同一个标签页内跨刷新保持不变**（sessionStorage 正好满足）。
+  // 否则 SESSION_TTL 触发的 location.reload() 会让本页变成「全新标签」：
+  // 老 TAB_ID 仍占着锁且心跳已停，新页面又认不出那是自己 → 双方僵持到锁过期，白白停 6 分钟。
+  let TAB_ID = "";
+  try { TAB_ID = sessionStorage.getItem(NS+"tabid") || ""; } catch (e) {}
+  if (!TAB_ID) {
+    TAB_ID = NS+"tab_"+Math.random().toString(36).slice(2,8);
+    try { sessionStorage.setItem(NS+"tabid", TAB_ID); } catch (e) {}
+  }
+  const leaderNow = () => GM_getValue(NS+"leader","");
+  const leaderAge = () => now() - (GM_getValue(NS+"leader_ts",0) || 0);
+
   function claimTab() {
-    const cur = GM_getValue(NS+"leader","");
-    const ts = GM_getValue(NS+"leader_ts",0);
-    if (!cur || cur === TAB_ID || now()-ts > 120000) { GM_setValue(NS+"leader",TAB_ID); GM_setValue(NS+"leader_ts",now()); return true; }
+    const cur = leaderNow(), age = leaderAge();
+    if (!cur || cur === TAB_ID || age > LIMIT.LEADER_TTL) {
+      if (cur && cur !== TAB_ID) log(`♻ 接管主控（上一个已 ${Math.round(age/60000)} 分钟无心跳）`);
+      GM_setValue(NS+"leader",TAB_ID); GM_setValue(NS+"leader_ts",now());
+      ST.leader = true;
+      return true;
+    }
+    ST.leader = false;
     return false;
   }
-  setInterval(()=>{ if (GM_getValue(NS+"leader","")===TAB_ID) GM_setValue(NS+"leader_ts",now()); }, 30000);
+
+  // 心跳里调用：主控续期；非主控在锁过期后自动接管（解决「启动晚一步就永远观察」）
+  function tickLeader() {
+    const cur = leaderNow();
+    if (cur === TAB_ID) { GM_setValue(NS+"leader_ts",now()); ST.leader = true; return true; }
+    // 锁被别的标签拿走了（常见于本页刷新期间被抢，或已另有主控）→ 主动让位，停掉自己的定时器
+    if (ST.leader) {
+      ST.leader = false;
+      if (ST.timer) { clearTimeout(ST.timer); ST.timer = null; }
+      log("⏸ 主控已被其他标签接管，本页转为观察模式");
+      updatePanel();
+      return false;
+    }
+    if (!CFG.autoLead) return false;
+    if (!cur || leaderAge() > LIMIT.LEADER_TTL) {
+      if (!claimTab()) return false;
+      log("▶ 本页接管主控，开始无人值守运行");
+      if (CFG.autoStart && !ST.stopped && !ST.running && !ST.timer) {
+        const nr = GM_getValue(NS+"next_run", 0);
+        const wait = (nr && nr > now()) ? nr-now() : 8000;
+        scheduleNext(wait);
+      }
+      updatePanel();
+      return true;
+    }
+    ST.leader = false;
+    return false;
+  }
 
   // ══════════════════════════════════════════════════════════════
   //  启动
@@ -1811,6 +1963,8 @@
     if (!CFG.url || !CFG.token) log("⚠ 未配置 Worker 地址/token → 点「设置」");
 
     startKeepAlive();
+    startKeepAwake();
+    if (CFG.autoLead) startWatchdog();   // 观察模式的标签也挂上看门狗，接管后能立刻补跑
 
     // 启动时先处理上次残留的缓冲（浏览器上次异常关闭时可能有积压）
     if (pending.length) {
@@ -1831,7 +1985,10 @@
         setStatus("就绪");
       }
     } else {
-      log("ℹ 其他标签页已在运行，本页仅观察（避免重复抓取）");
+      const mins = Math.round(leaderAge() / 60000);
+      log(`ℹ 其他标签页是主控，本页暂为观察模式（避免重复抓取）`);
+      log(`  → 该主控若 ${Math.max(1, Math.round((LIMIT.LEADER_TTL - leaderAge())/60000))} 分钟内无心跳，本页会自动接管`
+        + `（当前已 ${mins} 分钟无心跳）；想立刻接管：菜单→「强制接管主控」`);
       setStatus("观察模式");
     }
     updatePanel();
@@ -1870,6 +2027,21 @@
     const n = await diagFollow();
     if (n) { FOLLOW_STATE.ok = true; FOLLOW_STATE.at = now(); }
   });
+  GM_registerMenuCommand("强制接管主控（本页抢锁）", () => {
+    GM_setValue(NS+"leader", TAB_ID); GM_setValue(NS+"leader_ts", now());
+    ST.leader = true; ST.stopped = false;
+    log("♻ 本页已强制接管主控（原先的主控将退为观察模式）");
+    if (ST.timer) clearTimeout(ST.timer);
+    if (!ST.running) scheduleNext(6000);
+    updatePanel();
+  }, "L");
+  GM_registerMenuCommand("后台保活：开/关", () => {
+    CFG.keepAwake = !CFG.keepAwake;
+    GM_setValue(KEYS.cfg, CFG);
+    if (CFG.keepAwake) { startKeepAwake(); log("🔊 后台保活已开启（极低音量音频，避免 Chrome 冻结本标签）"); }
+    else log("🔇 后台保活已关闭（不可见的标签页可能被 Chrome 冻结，建议改用启动参数的 Chrome）");
+    updatePanel();
+  }, "k");
   GM_registerMenuCommand("重置「关注」冷却", () => {
     FOLLOW_STATE.ok = false; FOLLOW_STATE.at = 0; followEp = "";
     log("♻ 「关注」冷却与已记住的接口已重置，下一轮会重新探测");
@@ -1885,6 +2057,6 @@
   GM_registerMenuCommand("查看统计", ()=>{
     alert("累计统计\n轮次 "+(stat.rounds||0)+"\n评论 "+(stat.comments||0)+"\n候选 "+(stat.clues||0)+
       "\n上传成功 "+(stat.uploads||0)+"\nWAF 命中 "+(stat.waf||0)+"\n账号受限 "+(stat.blocked||0)+
-      "\n失败 "+(stat.fails||0)+"\n\n末次成功："+(stat.lastOk||"无"));
+      "\n节流补跑 "+(stat.throttled||0)+"\n失败 "+(stat.fails||0)+"\n\n末次成功："+(stat.lastOk||"无"));
   }, "t");
 })();
