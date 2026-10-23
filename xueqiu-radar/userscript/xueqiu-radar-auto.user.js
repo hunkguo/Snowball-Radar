@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.0.0
+// @version      3.1.0
 // @description  油猴全自动抓取雪球评论并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
@@ -52,7 +52,10 @@
     batch_min: 30, batch_interval: 90,   // 攒批阈值与最长等待
   };
   const LIMIT = {
-    MAX_POSTS: 10, MAX_PAGES: 3, MIN_INTERVAL: 90,
+    MAX_POSTS: 10, MAX_PAGES: 3,
+    // 2026-10-23 由 90 下调至 30（用户要求允许更频繁）。
+    // 注意：<90 分钟会明显增加风控/封号概率，保存时会给出警告；这里仍留 30 作为防呆下限。
+    MIN_INTERVAL: 30,
     NIGHT_START: 23, NIGHT_END: 7,
     POST_DELAY: [3200, 7800],
     PAGE_DELAY: [2100, 3600],
@@ -1000,8 +1003,11 @@
               <div><label>每板块帖数</label><input type="number" id="xr3-pp" min="1" max="10"></div>
               <div><label>每帖页数</label><input type="number" id="xr3-cp" min="1" max="3"></div>
               <div><label>板块</label><input type="text" id="xr3-sec"></div>
-              <div><label>最小间隔(分)</label><input type="number" id="xr3-mi" min="90" max="1440"></div>
-              <div><label>最大间隔(分)</label><input type="number" id="xr3-ma" min="90" max="1440"></div>
+              <div><label>最小间隔(分)</label><input type="number" id="xr3-mi" min="30" max="1440"></div>
+              <div><label>最大间隔(分)</label><input type="number" id="xr3-ma" min="30" max="1440"></div>
+              <div style="grid-column:1/-1;font-size:11px;line-height:1.5;color:#f59e0b;margin-top:6px">
+                间隔下限 30 分钟（最大须 ≥ 最小）。填 &lt;90 分钟会明显增加风控/封号风险，建议 150~240。
+              </div>
               <div><label>攒批阈值</label><input type="number" id="xr3-bt" min="1" max="200"></div>
               <div><label>攒批等待(分)</label><input type="number" id="xr3-bi" min="5" max="1440"></div>
             </div>
@@ -1081,8 +1087,21 @@
       CFG.postsPerRound = Math.min(LIMIT.MAX_POSTS, Math.max(1, parseInt($("#xr3-pp").value, 10) || 6));
       CFG.commentPages = Math.min(LIMIT.MAX_PAGES, Math.max(1, parseInt($("#xr3-cp").value, 10) || 2));
       CFG.sections = ($("#xr3-sec").value || "recommend,hot").trim();
-      CFG.minIntervalMin = Math.max(LIMIT.MIN_INTERVAL, parseInt($("#xr3-mi").value, 10) || 150);
-      CFG.maxIntervalMin = Math.max(CFG.minIntervalMin, parseInt($("#xr3-ma").value, 10) || 240);
+      // 间隔：下限 30 分钟，最大须 ≥ 最小。
+      // 关键：被钳制时**明确告知**——旧版是静默改写，看起来就像"保存失败"。
+      const rawMi = parseInt($("#xr3-mi").value, 10);
+      const rawMa = parseInt($("#xr3-ma").value, 10);
+      CFG.minIntervalMin = Math.max(LIMIT.MIN_INTERVAL, rawMi || 150);
+      CFG.maxIntervalMin = Math.max(CFG.minIntervalMin, rawMa || 240);
+      const notes = [];
+      if (!rawMi) notes.push(`最小间隔留空，已按默认 ${CFG.minIntervalMin} 分钟保存`);
+      else if (rawMi < LIMIT.MIN_INTERVAL) notes.push(`最小间隔最低 ${LIMIT.MIN_INTERVAL} 分钟，已按 ${LIMIT.MIN_INTERVAL} 保存`);
+      if (!rawMa) notes.push(`最大间隔留空，已按默认 ${CFG.maxIntervalMin} 分钟保存`);
+      else if (rawMa < CFG.minIntervalMin) notes.push(`最大间隔不能小于最小间隔，已按 ${CFG.minIntervalMin} 保存`);
+      if (CFG.minIntervalMin < 90) notes.push(`间隔 ${CFG.minIntervalMin} 分钟偏短，风控/封号风险明显升高`);
+      // 输入框回填成实际生效值，避免"我填的"和"它存的"不一致
+      $("#xr3-mi").value = CFG.minIntervalMin;
+      $("#xr3-ma").value = CFG.maxIntervalMin;
       BATCH.minToFlush = Math.min(200, Math.max(1, parseInt($("#xr3-bt").value, 10) || 30));
       BATCH.maxIntervalMin = Math.min(1440, Math.max(5, parseInt($("#xr3-bi").value, 10) || 90));
       BATCH.maxBuffer = Math.max(BATCH.minToFlush * 2, 300);
@@ -1090,6 +1109,15 @@
       CFG.batch_interval = BATCH.maxIntervalMin;
       GM_setValue(KEYS.cfg, CFG);
       persist();
+      notes.forEach((n) => log("⚠ " + n));
+
+      // 让新间隔立刻生效：已排定的定时器仍按旧间隔在等，这里重排一次，
+      // 否则面板"下次运行"不变，会让人以为没保存成功。
+      if (!ST.running && !ST.stopped && ST.timer) {
+        scheduleNext(nextDelay());
+        log(`✓ 下次运行已按新间隔重排（${CFG.minIntervalMin}~${CFG.maxIntervalMin} 分钟）`);
+      }
+      if (notes.length) say(notes.join("；"), false);
 
       if (!CFG.url || !CFG.token) {
         log("⚠ 地址或 token 为空 → 无法上传");
