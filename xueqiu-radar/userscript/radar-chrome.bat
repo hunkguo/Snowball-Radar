@@ -1,40 +1,49 @@
-@echo off
-REM ==========================================================================
-REM  雪球雷达 · 后台保活专用 Chrome 启动器
-REM
-REM  作用：用「禁用后台节流 / 禁用后台冻结 / 禁用窗口遮挡判定」的参数启动一个
-REM        **独立的** Chrome 实例，这样即使遇到下列情况脚本也照常抓：
-REM          - 电脑锁屏
-REM          - 远程桌面连过去（本地会话窗口被判定为不可见）
-REM          - 标签页在桌面 2 / 不是最前端 / 被别的窗口完全遮挡
-REM
-REM  为什么用独立 profile：和日常用的 Chrome 完全隔离，你平时关浏览器、
-REM  开一堆标签都不会影响它，它自己常驻即可。
-REM
-REM  用法：双击本文件。第一次需要在这个窗口里登录一次雪球（之后一直保留）。
-REM ==========================================================================
-
-set "CHROME=C:\Program Files\Google\Chrome\Application\chrome.exe"
-if not exist "%CHROME%" set "CHROME=%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
-if not exist "%CHROME%" (
-  echo [X] 没找到 chrome.exe，请修改本文件里的 CHROME 路径。
-  pause
-  exit /b 1
-)
-
-REM 独立 profile 目录（已被 .gitignore 忽略，不会进仓库）
-set "PROF=%~dp0..\..\chrome-radar-profile"
-
-REM 关键参数（缺一个都可能被节流）：
-REM   --disable-background-timer-throttling   后台定时器不降频
-REM   --disable-backgrounding-occluded-windows 窗口被遮挡/在别的虚拟桌面也当作前台
-REM   --disable-renderer-backgrounding         不把后台标签置为低优先级（防冻结）
-REM   --disable-features=CalculateNativeWinOcclusion  不做原生窗口遮挡计算
-REM   --disable-features=IntensiveWakeUpThrottling    不做 1 分钟对齐的强制节流
-REM   --autoplay-policy=no-user-gesture-required      允许脚本的保活音频自动播放
-set "FLAGS=--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling --autoplay-policy=no-user-gesture-required --no-first-run --no-default-browser-check --disable-ipc-flooding-protection"
-
-echo 正在启动「后台保活 Chrome」（独立 profile）...
-echo profile: %PROF%
-echo 提示：把它开着就行，可以最小化；锁屏 / 远程桌面 / 切虚拟桌面都不影响。
-start "" "%CHROME%" --user-data-dir="%PROF%" %FLAGS% https://www.xueqiu.com/
+@echo off
+REM ==========================================================================
+REM  Xueqiu Radar -- keep-awake Chrome launcher
+REM
+REM  Starts an ISOLATED Chrome instance with background-throttling disabled,
+REM  so the userscript keeps running even when:
+REM    - the PC is locked
+REM    - you connect via Remote Desktop
+REM    - the tab sits on virtual desktop 2 / is not the foreground window
+REM
+REM  Usage: double-click this file. Log in to Xueqiu ONCE in the new window.
+REM  (Full Chinese explanation: README-?????.md, section 0)
+REM ==========================================================================
+
+cd /d "%~dp0"
+
+set "CHROME=C:\Program Files\Google\Chrome\Application\chrome.exe"
+if not exist "%CHROME%" set "CHROME=%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
+if not exist "%CHROME%" (
+  echo [X] chrome.exe not found. Please edit the CHROME path in this file.
+  echo     Current: "%CHROME%"
+  pause
+  exit /b 1
+)
+
+REM Isolated profile dir (gitignored). Convert to an absolute path first.
+set "PROF=%~dp0..\..\chrome-radar-profile"
+for %%I in ("%PROF%") do set "PROFABS=%%~fI"
+
+echo.
+echo Starting keep-awake Chrome with an isolated profile...
+echo   chrome : %CHROME%
+echo   profile: %PROFABS%
+echo.
+
+REM Use cmd's own START (fully detached) as the primary path.
+REM Note: the --disable-features value is wrapped in quotes so cmd.exe does not
+REM treat "=" and "," inside it as argument delimiters.
+start "Xueqiu Radar" "%CHROME%" --user-data-dir="%PROFABS%" --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling" --autoplay-policy=no-user-gesture-required --no-first-run --no-default-browser-check "https://www.xueqiu.com/"
+
+if errorlevel 1 (
+  echo [!] START failed, falling back to PowerShell...
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%CHROME%' -ArgumentList @('--user-data-dir=%PROFABS%','--disable-background-timer-throttling','--disable-backgrounding-occluded-windows','--disable-renderer-backgrounding','--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling','--autoplay-policy=no-user-gesture-required','--no-first-run','--no-default-browser-check','https://www.xueqiu.com/')"
+)
+
+echo.
+echo Chrome should open in a moment. If nothing happens, read the message above.
+echo NOTE: this window is a NEW isolated Chrome -- log in to Xueqiu once here.
+timeout /t 8 >nul
