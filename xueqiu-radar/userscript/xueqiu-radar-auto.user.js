@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.2.0
+// @version      3.2.1
 // @description  油猴全自动抓取雪球评论（推荐 / 热门 / 关注 三源）并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
@@ -48,7 +48,7 @@
     postsPerRound: 6, commentPages: 2,   // postsPerRound 仅用于旧配置迁移（=每板块帖数）
     totalPostsPerRound: 12,              // 每轮总帖数预算，按启用的板块均分（新增板块不增加请求量）
     minIntervalMin: 150, maxIntervalMin: 240,
-    sections: "recommend,hot",
+    sections: "recommend,hot,follow",   // 2026-10-23 默认启用「关注」；取不到会自动跳过
     autoStart: true, notify: true,
     batch_min: 30, batch_interval: 90,   // 攒批阈值与最长等待
   };
@@ -71,6 +71,7 @@
     cfg: NS + "cfg", seen: NS + "seen", stat: NS + "stat",
     accounts: NS + "accounts", idx: NS + "acct_idx", nextRun: NS + "next_run",
     pending: NS + "pending", lastFlush: NS + "last_flush",
+    migFollow: NS + "mig_follow_v1",
   };
 
   function loadCfg() {
@@ -78,14 +79,26 @@
     const c = Object.assign({}, DEFAULTS, raw);
     c.postsPerRound = Math.min(LIMIT.MAX_POSTS, Math.max(1, +c.postsPerRound || 6));
     c.commentPages = Math.min(LIMIT.MAX_PAGES, Math.max(1, +c.commentPages || 2));
-    // 总帖数预算：旧配置只有「每板块帖数」，换算成总量，保证升级后实际抓取量不变
-    if (raw.totalPostsPerRound == null) {
-      const n = String(c.sections || "recommend,hot")
+    // 总帖数预算：旧配置只有「每板块帖数」，换算成总量，保证升级后实际抓取量不变。
+    // 注意：这里必须用**旧的**板块数算（下面会补 follow），否则总量会被放大 50%。
+    if (raw.totalPostsPerRound == null && raw.postsPerRound != null) {
+      const n = String(raw.sections || "recommend,hot")
         .split(",").map((s) => s.trim()).filter(Boolean).length || 2;
       c.totalPostsPerRound = Math.max(1, (+raw.postsPerRound || 6) * n);
     }
     c.totalPostsPerRound = Math.min(LIMIT.MAX_TOTAL_POSTS,
       Math.max(1, +c.totalPostsPerRound || 12));
+    // 一次性迁移：把「关注」补进板块（只补一次；之后用户手动删掉不会再被加回来）
+    if (!GM_getValue(KEYS.migFollow, false)) {
+      const arr = String(c.sections || DEFAULTS.sections)
+        .split(",").map((s) => s.trim()).filter(Boolean);
+      if (!arr.includes("follow")) {
+        arr.push("follow");
+        c.sections = arr.join(",");
+        GM_setValue(KEYS.cfg, c);   // 持久化，否则下次加载又回到旧板块
+      }
+      GM_setValue(KEYS.migFollow, true);
+    }
     c.minIntervalMin = Math.max(LIMIT.MIN_INTERVAL, +c.minIntervalMin || 150);
     c.maxIntervalMin = Math.max(c.minIntervalMin, +c.maxIntervalMin || 240);
     return c;
@@ -413,6 +426,8 @@
   ];
   let followEp = "";
   const FOLLOW_STATE = { ok: false, msg: "未测试", at: 0 };
+  // 失败冷却：关注流不可用时不要每轮都试 3 个接口（白多 3 次请求，还会加重风控）
+  const FOLLOW_COOLDOWN_MS = 6 * 3600 * 1000;   // 6 小时
 
   function pickList(d) {
     if (!d || typeof d !== "object") return [];
@@ -423,6 +438,10 @@
   }
 
   async function getFollowPosts(limit) {
+    if (FOLLOW_STATE.at && !FOLLOW_STATE.ok && now() - FOLLOW_STATE.at < FOLLOW_COOLDOWN_MS) {
+      return { posts: [], kind: "cooldown",
+        msg: `上次失败，冷却中（${fmtDur(FOLLOW_STATE.at + FOLLOW_COOLDOWN_MS - now())}后再试）` };
+    }
     const order = followEp
       ? [followEp].concat(FOLLOW_ENDPOINTS.filter((e) => e !== followEp))
       : FOLLOW_ENDPOINTS.slice();
@@ -794,7 +813,11 @@
           // 「关注」是新增源，接口路径尚未在真实登录态下完全验证：
           // 失败只跳过它自己，绝不拖垮整轮（推荐/热门照常跑）
           if (section === "follow") {
-            log(`  ⚠ 「关注」不可用（${pr.kind}${pr.msg ? " · " + pr.msg : ""}）→ 跳过该板块，其余照常`);
+            if (pr.kind === "cooldown") {
+              log(`  · 「关注」${pr.msg} → 跳过`);
+            } else {
+              log(`  ⚠ 「关注」不可用（${pr.kind}${pr.msg ? " · " + pr.msg : ""}）→ 跳过该板块，其余照常`);
+            }
             continue;
           }
           aborted = pr; log(`  ✗ 列表失败：${pr.kind}${pr.msg?" ("+pr.msg+")":""}`); break;
