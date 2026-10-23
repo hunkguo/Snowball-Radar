@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.4.0
+// @version      3.4.1
 // @description  油猴全自动抓取雪球评论（推荐 / 热门 / 关注 三源）并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
@@ -136,6 +136,7 @@
     if (m < 60) return m + " 分钟";
     return Math.floor(m / 60) + " 小时 " + (m % 60) + " 分";
   }
+  const clip = (s, n) => (String(s || "").length > n ? String(s).slice(0, n) + "…" : String(s || ""));
   const ENT = { "&amp;":"&","&lt;":"<","&gt;":">","&quot;":'"',"&apos;":"'","&nbsp;":" ","&#39;":"'","&hellip;":"…" };
   function cleanText(t) {
     if (!t) return "";
@@ -572,7 +573,12 @@
       try {
         GM_xmlhttpRequest({
           method: "GET", url,
-          headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json, text/plain, */*" },
+          // 实测：部分接口（尤其 home_timeline）缺 Referer 会被直接拒（HTTP 400 / error_code 400016）
+          headers: {
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.xueqiu.com/",
+          },
           onload: (res) => resolve({
             resp: { ok: res.status >= 200 && res.status < 300, status: res.status },
             txt: res.responseText || "",
@@ -610,6 +616,13 @@
       const code = String((data && data.error_code) || "");
       if (NOT_LOGIN.test(msg) || code === "10022") return { ok:false, kind:"notlogin", data:null, msg:msg||"用户未登录" };
       if (msg && BLOCK_MSG.test(msg)) return { ok:false, kind:"blocked", data:null, msg };
+      // ⚠ 关键：接口业务错误（如 HTTP 200 + error_code 400016「请重新登录」）以前会被当成
+      //   「正常 JSON」，下游 pickList 取不到数组就报「返回 0 条可用帖子」，把真正的报错掩盖掉。
+      //   这里显式识别：error_code 非 0 一律算失败，文案含登录字样归 notlogin，其余归 apierr。
+      if (data && typeof data === "object" && data.error_code != null && code !== "" && code !== "0") {
+        const hint = /重新登录|未登录|登录失效|登录状态/.test(msg) ? "notlogin" : "apierr";
+        return { ok:false, kind: hint, data:null, msg: msg || ("error_code " + code) };
+      }
       if (data && typeof data === "object") return { ok:true, kind:"ok", data };
       return { ok:false, kind:"parse", data:null };
     } catch (e) { return { ok:false, kind:"parse", data:null }; }
@@ -620,21 +633,46 @@
   // ══════════════════════════════════════════════════════════════
   // 实测：热门列表 items[].id 是序号；真实帖子 id 在 original_status.id 或 data(JSON串)
   // drop: 可选计数器 {noId,noUser,noText}，用于把「因字段缺失被丢弃」变得可见
-  function normalizePost(item, drop) {
+  // 帖子的“外壳”有很多种：转发壳（original_status / retweeted_status）、
+  // 卡片壳（item_data / status / target）、以及 data 字段（旧版是 JSON 字符串，v4 可能是对象）。
+  // 逐层剥壳后再取 id/user/正文，避免「接口明明有数据却 0 条可用」。
+  const UNWRAP_KEYS = ["original_status", "retweeted_status", "status", "item_data", "target", "quote", "source_status"];
+  function unwrapPost(item) {
     let p = item;
-    if (item && typeof item.data === "string") {
-      try { p = JSON.parse(item.data); } catch (e) { p = item; }
-      if (item.original_status && item.original_status.id) p = item.original_status;
-    } else if (item && item.original_status && item.original_status.id) {
-      p = item.original_status;
+    for (let i = 0; i < 4; i++) {
+      if (!p || typeof p !== "object") return null;
+      if (typeof p.data === "string") {
+        let parsed = null;
+        try { parsed = JSON.parse(p.data); } catch (e) { parsed = null; }
+        if (parsed && typeof parsed === "object") {
+          const inner = unwrapPost(parsed);
+          if (inner && inner.id) return inner;
+          p = parsed; continue;
+        }
+      }
+      let nx = null;
+      for (const k of UNWRAP_KEYS) {
+        const v = p[k];
+        if (v && typeof v === "object" && v.id) { nx = v; break; }
+      }
+      if (nx) { p = nx; continue; }
+      if (p.data && typeof p.data === "object" && !Array.isArray(p.data)
+          && (p.data.id || p.data.description || p.data.text || p.data.user)) { p = p.data; continue; }
+      return p;
     }
+    return p;
+  }
+
+  function normalizePost(item, drop) {
+    const p = unwrapPost(item);
     if (!p || !p.id) { if (drop) drop.noId++; return null; }
-    const u = p.user || {};
+    const u = p.user || p.author || {};
     // 有 user.id 但缺昵称 → 用数字 ID 兜底。
     // 以前是整条丢弃，接口一改版就会「有效帖子 0 条」且毫无提示。
     if (!u.screen_name && u.id) u.screen_name = String(u.id);
     if (!u.screen_name) { if (drop) drop.noUser++; return null; }
-    if (!(p.description || p.title)) { if (drop) drop.noText++; return null; }
+    // 正文字段也可能是 text（长文/转帖），以前只认 description/title 会误丢
+    if (!(p.description || p.title || p.text)) { if (drop) drop.noText++; return null; }
     return { id: String(p.id), title: cleanText(p.title||""),
              screen_name: u.screen_name, user_id: String(u.id || ""),
              created_at: p.created_at||0 };
@@ -652,12 +690,52 @@
   // 失败冷却：关注流不可用时不要每轮都试 3 个接口（白多 3 次请求，还会加重风控）
   const FOLLOW_COOLDOWN_MS = 6 * 3600 * 1000;   // 6 小时
 
+  // 只在顶层找 statuses/list/items/data 太脆：v4 常见 { data:{ statuses:[...] } } 这类一层嵌套，
+  // 顶层 data 是对象就被跳过 → 直接误判「返回 0 条」。改为三档：顶层键 → 一层容器 → 递归兜底。
   function pickList(d) {
     if (!d || typeof d !== "object") return [];
     for (const k of ["statuses", "list", "items", "data"]) {
       if (Array.isArray(d[k])) return d[k];
     }
-    return [];
+    for (const k of ["data", "result", "results", "resp", "body", "page", "content", "module"]) {
+      const v = d[k];
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        for (const kk of ["statuses", "list", "items", "records", "data"]) {
+          if (Array.isArray(v[kk])) return v[kk];
+        }
+      }
+    }
+    return deepFindList(d, 0) || [];
+  }
+
+  // 递归兜底：找出「像帖子列表」的数组（元素是对象且带帖子特征字段），深度 ≤4
+  function looksLikePost(o) {
+    return !!(o.id || o.status_id || o.description || o.text || o.title
+              || o.user || o.original_status || o.retweeted_status || o.item_data);
+  }
+  function deepFindList(node, depth) {
+    if (!node || typeof node !== "object" || depth > 4) return null;
+    if (Array.isArray(node)) {
+      return (node.length && node.some((x) => x && typeof x === "object" && looksLikePost(x))) ? node : null;
+    }
+    for (const k of Object.keys(node)) {
+      if (/^(error|count|total|page|next|max|since)/i.test(k)) continue;
+      const r = deepFindList(node[k], depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  // 取不到帖子时把原始响应结构摊开，别再让「0 条」成为黑盒
+  function shapeOf(d) {
+    try {
+      if (d === null || typeof d !== "object") return String(d).slice(0, 80);
+      const keys = Array.isArray(d) ? "array(len=" + d.length + ")" : Object.keys(d).slice(0, 12).join(",");
+      const first = Array.isArray(d) && d.length && d[0] && typeof d[0] === "object"
+        ? Object.keys(d[0]).slice(0, 12).join(",") : "";
+      const preview = JSON.stringify(d).slice(0, 160);
+      return `keys=[${keys}]` + (first ? ` item0=[${first}]` : "") + ` raw=${preview}`;
+    } catch (e) { return "(无法序列化)"; }
   }
 
   async function getFollowPosts(limit) {
@@ -669,9 +747,14 @@
       ? [followEp].concat(FOLLOW_ENDPOINTS.filter((e) => e !== followEp))
       : FOLLOW_ENDPOINTS.slice();
     let last = { kind: "unsupported", msg: "未知原因" };
+    const tried = [];
     for (const ep of order) {
       const r = await xqJson(ep);
-      if (!r.ok) { last = { kind: r.kind, msg: ep + " → " + (r.msg || r.kind) }; continue; }
+      if (!r.ok) {
+        last = { kind: r.kind, msg: ep + " → " + (r.msg || r.kind) };
+        tried.push(last.msg);
+        continue;
+      }
       const items = pickList(r.data);
       const posts = []; const drop = { noId:0, noUser:0, noText:0 };
       for (const it of items) { const p = normalizePost(it, drop); if (p) posts.push(p); }
@@ -681,10 +764,18 @@
         FOLLOW_STATE.ok = true; FOLLOW_STATE.msg = ep; FOLLOW_STATE.at = now();
         return { posts: posts.slice(0, limit), kind: "ok" };
       }
-      last = { kind: "empty", msg: ep + " 返回 0 条可用帖子" };
+      // 有响应却取不到帖子 → 把结构摊开写进原因，方便直接定位改版
+      const why = `${ep} 返回 0 条可用帖子（原始 ${items.length} 条`
+        + ` · 丢弃 noId=${drop.noId} noUser=${drop.noUser} noText=${drop.noText}`
+        + ` · ${shapeOf(r.data)}）`;
+      last = { kind: "empty", msg: why };
+      tried.push(why);
     }
-    FOLLOW_STATE.ok = false; FOLLOW_STATE.msg = last.msg; FOLLOW_STATE.at = now();
-    return { posts: [], kind: last.kind, msg: last.msg };
+    const detail = tried.length > 1
+      ? `${last.msg} ｜ 其余候选：${tried.slice(0, -1).map((s) => s.replace(/\s*·\s*raw=.*$/, "")).join("；")}`
+      : last.msg;
+    FOLLOW_STATE.ok = false; FOLLOW_STATE.msg = detail; FOLLOW_STATE.at = now();
+    return { posts: [], kind: last.kind, msg: detail };
   }
 
   async function getPosts(section, limit) {
@@ -1098,7 +1189,7 @@
             if (pr.kind === "cooldown") {
               log(`  · 「关注」${pr.msg} → 跳过`);
             } else {
-              log(`  ⚠ 「关注」不可用（${pr.kind}${pr.msg ? " · " + pr.msg : ""}）→ 跳过该板块，其余照常`);
+              log(`  ⚠ 「关注」不可用（${pr.kind}${pr.msg ? " · " + clip(pr.msg, 320) : ""}）→ 跳过该板块，其余照常`);
             }
             continue;
           }
@@ -1753,20 +1844,35 @@
   GM_registerMenuCommand("设置", openConfig, "c");
   // 「关注」流是新增源，接口路径需在真实登录态下验证：这个菜单逐个试候选接口，
   // 打开雪球页面点一下，面板日志里就能看到哪个可用、能取到多少条。
-  GM_registerMenuCommand("测试「关注」流接口", async () => {
+  // 诊断「关注」流：逐个候选接口打印原始结构，一眼看出是接口报错还是字段改版
+  async function diagFollow() {
     log("▶ 测试「关注」时间线（逐个候选接口）…");
     let okCount = 0;
     for (const ep of FOLLOW_ENDPOINTS) {
       const r = await xqJson(ep);
       if (!r.ok) { log(`  ✗ ${ep} → ${r.kind}${r.msg ? " · " + r.msg : ""}`); continue; }
       const items = pickList(r.data);
-      const posts = items.map(normalizePost).filter(Boolean);
+      const drop = { noId:0, noUser:0, noText:0 };
+      const posts = items.map((x) => normalizePost(x, drop)).filter(Boolean);
       if (posts.length) okCount++;
-      log(`  ${posts.length ? "✓" : "·"} ${ep} → 原始 ${items.length} 条，可用 ${posts.length} 条`);
+      log(`  ${posts.length ? "✓" : "·"} ${ep} → 原始 ${items.length} 条，可用 ${posts.length} 条`
+        + (posts.length ? ""
+           : `（丢弃 noId=${drop.noId} noUser=${drop.noUser} noText=${drop.noText}）`));
       if (posts.length) log(`     例：${posts[0].screen_name} · ${(posts[0].title || "").slice(0, 30)}`);
+      else log(`     结构：${clip(shapeOf(r.data), 400)}`);
     }
     log(okCount ? "  ✓ 关注流可用（自动记住能用的那个接口）"
-                : "  ✗ 全部不可用：可能没关注任何人，或接口又改版了");
+                : "  ✗ 全部不可用：可能没关注任何人、登录态失效，或接口又改版了");
+    return okCount;
+  }
+  GM_registerMenuCommand("测试「关注」流接口", async () => {
+    FOLLOW_STATE.at = 0;                     // 诊断时忽略冷却，强制重测
+    const n = await diagFollow();
+    if (n) { FOLLOW_STATE.ok = true; FOLLOW_STATE.at = now(); }
+  });
+  GM_registerMenuCommand("重置「关注」冷却", () => {
+    FOLLOW_STATE.ok = false; FOLLOW_STATE.at = 0; followEp = "";
+    log("♻ 「关注」冷却与已记住的接口已重置，下一轮会重新探测");
   });
   GM_registerMenuCommand("账号池", openAccounts, "a");
   GM_registerMenuCommand("停止/恢复自动抓取", ()=>{
