@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.2.2
+// @version      3.3.0
 // @description  油猴全自动抓取雪球评论（推荐 / 热门 / 关注 三源）并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
@@ -53,7 +53,7 @@
     batch_min: 30, batch_interval: 90,   // 攒批阈值与最长等待
   };
   const LIMIT = {
-    MAX_POSTS: 10, MAX_PAGES: 3, MAX_TOTAL_POSTS: 30,
+    MAX_POSTS: 10, MAX_PAGES: 3, MAX_TOTAL_POSTS: 30, MAX_CANDS: 200,
     // 2026-10-23 由 90 下调至 30（用户要求允许更频繁）。
     // 注意：<90 分钟会明显增加风控/封号概率，保存时会给出警告；这里仍留 30 作为防呆下限。
     MIN_INTERVAL: 30,
@@ -71,7 +71,7 @@
     cfg: NS + "cfg", seen: NS + "seen", stat: NS + "stat",
     accounts: NS + "accounts", idx: NS + "acct_idx", nextRun: NS + "next_run",
     pending: NS + "pending", lastFlush: NS + "last_flush",
-    migFollow: NS + "mig_follow_v1",
+    migFollow: NS + "mig_follow_v1", maxPage: NS + "maxpage",
   };
 
   function loadCfg() {
@@ -286,6 +286,38 @@
     GM_setValue(KEYS.stat, stat);
     GM_setValue(KEYS.pending, pending.slice(-500));
     GM_setValue(KEYS.lastFlush, lastFlushAt);
+    mpFlush();
+  }
+
+  // ── 帖子页数缓存（maxPage）──
+  // comments.json 的 maxPage 在同一帖子上短期内不变（推荐/热门是小滚动池，帖子会反复出现）。
+  // 缓存后可直接抓尾部页，省掉 page=1 的探测请求 —— 把这次请求用在"多抓一页最新评论"上，
+  // 等于**不增加请求量的前提下少漏评论**。
+  let _mpCache = (GM_getValue(KEYS.maxPage, {}) || {});
+  if (typeof _mpCache !== "object" || _mpCache === null) _mpCache = {};
+  let _mpDirty = false;
+  const MAXPAGE_TTL = 12 * 3600 * 1000;   // 12 小时
+  const MAXPAGE_CAP = 3000;
+
+  function mpGet(pid) {
+    const v = _mpCache[pid];
+    if (!v) return 0;
+    if (now() - (+v[1] || 0) > MAXPAGE_TTL) { delete _mpCache[pid]; _mpDirty = true; return 0; }
+    return +v[0] || 0;
+  }
+  function mpSet(pid, mp) {
+    if (!pid || !mp || mp < 1) return;
+    _mpCache[pid] = [mp, now()];
+    _mpDirty = true;
+    if (Object.keys(_mpCache).length > MAXPAGE_CAP) {
+      const entries = Object.entries(_mpCache).sort((a, b) => (+a[1][1]) - (+b[1][1]));
+      for (let i = 0; i < entries.length / 2; i++) delete _mpCache[entries[i][0]];
+    }
+  }
+  function mpFlush() {
+    if (!_mpDirty) return;
+    GM_setValue(KEYS.maxPage, _mpCache);
+    _mpDirty = false;
   }
   function bump(k, n) { stat[k] = (stat[k]||0) + (n||1); persist(); }
 
@@ -370,6 +402,24 @@
   const NOT_LOGIN = /10022|用户未登录/;
   const BLOCK_MSG = /账号异常|已被封|封禁|冻结|无权访问|登录失效|访问受限|过于频繁|请稍后再试/;
 
+  // fetch 兜底通道：页面 CSP / 某些扩展会拦掉 fetch，但拦不住油猴的 GM_xmlhttpRequest
+  function gmFetch(url) {
+    return new Promise((resolve) => {
+      try {
+        GM_xmlhttpRequest({
+          method: "GET", url,
+          headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json, text/plain, */*" },
+          onload: (res) => resolve({
+            resp: { ok: res.status >= 200 && res.status < 300, status: res.status },
+            txt: res.responseText || "",
+          }),
+          onerror: () => resolve(null),
+          ontimeout: () => resolve(null),
+        });
+      } catch (e) { resolve(null); }
+    });
+  }
+
   async function xqJson(url) {
     let resp, txt;
     try {
@@ -379,7 +429,11 @@
         cache: "no-store",
       });
       txt = await resp.text();
-    } catch (e) { return { ok:false, kind:"network", data:null }; }
+    } catch (e) {
+      const fb = await gmFetch(url);
+      if (fb === null) return { ok:false, kind:"network", data:null };
+      resp = fb.resp; txt = fb.txt;
+    }
 
     if (WAF_HTML.test(txt.slice(0, 3000))) return { ok:false, kind:"waf", data:null };
     if (!resp.ok) {
@@ -401,7 +455,8 @@
   //  接口
   // ══════════════════════════════════════════════════════════════
   // 实测：热门列表 items[].id 是序号；真实帖子 id 在 original_status.id 或 data(JSON串)
-  function normalizePost(item) {
+  // drop: 可选计数器 {noId,noUser,noText}，用于把「因字段缺失被丢弃」变得可见
+  function normalizePost(item, drop) {
     let p = item;
     if (item && typeof item.data === "string") {
       try { p = JSON.parse(item.data); } catch (e) { p = item; }
@@ -409,12 +464,16 @@
     } else if (item && item.original_status && item.original_status.id) {
       p = item.original_status;
     }
-    if (!p || !p.id) return null;
-    // 必须有真实用户信息，剔除热门榜占位项
-    if (!p.user || !p.user.screen_name) return null;
-    if (!(p.description || p.title)) return null;
-    const u = p.user;
-    return { id: String(p.id), title: cleanText(p.title||""), screen_name: u.screen_name, created_at: p.created_at||0 };
+    if (!p || !p.id) { if (drop) drop.noId++; return null; }
+    const u = p.user || {};
+    // 有 user.id 但缺昵称 → 用数字 ID 兜底。
+    // 以前是整条丢弃，接口一改版就会「有效帖子 0 条」且毫无提示。
+    if (!u.screen_name && u.id) u.screen_name = String(u.id);
+    if (!u.screen_name) { if (drop) drop.noUser++; return null; }
+    if (!(p.description || p.title)) { if (drop) drop.noText++; return null; }
+    return { id: String(p.id), title: cleanText(p.title||""),
+             screen_name: u.screen_name, user_id: String(u.id || ""),
+             created_at: p.created_at||0 };
   }
 
   // 「关注」时间线：雪球多次改版，路径不保证稳定 → 准备多个候选逐个试，
@@ -450,8 +509,9 @@
       const r = await xqJson(ep);
       if (!r.ok) { last = { kind: r.kind, msg: ep + " → " + (r.msg || r.kind) }; continue; }
       const items = pickList(r.data);
-      const posts = [];
-      for (const it of items) { const p = normalizePost(it); if (p) posts.push(p); }
+      const posts = []; const drop = { noId:0, noUser:0, noText:0 };
+      for (const it of items) { const p = normalizePost(it, drop); if (p) posts.push(p); }
+      ROUND.fieldDrop += drop.noId + drop.noUser + drop.noText;
       if (posts.length) {
         followEp = ep;
         FOLLOW_STATE.ok = true; FOLLOW_STATE.msg = ep; FOLLOW_STATE.at = now();
@@ -473,49 +533,76 @@
     const r = await xqJson(url);
     if (!r.ok) return { posts:[], kind:r.kind, msg:r.msg };
     const items = section === "recommend" ? ((r.data&&r.data.list)||[]) : ((r.data&&r.data.items)||[]);
-    const posts = [];
-    for (const it of items) { const p = normalizePost(it); if (p) posts.push(p); }
-    return { posts: posts.slice(0, limit), kind:"ok" };
+    const posts = []; const drop = { noId:0, noUser:0, noText:0 };
+    for (const it of items) { const p = normalizePost(it, drop); if (p) posts.push(p); }
+    ROUND.fieldDrop += drop.noId + drop.noUser + drop.noText;
+    if (drop.noId + drop.noUser + drop.noText) {
+      log(`  [!] 接口返回 ${items.length} 项，其中 ${drop.noId + drop.noUser + drop.noText} 项因字段缺失被丢弃`
+        + `（无id ${drop.noId} / 无用户 ${drop.noUser} / 无正文 ${drop.noText}）`);
+    }
+    return { posts: posts.slice(0, limit), kind:"ok", raw: items.length };
   }
 
   async function getComments(postId) {
     const out = []; const ids = new Set();
-    let maxPage = 0;
-    const asked = new Set();
-    for (let pg = 1; pg <= CFG.commentPages; pg++) {
-      // 第 1 次固定取 page=1（顺便读 maxPage）；之后改抓【尾部页】。
-      // 实测（data/xueqiu.db 历史数据核对）：comments.json 按时间**升序**返回，
-      // page=1 是最早的 20 条，而人在页面上看到的是最新/最热的评论 ——
-      // 老实现等于专挑用户最看不到、时效性最差的那批。改抓尾部页后请求次数不变。
-      let target;
-      if (pg === 1) target = 1;
-      else {
-        target = Math.max(1, maxPage - (pg - 2));
-        if (asked.has(target)) target = Math.max(1, target - 1);   // 防止重复页
-      }
-      asked.add(target);
-      const r = await xqJson(`/statuses/comments.json?id=${postId}&page=${target}&count=20`);
-      if (!r.ok) return { comments: out, kind: r.kind, msg: r.msg };
-      const list = (r.data && (r.data.comments || r.data.list)) || [];
-      if (!list.length) break;
-      if (!maxPage) maxPage = Math.max(1, +(r.data && r.data.maxPage) || 1);
+    const push = (list) => {
+      let added = 0;
       for (const c of list) {
         const cid = String(c.id);
-        if (ids.has(cid)) continue;
+        if (!cid || ids.has(cid)) continue;
         ids.add(cid);
         const cu = c.user || {};
         out.push({
           id: cid, text: cleanText(c.text || c.description || ""),
           created_at: c.created_at || 0, like_count: c.like_count || 0,
-          reply_count: c.reply_count || 0, user_name: cu.screen_name || "",
+          reply_count: c.reply_count || 0,
+          user_name: cu.screen_name || cu.id || "",
         });
+        added++;
       }
+      return added;
+    };
+
+    let maxPage = mpGet(postId);
+    let probe = null;          // 无缓存时，第 1 次探测请求拿到的列表
+    let partial = false;       // 中途有页面失败（保留已抓到的，不整帖放弃）
+
+    // 阶段一：不知道总页数 → 用一次请求探测（这 20 条也照收，不浪费）
+    if (!maxPage) {
+      const r = await xqJson(`/statuses/comments.json?id=${postId}&page=1&count=20`);
+      if (!r.ok) return { comments: [], kind: r.kind, msg: r.msg };
+      const list = (r.data && (r.data.comments || r.data.list)) || [];
+      if (!list.length) return { comments: [], kind: "empty" };
+      maxPage = Math.max(1, +(r.data && r.data.maxPage) || 1);
+      mpSet(postId, maxPage);
+      probe = list;
+    }
+
+    // 阶段二：剩余请求预算全部投给【尾部页】。
+    // 实测：comments.json 按时间升序返回，尾部页 = 最新评论 = 人在页面上看到的那批。
+    const budget = Math.max(0, CFG.commentPages - (probe ? 1 : 0));
+    const targets = [];
+    const askedPages = new Set(probe ? [1] : []);
+    for (let i = 0; i < budget; i++) {
+      const t = maxPage - i;
+      if (t < 1) break;
+      if (askedPages.has(t)) continue;   // 与探测页重复 → 跳过，避免白发一次请求
+      askedPages.add(t);
+      targets.push(t);
+    }
+
+    if (probe) push(probe);
+    for (const t of targets) {
+      const r = await xqJson(`/statuses/comments.json?id=${postId}&page=${t}&count=20`);
+      if (!r.ok) { partial = true; break; }
+      const list = (r.data && (r.data.comments || r.data.list)) || [];
+      if (!list.length) break;
+      push(list);
       if (list.length < 20) break;
       await sleep(rnd(LIMIT.PAGE_DELAY[0], LIMIT.PAGE_DELAY[1]));
     }
-    // tail=true 表示抓到了尾部页（较新的评论）
-    const tail = [...asked].some((p) => p > 1);
-    return { comments: out, kind: "ok", tail, maxPage };
+    return { comments: out, kind: "ok", tail: targets.length > 0,
+             maxPage, partial, cached: !probe };
   }
 
   // ══════════════════════════════════════════════════════════════
@@ -619,7 +706,7 @@
   function extractClues(comments, threshold) {
     const cands = []; const local = new Set();
     for (const c of comments) {
-      if (seenSet.has(c.id) || local.has(c.id)) continue;
+      if (seenSet.has(c.id) || local.has(c.id)) { ROUND.seenSkip++; continue; }
       const { score, tags, stocks } = scoreComment(c.text, c.like_count, c.reply_count);
       if (score < threshold) continue;
       local.add(c.id);
@@ -633,7 +720,9 @@
     }
     // 分数相同 → 点赞高优先 → 时间新优先（尾部页改动后，同分时保留较新的观点）
     cands.sort((a,b)=>(b.score-a.score)||(b.like_count-a.like_count)||(b.created_at-a.created_at));
-    return cands.slice(0,100);
+    LAST_EXTRACT = { total: cands.length, cap: LIMIT.MAX_CANDS,
+                     kept: Math.min(cands.length, LIMIT.MAX_CANDS) };
+    return cands.slice(0, LIMIT.MAX_CANDS);
   }
   // 生成与 payload 一致的 round_id（用于命中上报，让服务端记 last_seen_round）
   function roundIdOf(source) {
@@ -752,6 +841,17 @@
   // ══════════════════════════════════════════════════════════════
   const ST = { running:false, stopped:false, timer:null, sessionStart:now(), nextAt:0, runAfterCurrent:false };
 
+  // 单轮诊断计数：每轮开始重置、结束汇总，用来回答"到底漏了多少"
+  const ROUND = { posts:0, comments:0, cands:0, seenSkip:0, fieldDrop:0,
+                  tailPages:0, partialPosts:0, cachedPages:0 };
+  // 最近一次 extractClues 的截断情况（候选超上限时给出明确提示）
+  let LAST_EXTRACT = { total: 0, cap: 0, kept: 0 };
+  let LAST_ROUND = null;   // 上轮诊断快照（面板展示用）
+  function roundReset() {
+    Object.assign(ROUND, { posts:0, comments:0, cands:0, seenSkip:0, fieldDrop:0,
+                          tailPages:0, partialPosts:0, cachedPages:0 });
+  }
+
   function log(t) {
     if (logEl) {
       const line = "["+new Date().toLocaleTimeString("zh-CN")+"] "+t;
@@ -778,6 +878,7 @@
   async function loop() {
     if (ST.running || ST.stopped) return;
     ST.running = true;
+    roundReset();
     setStatus("运行中…");
     try {
       // 前置检查
@@ -844,9 +945,15 @@
           if (ST.stopped) break;
           const cr = await getComments(p.id);
           if (cr.kind !== "ok") { aborted = cr; log(`  ✗ 评论失败（${cr.kind}${cr.msg?" "+cr.msg:""}）`); break; }
+          ROUND.posts++;
+          ROUND.comments += cr.comments.length;
           for (const c of cr.comments) { c.section=section; c.post_id=p.id; c.post_author=p.screen_name; all.push(c); }
+          if (cr.tail) ROUND.tailPages++;
+          if (cr.cached) ROUND.cachedPages++;
+          if (cr.partial) ROUND.partialPosts++;
           log(`  · ${p.screen_name} → ${cr.comments.length} 条` +
-              (cr.tail ? `（含最新页，该帖共 ${cr.maxPage} 页评论）` : ""));
+              (cr.tail ? `（最新页，该帖共 ${cr.maxPage} 页${cr.cached ? " · 页码已缓存" : ""}）` : "") +
+              (cr.partial ? " ⚠部分页失败" : ""));
           await sleep(rnd(LIMIT.POST_DELAY[0], LIMIT.POST_DELAY[1]));
         }
         if (aborted) break;
@@ -896,6 +1003,17 @@
       log(`共 ${all.length} 条评论，打分中…`);
       const cands = extractClues(all, CFG.threshold);
       log(`▲ 候选 ${cands.length} 条（阈值 ${CFG.threshold}）`);
+      if (LAST_EXTRACT.total > LAST_EXTRACT.kept) {
+        log(`  [!] 共 ${LAST_EXTRACT.total} 条过阈值，超过单轮上限 ${LAST_EXTRACT.cap}，`
+          + `按分数截断（漏 ${LAST_EXTRACT.total - LAST_EXTRACT.kept} 条）`);
+      }
+      ROUND.cands = cands.length;
+      log(`诊断：帖子 ${ROUND.posts} · 评论 ${all.length} · 候选 ${cands.length}`
+        + ` · seen跳过 ${ROUND.seenSkip}`
+        + (ROUND.fieldDrop ? ` · 字段丢弃 ${ROUND.fieldDrop}` : "")
+        + ` · 最新页命中 ${ROUND.tailPages}/${ROUND.posts}（页码缓存 ${ROUND.cachedPages}）`
+        + (ROUND.partialPosts ? ` · 部分失败帖 ${ROUND.partialPosts}` : ""));
+      LAST_ROUND = Object.assign({}, ROUND);
 
       if (cands.length) {
         // 攒批：候选先入缓冲，跨轮累积到阈值再一次性发出
@@ -1035,6 +1153,10 @@
       `上传 ${upLine}<br>`+
       `轮次 ${stat.rounds||0} · 评论 ${stat.comments||0} · 线索 ${stat.clues||0} · 服务端去重 ${stat.dedup||0}<br>`+
       `缓冲 <b>${pending.length}</b> 条（满 ${BATCH.minToFlush} 即发）<br>`+
+      (LAST_ROUND ? `上轮 帖 ${LAST_ROUND.posts} · 评 ${LAST_ROUND.comments} · 候选 ${LAST_ROUND.cands}`
+        + ` · 最新页 ${LAST_ROUND.tailPages}/${LAST_ROUND.posts}`
+        + (LAST_ROUND.seenSkip ? ` · seen跳过 ${LAST_ROUND.seenSkip}` : "")
+        + (LAST_ROUND.fieldDrop ? ` · 字段丢弃 ${LAST_ROUND.fieldDrop}` : "") + `<br>` : "")+
       (String(CFG.sections||"").includes("follow")
         ? `关注流 <b style="color:${FOLLOW_STATE.ok?"#4ade80":"#fbbf24"}">${
             !FOLLOW_STATE.at ? "未测试" : (FOLLOW_STATE.ok ? "可用" : "不可用")
