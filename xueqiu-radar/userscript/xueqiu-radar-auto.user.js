@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.2.1
+// @version      3.2.2
 // @description  油猴全自动抓取雪球评论（推荐 / 热门 / 关注 三源）并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
@@ -480,11 +480,25 @@
 
   async function getComments(postId) {
     const out = []; const ids = new Set();
+    let maxPage = 0;
+    const asked = new Set();
     for (let pg = 1; pg <= CFG.commentPages; pg++) {
-      const r = await xqJson(`/statuses/comments.json?id=${postId}&page=${pg}&count=20`);
+      // 第 1 次固定取 page=1（顺便读 maxPage）；之后改抓【尾部页】。
+      // 实测（data/xueqiu.db 历史数据核对）：comments.json 按时间**升序**返回，
+      // page=1 是最早的 20 条，而人在页面上看到的是最新/最热的评论 ——
+      // 老实现等于专挑用户最看不到、时效性最差的那批。改抓尾部页后请求次数不变。
+      let target;
+      if (pg === 1) target = 1;
+      else {
+        target = Math.max(1, maxPage - (pg - 2));
+        if (asked.has(target)) target = Math.max(1, target - 1);   // 防止重复页
+      }
+      asked.add(target);
+      const r = await xqJson(`/statuses/comments.json?id=${postId}&page=${target}&count=20`);
       if (!r.ok) return { comments: out, kind: r.kind, msg: r.msg };
       const list = (r.data && (r.data.comments || r.data.list)) || [];
       if (!list.length) break;
+      if (!maxPage) maxPage = Math.max(1, +(r.data && r.data.maxPage) || 1);
       for (const c of list) {
         const cid = String(c.id);
         if (ids.has(cid)) continue;
@@ -499,7 +513,9 @@
       if (list.length < 20) break;
       await sleep(rnd(LIMIT.PAGE_DELAY[0], LIMIT.PAGE_DELAY[1]));
     }
-    return { comments: out, kind: "ok" };
+    // tail=true 表示抓到了尾部页（较新的评论）
+    const tail = [...asked].some((p) => p > 1);
+    return { comments: out, kind: "ok", tail, maxPage };
   }
 
   // ══════════════════════════════════════════════════════════════
@@ -615,7 +631,8 @@
         hashtag:c.hashtag||"", jev_value:0, jev_ok:false,
       });
     }
-    cands.sort((a,b)=>(b.score-a.score)||(b.like_count-a.like_count));
+    // 分数相同 → 点赞高优先 → 时间新优先（尾部页改动后，同分时保留较新的观点）
+    cands.sort((a,b)=>(b.score-a.score)||(b.like_count-a.like_count)||(b.created_at-a.created_at));
     return cands.slice(0,100);
   }
   // 生成与 payload 一致的 round_id（用于命中上报，让服务端记 last_seen_round）
@@ -828,7 +845,8 @@
           const cr = await getComments(p.id);
           if (cr.kind !== "ok") { aborted = cr; log(`  ✗ 评论失败（${cr.kind}${cr.msg?" "+cr.msg:""}）`); break; }
           for (const c of cr.comments) { c.section=section; c.post_id=p.id; c.post_author=p.screen_name; all.push(c); }
-          log(`  · ${p.screen_name} → ${cr.comments.length} 条`);
+          log(`  · ${p.screen_name} → ${cr.comments.length} 条` +
+              (cr.tail ? `（含最新页，该帖共 ${cr.maxPage} 页评论）` : ""));
           await sleep(rnd(LIMIT.POST_DELAY[0], LIMIT.POST_DELAY[1]));
         }
         if (aborted) break;

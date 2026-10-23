@@ -42,6 +42,7 @@ Web 端完全不同：我实测雪球用的是**阿里云 WAF**（响应头 `Set
 | 未登录访问 `/<post_id>` 会被**重定向回首页** | 被动 DOM 模式也必须登录 |
 | 热门列表 `items[].id` 是序号（973959），真实帖 id 在 `original_status.id` | 过滤逻辑必须取 inner id |
 | 裸 curl 必吃 110KB WAF JS 挑战页，一个 cookie 都不下发 | **python-requests 永远过不了 WAF** |
+| `comments.json` 按时间**升序**返回（`page=1` = 最早的 20 条；用历史库核对 id 与 created_at 递增证实） | `page=1..N` 抓到的全是**最老、时效性最差**的评论，而人在页面上看的是最新/最热的 → 改为「第 1 页探 maxPage，之后抓尾部页」，请求次数不变 |
 
 ---
 
