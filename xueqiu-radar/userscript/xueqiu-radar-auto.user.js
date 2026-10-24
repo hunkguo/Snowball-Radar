@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.5.0
+// @version      3.5.1
 // @description  油猴全自动抓取雪球评论（推荐 / 热门 / 关注 三源）并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
@@ -51,6 +51,8 @@
     sections: "recommend,hot,follow",   // 2026-10-23 默认启用「关注」；取不到会自动跳过
     autoStart: true, notify: true,
     batch_min: 30, batch_interval: 90,   // 攒批阈值与最长等待
+    // 夜间静默时段（24 小时制整点）。开始 = 结束 表示**全天运行、不静默**。
+    nightStart: 23, nightEnd: 7,
     // 无人值守保活（锁屏 / 远程桌面 / 标签页不在前台时仍要跑）
     keepAwake: true,     // 播放极低音量音频，让 Chrome 判定「正在播放音频」→ 豁免冻结
     autoLead: true,      // 主控标签若长时间无心跳，本页自动接管（原来只能刷新页面才重试）
@@ -60,6 +62,7 @@
     // 2026-10-23 由 90 下调至 30（用户要求允许更频繁）。
     // 注意：<90 分钟会明显增加风控/封号概率，保存时会给出警告；这里仍留 30 作为防呆下限。
     MIN_INTERVAL: 30,
+    // 静默时段的出厂默认（用户可在「设置」里改，存进 CFG.nightStart / CFG.nightEnd）
     NIGHT_START: 23, NIGHT_END: 7,
     POST_DELAY: [3200, 7800],
     PAGE_DELAY: [2100, 3600],
@@ -83,6 +86,12 @@
     migFollow: NS + "mig_follow_v1", maxPage: NS + "maxpage",
   };
 
+  // 整点小时（0~23）归一化：非法值回落到默认
+  const normHour = (v, def) => {
+    const n = parseInt(v, 10);
+    return (Number.isFinite(n) && n >= 0 && n <= 23) ? n : def;
+  };
+
   function loadCfg() {
     const raw = GM_getValue(KEYS.cfg, {}) || {};
     const c = Object.assign({}, DEFAULTS, raw);
@@ -97,6 +106,10 @@
     }
     c.totalPostsPerRound = Math.min(LIMIT.MAX_TOTAL_POSTS,
       Math.max(1, +c.totalPostsPerRound || 12));
+    // 静默时段：老配置没有这两个字段 → 走出厂默认 23:00-07:00；
+    // 非法值（空/非数字/越界）一律回落默认，避免「undefined 点」静默判断失效。
+    c.nightStart = normHour(c.nightStart, LIMIT.NIGHT_START);
+    c.nightEnd = normHour(c.nightEnd, LIMIT.NIGHT_END);
     // 一次性迁移：把「关注」补进板块（只补一次；之后用户手动删掉不会再被加回来）
     if (!GM_getValue(KEYS.migFollow, false)) {
       const arr = String(c.sections || DEFAULTS.sections)
@@ -131,14 +144,34 @@
     const b = `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
     return withSec ? b + ":" + p(d.getUTCSeconds()) : b;
   }
+  // 静默时段由用户在「设置」里改（CFG.nightStart / CFG.nightEnd，整点）。
+  // 三种形态都要支持：
+  //   跨天     23→7    h>=23 或 h<7
+  //   不跨天    9→17   h>=9 且 h<17
+  //   开始=结束        → 视为「全天运行」，不做任何静默（否则 h>=start 恒真会永久停抓）
+  function nightRange() {
+    const s = normHour(CFG && CFG.nightStart, LIMIT.NIGHT_START);
+    const e = normHour(CFG && CFG.nightEnd, LIMIT.NIGHT_END);
+    return { s, e, on: s !== e };
+  }
   function isNight() {
+    const { s, e, on } = nightRange();
+    if (!on) return false;
     const h = new Date().getHours();
-    return h >= LIMIT.NIGHT_START || h < LIMIT.NIGHT_END;
+    return s < e ? (h >= s && h < e) : (h >= s || h < e);
   }
+  // 距离静默结束还有多久：走到结束整点即可（跨天/不跨天通用）
   function msToNightEnd() {
+    const { e } = nightRange();
     const h = new Date().getHours();
-    return h >= LIMIT.NIGHT_START ? ((24 - h) + LIMIT.NIGHT_END) * 3600000 : (LIMIT.NIGHT_END - h) * 3600000;
+    let d = e - h;
+    if (d <= 0) d += 24;
+    return d * 3600000;
   }
+  const nightLabel = () => {
+    const { s, e, on } = nightRange();
+    return on ? `${s}:00-${e}:00` : "全天运行（已关闭静默）";
+  };
   function fmtDur(ms) {
     if (ms <= 0) return "即将";
     const m = Math.round(ms / 60000);
@@ -1156,7 +1189,7 @@
       }
       if (isNight()) {
         const wait = msToNightEnd() + rnd(0, 1800000);
-        log(`🌙 夜间停抓（${LIMIT.NIGHT_START}:00-${LIMIT.NIGHT_END}:00），${fmtDur(wait)} 后恢复`);
+        log(`🌙 静默时段停抓（${nightLabel()}），${fmtDur(wait)} 后恢复`);
         setStatus("夜间停抓");
         scheduleNext(wait);
         return;
@@ -1434,7 +1467,8 @@
       `主控 <b style="color:${ST.leader?"#4ade80":"#fbbf24"}">${ST.leader?"本页":"其他页"}</b>`
         + `${ST.leader?"":"（"+Math.round(leaderAge()/60000)+"分钟无心跳）"}`
         + ` · 页面 ${document.visibilityState === "visible" ? "可见" : "<span style=\"color:#fbbf24\">不可见</span>"}`
-        + ` · 保活 ${ST.awake?"<span style=\"color:#4ade80\">开</span>":"<span style=\"color:#f87171\">关</span>"}<br>`+
+        +       ` · 保活 ${ST.awake?"<span style=\"color:#4ade80\">开</span>":"<span style=\"color:#f87171\">关</span>"}<br>`+
+      `静默 <b>${nightLabel()}</b>${isNight()?" <span style=\"color:#38bdf8\">（当前静默中）</span>":""}<br>`+
       `下一轮 <b>${ST.stopped?"已停止":(nextIn>0?fmtDur(nextIn)+"后":"即将开始")}</b>`;
     if (dot) dot.className = "dot"+(ST.stopped?"":(ST.running?" on":(nextIn>0?" wait":" on")));
   }
@@ -1525,6 +1559,12 @@
               </div>
               <div><label>攒批阈值</label><input type="number" id="xr3-bt" min="1" max="200"></div>
               <div><label>攒批等待(分)</label><input type="number" id="xr3-bi" min="5" max="1440"></div>
+              <div><label>静默开始(整点)</label><input type="number" id="xr3-ns" min="0" max="23"></div>
+              <div><label>静默结束(整点)</label><input type="number" id="xr3-ne" min="0" max="23"></div>
+              <div style="grid-column:1/-1;font-size:11px;line-height:1.5;color:#94a3b8;margin-top:6px">
+                静默时段内不发任何请求，到点自动恢复（默认 23:00-07:00）。
+                支持跨天（23→7）与不跨天（9→17）；<b>开始 = 结束</b> 表示<b>全天运行、不静默</b>。
+              </div>
             </div>
             <div class="sep"></div>
             <div style="font-size:11px;line-height:1.6;color:#94a3b8">
@@ -1560,6 +1600,8 @@
     $("#xr3-ma").value = CFG.maxIntervalMin;
     $("#xr3-bt").value = BATCH.minToFlush;
     $("#xr3-bi").value = BATCH.maxIntervalMin;
+    $("#xr3-ns").value = normHour(CFG.nightStart, LIMIT.NIGHT_START);
+    $("#xr3-ne").value = normHour(CFG.nightEnd, LIMIT.NIGHT_END);
     $("#xr3-ka").checked = CFG.keepAwake !== false;
     $("#xr3-al").checked = CFG.autoLead !== false;
 
@@ -1643,6 +1685,17 @@
       // 输入框回填成实际生效值，避免"我填的"和"它存的"不一致
       $("#xr3-mi").value = CFG.minIntervalMin;
       $("#xr3-ma").value = CFG.maxIntervalMin;
+      // 静默时段：整点 0~23；开始 = 结束 → 全天运行（不静默）
+      const rawNs = parseInt($("#xr3-ns").value, 10);
+      const rawNe = parseInt($("#xr3-ne").value, 10);
+      const oldNight = nightLabel();
+      CFG.nightStart = normHour(rawNs, LIMIT.NIGHT_START);
+      CFG.nightEnd = normHour(rawNe, LIMIT.NIGHT_END);
+      const badHour = [rawNs, rawNe].some((n) => !Number.isFinite(n) || n < 0 || n > 23);
+      if (badHour) notes.push(`静默时段只能填 0~23 的整点，非法值已按默认 ${LIMIT.NIGHT_START}:00-${LIMIT.NIGHT_END}:00 处理`);
+      if (CFG.nightStart === CFG.nightEnd) notes.push(`静默开始 = 结束 → 全天运行，不再夜间停抓`);
+      $("#xr3-ns").value = CFG.nightStart;
+      $("#xr3-ne").value = CFG.nightEnd;
       BATCH.minToFlush = Math.min(200, Math.max(1, parseInt($("#xr3-bt").value, 10) || 30));
       BATCH.maxIntervalMin = Math.min(1440, Math.max(5, parseInt($("#xr3-bi").value, 10) || 90));
       BATCH.maxBuffer = Math.max(BATCH.minToFlush * 2, 300);
@@ -1660,8 +1713,17 @@
       // 让新间隔立刻生效：已排定的定时器仍按旧间隔在等，这里重排一次，
       // 否则面板"下次运行"不变，会让人以为没保存成功。
       if (!ST.running && !ST.stopped && ST.timer) {
-        scheduleNext(nextDelay());
-        log(`✓ 下次运行已按新间隔重排（${CFG.minIntervalMin}~${CFG.maxIntervalMin} 分钟）`);
+        const nightChanged = oldNight !== nightLabel();
+        if (nightChanged && !isNight()) {
+          // 原本正卡在静默等待里，改完不该再等 → 尽快开跑（而不是又排 2~4 小时）
+          scheduleNext(8000);
+          log(`✓ 静默时段 ${oldNight} → ${nightLabel()}，即将开始新一轮`);
+        } else {
+          scheduleNext(nextDelay());
+          log(`✓ 下次运行已按新间隔重排（${CFG.minIntervalMin}~${CFG.maxIntervalMin} 分钟）`);
+        }
+      } else if (oldNight !== nightLabel()) {
+        log(`✓ 静默时段已更新：${oldNight} → ${nightLabel()}`);
       }
       if (notes.length) say(notes.join("；"), false);
 
