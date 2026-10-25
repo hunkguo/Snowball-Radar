@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雪球雷达 · 无人值守保号版 v3
 // @namespace    https://snowball-radar.local/userscript
-// @version      3.5.1
+// @version      3.5.2
 // @description  油猴全自动抓取雪球评论（推荐 / 热门 / 关注 三源）并上传 Worker。打开即后台常驻，无需点击。含实测校准的选择器、账号池轮换、WAF/封号自动退避、跨轮断点续跑。
 // @author       hunk / WorkBuddy
 // @match        https://xueqiu.com/*
@@ -854,6 +854,7 @@
           created_at: c.created_at || 0, like_count: c.like_count || 0,
           reply_count: c.reply_count || 0,
           user_name: cu.screen_name || cu.id || "",
+          user_id: String(cu.id || ""),   // 前端点用户名跳转用户主页需要
         });
         added++;
       }
@@ -1008,7 +1009,7 @@
       if (score < threshold) continue;
       local.add(c.id);
       cands.push({
-        id:c.id, user_name:c.user_name||"", post_author:c.post_author||"",
+        id:c.id, user_name:c.user_name||"", user_id:c.user_id||"", post_author:c.post_author||"",
         time_str:epochToBeijing(c.created_at,false), created_at:c.created_at,
         like_count:c.like_count, reply_count:c.reply_count, text:c.text,
         score, tags, stocks, section:c.section||"", post_id:c.post_id||"",
