@@ -1222,6 +1222,7 @@
         + `（每板块 ${perSection} 帖 · 总预算 ${CFG.totalPostsPerRound}）`);
       const all = [];
       let aborted = null;
+      let emptyCount = 0;   // 本轮「接口正常但 0 评论」的帖子数（区分「帖无评论」与「登录失效」）
 
       for (const section of sections) {
         if (ST.stopped) break;
@@ -1244,7 +1245,18 @@
         for (const p of pr.posts) {
           if (ST.stopped) break;
           const cr = await getComments(p.id);
-          if (cr.kind !== "ok") { aborted = cr; log(`  ✗ 评论失败（${cr.kind}${cr.msg?" "+cr.msg:""}）`); break; }
+          if (cr.kind !== "ok") {
+            // 「empty」= 接口 200 但 0 条评论：可能是帖子本身没评论（正常、无害），
+            // 也可能是登录态失效 → 匿名请求返回空列表（项目已知特性）。
+            // 单帖 empty 不应废掉整轮：跳过它继续抓后面的帖，
+            // 只有整轮系统性全空（emptyCount≈尝试数）才说明登录失效/风控。
+            if (cr.kind === "empty") {
+              emptyCount++;
+              log(`  · ${p.screen_name} → 0 条评论（空，跳过）`);
+              continue;
+            }
+            aborted = cr; log(`  ✗ 评论失败（${cr.kind}${cr.msg?" "+cr.msg:""}）`); break;
+          }
           ROUND.posts++;
           ROUND.comments += cr.comments.length;
           for (const c of cr.comments) { c.section=section; c.post_id=p.id; c.post_author=p.screen_name; all.push(c); }
@@ -1311,6 +1323,7 @@
       log(`诊断：帖子 ${ROUND.posts} · 评论 ${all.length} · 候选 ${cands.length}`
         + ` · seen跳过 ${ROUND.seenSkip}`
         + (ROUND.fieldDrop ? ` · 字段丢弃 ${ROUND.fieldDrop}` : "")
+        + (emptyCount ? ` · 空帖 ${emptyCount}` : "")
         + ` · 最新页命中 ${ROUND.tailPages}/${ROUND.posts}（页码缓存 ${ROUND.cachedPages}）`
         + (ROUND.partialPosts ? ` · 部分失败帖 ${ROUND.partialPosts}` : ""));
       LAST_ROUND = Object.assign({}, ROUND);
@@ -1340,8 +1353,10 @@
         stat.empty = (stat.empty||0)+1;
         if (stat.empty >= LIMIT.MAX_EMPTY) {
           const wait = rnd(LIMIT.WAF_BACKOFF[0], LIMIT.WAF_BACKOFF[1])*60000;
-          log(`⚠ 连续 ${stat.empty} 轮 0 评论 → 判定异常，降频 ${fmtDur(wait)}`);
-          notify("雪球雷达", "连续多轮 0 评论，已降频 "+fmtDur(wait));
+          // 整轮全空几乎不可能是「帖子都无评论」（推荐/热门都是热门帖），
+          // 更可能是登录态失效（匿名 comments.json 返回空）或被风控 → 提示去重新登录
+          log(`⚠ 连续 ${stat.empty} 轮 0 评论 → 疑似登录态失效/风控，降频 ${fmtDur(wait)}（请到雪球页面重新登录）`);
+          notify("雪球雷达", "连续多轮 0 评论，疑似登录失效，已降频 "+fmtDur(wait)+"，请重新登录");
           stat.empty = 0; persist();
           scheduleNext(wait); return;
         }
