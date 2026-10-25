@@ -36,12 +36,13 @@ const minScore = ref(0);
 const search = ref("");
 const asc = ref(false); // false = 最新在前（倒序时间线）
 const sort = ref("ts"); // "ts"=按时间(默认) | "jev"=按 Jev 价值分降序
-// 板块筛选：""=全部 | "recommend"=推荐/关注 | "hot"=热门 | "topic"=热点话题
+// 板块筛选：""=全部 | "recommend"=推荐 | "hot"=热门 | "follow"=关注 | "topic"=热点话题
 const sectionFilter = ref("");
 const SECTION_TABS = [
   { key: "", label: "全部" },
-  { key: "recommend", label: "推荐/关注" },
+  { key: "recommend", label: "推荐" },
   { key: "hot", label: "热门" },
+  { key: "follow", label: "关注" },
   { key: "topic", label: "热点话题" },
 ];
 
@@ -176,15 +177,16 @@ function jevLabel(c) {
   return "";
 }
 
-// 板块归属：推荐(section=recommend) / 热门(section=hot) / 热点话题(无 section，来自 hashtag 引擎)
+// 板块归属：推荐(section=recommend) / 热门(section=hot) / 关注(section=follow) / 热点话题(无 section，来自 hashtag 引擎)
 function sectionOf(c) {
   if (c.section === "recommend") return "recommend";
   if (c.section === "hot") return "hot";
+  if (c.section === "follow") return "follow";
   return "topic";
 }
 function sectionLabel(c) {
   const s = sectionOf(c);
-  return s === "recommend" ? "推荐" : s === "hot" ? "热门" : "话题";
+  return s === "recommend" ? "推荐" : s === "follow" ? "关注" : s === "hot" ? "热门" : "话题";
 }
 
 // 重复命中标记：该线索被多轮抓取到（全局去重后只存一行，但可看出热度）

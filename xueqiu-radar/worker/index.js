@@ -317,9 +317,9 @@ function parseQuery(url) {
   const min = url.searchParams.get("min");
   const minScore = min != null && min !== "" ? Math.max(parseInt(min, 10) || 0, 0) : null;
   const sort = url.searchParams.get("sort") === "jev" ? "jev" : "ts";
-  // section 筛选："" = 全部 | "recommend" = 推荐/关注 | "hot" = 热门 | "topic" = 热点话题(无 section)
+  // section 筛选："" = 全部 | "recommend" = 推荐 | "hot" = 热门 | "follow" = 关注 | "topic" = 热点话题(无 section)
   const rawSection = (url.searchParams.get("section") || "").trim();
-  const section = ["recommend", "hot", "topic"].includes(rawSection) ? rawSection : "";
+  const section = ["recommend", "hot", "follow", "topic"].includes(rawSection) ? rawSection : "";
   return { limit, offset, order, stock, q, minScore, sort, section };
 }
 

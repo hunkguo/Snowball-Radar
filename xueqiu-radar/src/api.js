@@ -14,7 +14,7 @@ export async function fetchRounds() {
 // 拉取一页线索（分页 + 服务端筛选 + 排序）
 // params: { stock, q, min, order, sort, section, limit, offset }
 //   sort: "ts"(默认，按时间) | "jev"(按 Jev 价值分降序)
-//   section: ""(全部) | "recommend"(推荐/关注) | "hot"(热门) | "topic"(热点话题)
+//   section: ""(全部) | "recommend"(推荐) | "hot"(热门) | "follow"(关注) | "topic"(热点话题)
 // 返回: { clues, total, has_more, limit, offset }
 export async function fetchCluesPage(params = {}) {
   const p = new URLSearchParams();

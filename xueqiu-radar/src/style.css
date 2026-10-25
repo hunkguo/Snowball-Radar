@@ -181,6 +181,7 @@ input:focus, select:focus { border-color: var(--accent); }
 }
 .clue .src.recommend { color: var(--accent); border-color: var(--accent); }
 .clue .src.hot { color: var(--red); border-color: var(--red); }
+.clue .src.follow { color: var(--green); border-color: var(--green); }
 .clue .src.topic { color: var(--amber); border-color: var(--amber); }
 .clue .src.hashtag { color: var(--amber); border-color: var(--amber); }
 .clue .src.unknown { color: var(--muted); }
