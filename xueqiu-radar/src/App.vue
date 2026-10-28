@@ -240,7 +240,7 @@ function origUrl(c) {
         <div class="sub">
           按时间线浏览自动抓取的高价值股票社区评论
           <template v-if="total">
-            · 共 {{ total }} 条 · 第 {{ page }} / {{ totalPages }} 页
+            · 近 10 天共 {{ total }} 条 · 第 {{ page }} / {{ totalPages }} 页
           </template>
         </div>
       </div>
@@ -272,7 +272,7 @@ function origUrl(c) {
         <option :value="12">分数 ≥ 12</option>
         <option :value="15">分数 ≥ 15</option>
       </select>
-      <span class="count">共 {{ total }} 条</span>
+      <span class="count" title="只保留最近 10 天入库的线索；旧数据每天 00:00 自动清理，所以总数是滚动的、不是历史累计">近 10 天 {{ total }} 条</span>
     </div>
 
     <div v-if="loading" class="loading">加载中…</div>

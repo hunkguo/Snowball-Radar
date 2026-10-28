@@ -259,13 +259,16 @@ clues 表：总行 30，唯一 30  ✓ 无重复行
 
 ### 自动清理（保留 10 天）
 
-- **每日 Cron 自动清理**：`wrangler.toml` 里配了 `crons = ["0 16 * * *"]`（UTC 16:00 = 北京时间 00:00），Worker 的 `scheduled` 每天删除 `ts`（评论时间）/`created_at`（轮次时间）早于 **10 天前** 的数据（`KEEP_DAYS = 10`，改这个值即可调整保留天数）。
+- **每日 Cron 自动清理**：`wrangler.toml` 里配了 `crons = ["0 16 * * *"]`（UTC 16:00 = 北京时间 00:00），Worker 的 `scheduled` 每天删除**入库满 10 天**的数据（`KEEP_DAYS = 10`，改这个值即可调整保留天数）。
+  - **口径 = `clues.ingested_at`（首次入库时间，毫秒）/ `rounds.created_at`**，两者同一把尺子，一条线索与它的首现轮次同生同灭。
+  - ⚠️ 2026-10-28 前用的是 `clues.ts`（**评论自身时间**），后果是：热帖下 10 天前的老评论今天才被抓到，刚入库就被判"过期"、当晚 00:00 立刻删掉 → 前台「共 N 条」忽高忽低（今天 4000+、明天 3000+）。迁移 `0010_add_ingested_at.sql` 已改为按入库时间，并把历史行按首现轮次回填。
+  - ⚠️ 另一个历史坑：`clues.ts` 存**秒**、`ingested_at`/`created_at` 存**毫秒**，换算错会一次删空全库（曾导致每天 00:00 清空）。改清理逻辑时务必核对单位。
   - 注：免费版 Cloudflare 也支持 Cron Trigger，但触发器数量有限；若免费版不可用，用下面的手动接口照样能清理。
-- **手动触发清理**：`POST /api/cleanup`（需 `Authorization: Bearer <token>`），立即删除 10 天前数据，返回删除条数：
+- **手动触发清理**：`POST /api/cleanup`（需 `Authorization: Bearer <token>`），立即删除入库满 10 天的数据，返回删除条数：
   ```bash
-  curl -X POST https://xueqiu.你的域名.com/api/cleanup \
+  curl -X POST https://radar.你的域名.com/api/cleanup \
     -H "Authorization: Bearer <你的token>"
-  # 返回示例：{"ok":true,"keep_days":10,"deleted":{"clues":12,"rounds":2}}
+  # 返回示例：{"ok":true,"keep_days":10,"basis":"ingested_at","deleted":{"clues":12,"rounds":2}}
   ```
 - 只删除有真实时间（`ts>0`/`created_at>0`）且早于 cutoff 的记录；无时间字段的遗留行不会被误删。
 

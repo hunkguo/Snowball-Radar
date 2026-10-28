@@ -169,8 +169,9 @@ async function ingest(body, env) {
         `INSERT INTO clues
            (round_id, clue_id, first_seen_round, last_seen_round, hit_count,
             user_name, user_id, post_id, post_author_id, time_str,
-            like_count, reply_count, text, score, tags, stocks, section, ts, date, jev_value)
-         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            like_count, reply_count, text, score, tags, stocks, section, ts, date, jev_value,
+            ingested_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(clue_id) DO UPDATE SET
            last_seen_round = excluded.last_seen_round,
            hit_count = COALESCE(clues.hit_count, 0) + 1,
@@ -195,7 +196,8 @@ async function ingest(body, env) {
         c.section || "",
         ts,
         date,
-        Number(c.jev_value) || 0
+        Number(c.jev_value) || 0,
+        createdAt
       )
     );
   }
@@ -390,18 +392,27 @@ async function handleClues(env, url) {
   });
 }
 
-// 清理 KEEP_DAYS 天前的数据（ts/created_at 早于 cutoff 的）
-// ⚠️ 单位陷阱：clues.ts 存的是「秒」，rounds.created_at 存的是「毫秒」。
-// cutoff 必须分别换算，否则拿毫秒级 cutoff 去比较秒级 ts，会让所有 clues 被误删
-// （这正是此前每天 00:00 Cron 把线索清空的原因）。
+// 清理 KEEP_DAYS 天前「入库」的数据
+// ⚠️ 两个历史坑，别再踩：
+// 1) 单位陷阱：clues.ts 存的是「秒」，ingested_at / rounds.created_at 是「毫秒」。
+//    曾拿毫秒级 cutoff 去比较秒级 ts，导致所有 clues 被误删（每天 00:00 清空的元凶）。
+// 2) 口径陷阱（2026-10-28 修）：以前按 ts（评论自身时间）判过期，
+//    于是「今天才抓到的、10 天前的老评论」刚入库就被追溯删除 →
+//    前台「共 N 条」忽高忽低，今天是 4000+ 明天变 3000+。
+//    现改为按 ingested_at（首次入库时间）判断，与 rounds.created_at 同一把尺子，
+//    一条线索与它的首现轮次同生同灭。
+//    迁移前入库的老行若 ingested_at=0，回退用 ts*1000；两者都无（时间未知）则不删。
 async function cleanup(env) {
-  const cutoffMs = Date.now() - KEEP_DAYS * 24 * 3600 * 1000; // 毫秒（用于 rounds.created_at）
-  const cutoffSec = Math.floor(cutoffMs / 1000);              // 秒（用于 clues.ts）
-  const delClues = await env.DB.prepare("DELETE FROM clues WHERE ts > 0 AND ts < ?").bind(cutoffSec).run();
+  const cutoffMs = Date.now() - KEEP_DAYS * 24 * 3600 * 1000;
+  const timeExpr = "CASE WHEN ingested_at > 0 THEN ingested_at WHEN ts > 0 THEN ts * 1000 ELSE NULL END";
+  const delClues = await env.DB.prepare(
+    `DELETE FROM clues WHERE ${timeExpr} < ?`
+  ).bind(cutoffMs).run();
   const delRounds = await env.DB.prepare("DELETE FROM rounds WHERE created_at > 0 AND created_at < ?").bind(cutoffMs).run();
   return {
     ok: true,
     keep_days: KEEP_DAYS,
+    basis: "ingested_at",
     cutoff: new Date(cutoffMs).toISOString(),
     deleted: {
       clues: (delClues && delClues.meta && delClues.meta.changes) || 0,
