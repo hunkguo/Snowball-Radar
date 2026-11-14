@@ -269,22 +269,6 @@ input:focus, select:focus { border-color: var(--accent); }
 .error { color: var(--red); padding: 20px 0; }
 
 /* 分页条：页码 + 上一页 / 下一页（整页替换） */
-/* 顶部快捷翻页条 */
-.pager-top {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 2px 0 14px;
-  color: var(--muted);
-  font-size: 13px;
-}
-.pager-top .pt-info {
-  padding: 0 4px;
-  font-variant-numeric: tabular-nums;
-}
-.pager-top .pt-info b { color: var(--text); }
-
 .pager {
   display: flex;
   align-items: center;

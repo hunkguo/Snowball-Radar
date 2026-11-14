@@ -12,21 +12,25 @@ const total = ref(0);
 const page = ref(1);
 const PAGE = 50;
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)));
-// 页码序列：当前页 ±2（共 5 个连续页码）、首末页常驻，缺口用 … 省略。
-// 页码多时（几十页）也只需一次点击就跳到附近任意页。
+// 页码序列：以当前页为中心取 7 个连续页码（贴边时自动补齐，始终满 7 个），
+// 首末页常驻，缺口用 … 省略。68 页时首页显示 1 2 3 4 5 6 7 … 68，一眼可选。
+const PAGE_WINDOW = 7;
 const pageList = computed(() => {
   const tp = totalPages.value;
-  const cur = page.value;
-  const set = new Set([1, tp]);
-  for (let p = cur - 2; p <= cur + 2; p++) {
-    if (p >= 1 && p <= tp) set.add(p);
-  }
+  const cur = Math.min(Math.max(1, page.value), tp);
+  const half = Math.floor(PAGE_WINDOW / 2);
+  let end = Math.min(tp, Math.max(1, cur - half) + PAGE_WINDOW - 1);
+  let start = Math.max(1, end - PAGE_WINDOW + 1);
+  end = Math.min(tp, start + PAGE_WINDOW - 1);
   const out = [];
-  let prev = 0;
-  for (const p of [...set].sort((a, b) => a - b)) {
-    if (prev && p - prev > 1) out.push("…");
-    out.push(p);
-    prev = p;
+  if (start > 1) {
+    out.push(1);
+    if (start > 2) out.push("…");
+  }
+  for (let p = start; p <= end; p++) out.push(p);
+  if (end < tp) {
+    if (end < tp - 1) out.push("…");
+    out.push(tp);
   }
   return out;
 });
@@ -356,15 +360,6 @@ function origUrl(c) {
         <option :value="15">分数 ≥ 15</option>
       </select>
       <span class="count" title="只保留最近 10 天入库的线索；旧数据每天 00:00 自动清理，所以总数是滚动的、不是历史累计">近 10 天 {{ total }} 条</span>
-    </div>
-
-    <!-- 顶部快捷翻页：一页 50 条，滚到底才能翻页太费劲，这里给一排按钮 -->
-    <div class="pager-top" v-if="total > 0 && !loading">
-      <button class="pg-btn nav" :disabled="page <= 1" @click="firstPage">« 首页</button>
-      <button class="pg-btn nav" :disabled="page <= 1" @click="prevPage">‹ 上一页</button>
-      <span class="pt-info">第 <b>{{ page }}</b> / {{ totalPages }} 页</span>
-      <button class="pg-btn nav" :disabled="page >= totalPages" @click="nextPage">下一页 ›</button>
-      <button class="pg-btn nav" :disabled="page >= totalPages" @click="lastPage">末页 »</button>
     </div>
 
     <div v-if="loading" class="loading">加载中…</div>
