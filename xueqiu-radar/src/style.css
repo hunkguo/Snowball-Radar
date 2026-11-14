@@ -269,6 +269,22 @@ input:focus, select:focus { border-color: var(--accent); }
 .error { color: var(--red); padding: 20px 0; }
 
 /* 分页条：页码 + 上一页 / 下一页（整页替换） */
+/* 顶部快捷翻页条 */
+.pager-top {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 2px 0 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.pager-top .pt-info {
+  padding: 0 4px;
+  font-variant-numeric: tabular-nums;
+}
+.pager-top .pt-info b { color: var(--text); }
+
 .pager {
   display: flex;
   align-items: center;
@@ -277,8 +293,7 @@ input:focus, select:focus { border-color: var(--accent); }
   gap: 8px;
   margin: 26px 0 6px;
 }
-.pager .pg-nums {
-  display: flex;
+.pager .pg-nums {  display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
@@ -324,6 +339,35 @@ input:focus, select:focus { border-color: var(--accent); }
   box-shadow: 0 4px 12px rgba(56, 189, 248, 0.28);
 }
 .pg-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* 跳页输入：页码多时一步直达，不用连点几十次「下一页」 */
+.pager .pg-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.pager .pg-jump input {
+  width: 62px;
+  height: 34px;
+  padding: 0 8px;
+  text-align: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.pager .pg-jump input:focus { outline: none; border-color: var(--accent); }
+.pager .pg-jump input::placeholder { color: var(--muted); opacity: 0.7; }
+/* 去掉数字框的上下微调箭头（手机上尤其容易误触） */
+.pager .pg-jump input::-webkit-outer-spin-button,
+.pager .pg-jump input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.pager .pg-jump input { -moz-appearance: textfield; appearance: textfield; }
 .pg-caption {
   text-align: center;
   color: var(--muted);

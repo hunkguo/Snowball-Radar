@@ -7,17 +7,18 @@ const clues = ref([]);
 const loading = ref(false);
 const error = ref("");
 
-// 分页状态（整页替换模式：页码 + 上一页/下一页）
+// 分页状态（整页替换模式：页码 + 上一页/下一页 + 首页/末页 + 跳页）
 const total = ref(0);
 const page = ref(1);
 const PAGE = 50;
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)));
-// 页码序列：当前页 ±1、首末页常驻，缺口用 … 省略
+// 页码序列：当前页 ±2（共 5 个连续页码）、首末页常驻，缺口用 … 省略。
+// 页码多时（几十页）也只需一次点击就跳到附近任意页。
 const pageList = computed(() => {
   const tp = totalPages.value;
   const cur = page.value;
   const set = new Set([1, tp]);
-  for (let p = cur - 1; p <= cur + 1; p++) {
+  for (let p = cur - 2; p <= cur + 2; p++) {
     if (p >= 1 && p <= tp) set.add(p);
   }
   const out = [];
@@ -29,6 +30,8 @@ const pageList = computed(() => {
   }
   return out;
 });
+// 跳页输入框
+const jumpTo = ref("");
 
 // 筛选（全部在服务端执行）
 const stockFilter = ref("");
@@ -46,12 +49,61 @@ const SECTION_TABS = [
   { key: "topic", label: "热点话题" },
 ];
 
-onMounted(() => {
-  loadInitial();
+// ── URL 状态（刷新/分享/前进后退都能定位到同一页）──────────────
+// 所有视图状态写进 query string：?page=3&section=hot&q=xx&stock=xx&min=7&sort=jev&order=asc
+// 为什么不用「/p/3」这种伪静态路径：本站是 SPA + 静态资源，路径要靠 fallback 兜底，
+// assets 路由一变就 404；query 参数零依赖，也不会被 CDN 当静态文件缓存。
+const VALID_SECTIONS = ["", "recommend", "hot", "follow", "topic"];
+const VALID_MINS = [0, 7, 12, 15];
+
+function readUrlState() {
+  const sp = new URLSearchParams(location.search);
+  const sec = sp.get("section") || "";
+  sectionFilter.value = VALID_SECTIONS.includes(sec) ? sec : "";
+  search.value = sp.get("q") || "";
+  stockFilter.value = sp.get("stock") || "";
+  const min = parseInt(sp.get("min") || "", 10);
+  minScore.value = VALID_MINS.includes(min) ? min : 0;
+  sort.value = sp.get("sort") === "jev" ? "jev" : "ts";
+  asc.value = sp.get("order") === "asc";
+  const p = parseInt(sp.get("page") || "", 10);
+  page.value = Number.isFinite(p) && p > 0 ? p : 1;
+}
+
+function writeUrlState(mode = "replace") {
+  const sp = new URLSearchParams();
+  if (page.value > 1) sp.set("page", String(page.value));
+  if (sectionFilter.value) sp.set("section", sectionFilter.value);
+  if (search.value.trim()) sp.set("q", search.value.trim());
+  if (stockFilter.value.trim()) sp.set("stock", stockFilter.value.trim());
+  if (minScore.value) sp.set("min", String(minScore.value));
+  if (sort.value !== "ts") sp.set("sort", sort.value);
+  if (asc.value) sp.set("order", "asc");
+  const qs = sp.toString();
+  const next = location.pathname + (qs ? "?" + qs : "");
+  if (next === location.pathname + location.search) return;
+  // 翻页用 push（可后退），改筛选/输入用 replace（不刷屏历史记录）
+  try { history[mode + "State"]({ page: page.value }, "", next); } catch (e) { /* file:// 等场景忽略 */ }
+}
+
+function onPopState() {
+  readUrlState();
+  loadPage(true);
+}
+
+onMounted(async () => {
+  readUrlState();
+  await loadPage(true);
+  await clampPage();
   window.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("popstate", onPopState);
   onScroll();
 });
-onUnmounted(() => window.removeEventListener("scroll", onScroll));
+onUnmounted(() => {
+  window.removeEventListener("scroll", onScroll);
+  window.removeEventListener("popstate", onPopState);
+  clearTimeout(searchTimer);
+});
 
 // 返回顶部浮动按钮：滚动超过阈值才显示
 const showToTop = ref(false);
@@ -71,11 +123,6 @@ const currentParams = computed(() => ({
   section: sectionFilter.value,
   limit: PAGE,
 }));
-
-async function loadInitial() {
-  page.value = 1;
-  await loadPage(true);
-}
 
 // 拉取当前页（默认不重复拉 rounds；首屏/刷新时才需要）
 async function loadPage(withRounds = false) {
@@ -100,18 +147,54 @@ async function loadPage(withRounds = false) {
   }
 }
 
-function goPage(p) {
-  if (p === page.value || p < 1 || p > totalPages.value) return;
+// 深链页码越界（比如数据被清理后 ?page=50 已不存在）→ 自动落到最后一页
+async function clampPage() {
+  if (total.value > 0 && page.value > totalPages.value) {
+    page.value = totalPages.value;
+    await loadPage();
+    writeUrlState("replace");
+  }
+}
+
+async function goPage(p) {
+  const tp = totalPages.value;
+  if (p < 1 || p > tp || p === page.value) return;
   page.value = p;
-  loadPage();
+  jumpTo.value = "";
+  writeUrlState("push");
+  await loadPage();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 function prevPage() { goPage(page.value - 1); }
 function nextPage() { goPage(page.value + 1); }
+function firstPage() { goPage(1); }
+function lastPage() { goPage(totalPages.value); }
+function doJump() {
+  const n = parseInt(jumpTo.value, 10);
+  if (!Number.isFinite(n)) { jumpTo.value = ""; return; }
+  const p = Math.min(totalPages.value, Math.max(1, n));
+  if (p === page.value) { jumpTo.value = ""; return; }
+  goPage(p);
+}
 
 // 筛选条件变化时，回到第一页重新拉取
 function onFilterChange() {
-  loadInitial();
+  page.value = 1;
+  writeUrlState("replace");
+  loadPage();
+}
+
+// 文本输入防抖：每敲一个字就发一次请求会把 D1 打爆
+let searchTimer = null;
+function onFilterInput() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(onFilterChange, 350);
+}
+
+// 刷新按钮：保留当前页与筛选，只重新拉数据
+function reload() {
+  writeUrlState("replace");
+  loadPage(true);
 }
 
 // round_id -> { title, source }，用于每条评论标注来源
@@ -249,7 +332,7 @@ function origUrl(c) {
           {{ sort === "jev" ? "按时间 ↓" : "按价值 ↓" }}
         </button>
         <button @click="asc = !asc; onFilterChange()">{{ asc ? "正序 ↑" : "倒序 ↓" }}</button>
-        <button @click="loadInitial">刷新</button>
+        <button @click="reload">刷新</button>
       </div>
     </div>
 
@@ -264,8 +347,8 @@ function origUrl(c) {
     </div>
 
     <div class="filters">
-      <input v-model="search" @input="onFilterChange" placeholder="搜索正文 / 作者" />
-      <input v-model="stockFilter" @input="onFilterChange" placeholder="按标的筛选（如 澜起科技）" />
+      <input v-model="search" @input="onFilterInput" placeholder="搜索正文 / 作者" />
+      <input v-model="stockFilter" @input="onFilterInput" placeholder="按标的筛选（如 澜起科技）" />
       <select v-model.number="minScore" @change="onFilterChange">
         <option :value="0">分数 ≥ 0</option>
         <option :value="7">分数 ≥ 7</option>
@@ -273,6 +356,15 @@ function origUrl(c) {
         <option :value="15">分数 ≥ 15</option>
       </select>
       <span class="count" title="只保留最近 10 天入库的线索；旧数据每天 00:00 自动清理，所以总数是滚动的、不是历史累计">近 10 天 {{ total }} 条</span>
+    </div>
+
+    <!-- 顶部快捷翻页：一页 50 条，滚到底才能翻页太费劲，这里给一排按钮 -->
+    <div class="pager-top" v-if="total > 0 && !loading">
+      <button class="pg-btn nav" :disabled="page <= 1" @click="firstPage">« 首页</button>
+      <button class="pg-btn nav" :disabled="page <= 1" @click="prevPage">‹ 上一页</button>
+      <span class="pt-info">第 <b>{{ page }}</b> / {{ totalPages }} 页</span>
+      <button class="pg-btn nav" :disabled="page >= totalPages" @click="nextPage">下一页 ›</button>
+      <button class="pg-btn nav" :disabled="page >= totalPages" @click="lastPage">末页 »</button>
     </div>
 
     <div v-if="loading" class="loading">加载中…</div>
@@ -321,6 +413,7 @@ function origUrl(c) {
       </div>
 
       <div class="pager" v-if="total > 0">
+        <button class="pg-btn nav" :disabled="page <= 1 || loading" @click="firstPage" title="回到第一页">« 首页</button>
         <button class="pg-btn nav" :disabled="page <= 1 || loading" @click="prevPage">‹ 上一页</button>
         <span class="pg-nums">
           <button
@@ -332,6 +425,17 @@ function origUrl(c) {
           >{{ p }}</button>
         </span>
         <button class="pg-btn nav" :disabled="page >= totalPages || loading" @click="nextPage">下一页 ›</button>
+        <button class="pg-btn nav" :disabled="page >= totalPages || loading" @click="lastPage" title="跳到最后一页">末页 »</button>
+        <span class="pg-jump">
+          跳至
+          <input
+            type="number" min="1" :max="totalPages" inputmode="numeric"
+            v-model="jumpTo" @keyup.enter="doJump" :disabled="loading"
+            :placeholder="String(page)" aria-label="跳转到指定页码"
+          >
+          页
+          <button class="pg-btn" :disabled="loading" @click="doJump">Go</button>
+        </span>
       </div>
       <div class="pg-caption" v-if="total > 0">第 {{ page }} / {{ totalPages }} 页 · 每页 {{ PAGE }} 条 · 共 {{ total }} 条</div>
     </div>
