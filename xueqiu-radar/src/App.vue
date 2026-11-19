@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed, nextTick } from "vue";
 import {
-  fetchRounds, fetchCluesPage, markRead, unmarkRead, clearAllReads,
+  fetchRounds, fetchCluesPage, markRead, unmarkRead, clearAllReads, clearReadsSince,
 } from "./api.js";
 
 const rounds = ref([]);
@@ -19,10 +19,12 @@ const savedPrefs = loadPrefs();
 const hideRead = ref(savedPrefs.hideRead !== false);   // 默认隐藏已读
 const autoMark = ref(savedPrefs.autoMark !== false);   // 默认滚动自动已读
 const readTotal = ref(0);                              // 服务端已读总数
+const CLEAR_DAYS = [1, 3, 5, 7];
+const clearDays = ref(CLEAR_DAYS.includes(savedPrefs.clearDays) ? savedPrefs.clearDays : 3); // 清除范围（近 N 天资讯）
 function savePrefs() {
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify({
-      hideRead: hideRead.value, autoMark: autoMark.value,
+      hideRead: hideRead.value, autoMark: autoMark.value, clearDays: clearDays.value,
     }));
   } catch { /* 隐私模式下忽略 */ }
 }
@@ -277,15 +279,34 @@ async function markPageRead() {
   }
 }
 
+// 清除已读：默认按「资讯日期」清近 N 天（只重读这几天的），全部清除作为次级选项。
+// 先 flush 掉本机还没提交的标记，避免清完又被这些待提交项写回去。
+async function clearReadRange() {
+  const days = Number(clearDays.value);
+  if (!window.confirm(
+    `确定把「近 ${days} 天资讯」的已读标记清掉吗？\n` +
+    `这些天读过的评论会重新出现在列表里（所有设备同步）。\n\n` +
+    `只想清得更少/更多，可先在下拉框改天数。`
+  )) return;
+  await doClear(() => clearReadsSince(days), `近 ${days} 天`);
+}
 async function clearAllRead() {
-  if (!window.confirm("确定清除所有已读标记吗？所有设备上的阅读进度都会重置。")) return;
+  if (!window.confirm("确定清空【所有】已读吗？近 10 天的阅读进度会全部重置，量较大，建议优先用「近 N 天」。")) return;
+  await doClear(clearAllReads, "全部");
+}
+async function doClear(fn, label) {
   try {
-    await clearAllReads();
-    readTotal.value = 0;
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (pendingReads.size) await flushPendingReads();
+    const r = await fn();
+    const n = (r && r.cleared) || 0;
+    // loadPage 会用服务端的 read_total 刷新计数（按范围清时不能简单归零）
     pendingReads.clear();
     await loadPage();
+    window.alert(`已清除${label}已读标记：${n} 条恢复为未读。`);
   } catch (e) {
-    console.warn("[已读] 清空失败", e);
+    console.warn("[已读] 清除失败", e);
+    window.alert("清除失败，请稍后重试：" + e.message);
   }
 }
 
@@ -389,20 +410,29 @@ function dayLabel(d) {
   return d;
 }
 
-// 卡片时间标签：刚刚 / X分钟前 / X小时前 / 今天 / 昨天 / 日期
+// 从 time_str 提取时刻 HH:MM（脚本上报格式 YYYY-MM-DD HH:MM，北京时间）
+function clockOf(c) {
+  const m = (c.time_str || "").match(/(\d{1,2}):(\d{2})/);
+  return m ? `${pad2(+m[1])}:${m[2]}` : "";
+}
+
+// 卡片时间标签：一律带具体时刻，避免一屏「昨天」分不清先后。
+// 刚刚 / X分钟前 保留相对显示；其余 → 今天 HH:MM / 昨天 HH:MM / MM-DD HH:MM
 function relTime(c) {
   const d = dateStr(c);
+  const clock = clockOf(c);
   if (c.ts) {
     const diff = Math.floor(Date.now() / 1000) - c.ts;
     if (diff < 60) return "刚刚";
     if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
-    // 仅当与今天同属一天才显示「X小时前」，避免跨天被误判为几小时前
-    if (d === todayStr() && diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
   }
-  if (!d) return "（时间未知）";
-  if (d === todayStr()) return "今天";
-  if (d === yesterdayStr()) return "昨天";
-  return d;
+  if (!d) return clock || "（时间未知）";
+  const at = (label) => (clock ? `${label} ${clock}` : label);
+  if (d === todayStr()) return at("今天");
+  if (d === yesterdayStr()) return at("昨天");
+  // 同年只显示 MM-DD，跨年补年份；都带时刻
+  const sameYear = d.slice(0, 4) === String(new Date().getFullYear());
+  return at(sameYear ? d.slice(5) : d);
 }
 
 // Jev 投资参考价值标签：仅当已由 Jev 评估(jev_ok)且分>0 时显示「价值 N%」
@@ -483,7 +513,10 @@ function origUrl(c) {
         <button @click="sort = (sort === 'jev' ? 'ts' : 'jev'); onFilterChange()">
           {{ sort === "jev" ? "按时间 ↓" : "按价值 ↓" }}
         </button>
-        <button @click="asc = !asc; onFilterChange()">{{ asc ? "正序 ↑" : "倒序 ↓" }}</button>
+        <button
+          @click="asc = !asc; onFilterChange()"
+          :title="asc ? '当前旧在前（时间升序），点击改为新在前' : '当前新在前（时间倒序），点击改为旧在前'"
+        >{{ asc ? "旧在前 ↑" : "新在前 ↓" }}</button>
         <button @click="reload">刷新</button>
       </div>
     </div>
@@ -508,7 +541,14 @@ function origUrl(c) {
       </label>
       <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
       <button class="rbtn" @click="markPageRead" :disabled="loading || !clues.length" title="把当前页全部标记为已读">本页全标已读</button>
-      <button class="rbtn" @click="clearAllRead" :disabled="loading || !readTotal" title="清空所有设备上的已读进度">重置已读</button>
+      <span class="rclear" title="按资讯日期恢复近 N 天的已读，方便重读这几天的评论">
+        清除
+        <select v-model.number="clearDays" @change="savePrefs">
+          <option v-for="d in CLEAR_DAYS" :key="d" :value="d">近 {{ d }} 天</option>
+        </select>
+        <button class="rbtn" @click="clearReadRange" :disabled="loading || !readTotal">恢复未读</button>
+        <button class="rbtn rbtn-minor" @click="clearAllRead" :disabled="loading || !readTotal" title="重置全部已读（量大，慎用）">全部</button>
+      </span>
     </div>
 
     <div class="filters">
@@ -528,7 +568,7 @@ function origUrl(c) {
     <div v-else-if="!total" class="empty">
       <template v-if="hideRead && !hasActiveFilter">
         近 10 天的资讯都已读完 ✓（已标记 {{ readTotal }} 条）。<br>
-        取消勾选「隐藏已读」可回看，或点「重置已读」重新开始。
+        取消勾选「隐藏已读」可回看，或用「清除 → 近 N 天 → 恢复未读」重读某几天。
       </template>
       <template v-else-if="hasActiveFilter">当前筛选条件下暂无数据，试试切换板块或清空筛选条件。</template>
       <template v-else>暂无数据。请先让上传工具运行一轮并开启上传（--upload 指定 Worker 地址）。</template>

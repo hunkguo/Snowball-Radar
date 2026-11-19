@@ -174,11 +174,30 @@ input:focus, select:focus { border-color: var(--accent); }
 .readbar .rstat { color: var(--muted); }
 .readbar .rstat b { color: var(--green); font-variant-numeric: tabular-nums; }
 .readbar .rbtn {
-  margin-left: auto;
   font-size: 12px;
   padding: 5px 11px;
 }
-.readbar .rbtn + .rbtn { margin-left: 0; }
+.readbar > .rbtn:first-of-type { margin-left: auto; }
+.readbar .rclear {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.readbar .rclear select {
+  font-size: 12px;
+  padding: 4px 6px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.readbar .rbtn-minor {
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--border);
+}
 
 .clue {
   border-left: 3px solid var(--border);

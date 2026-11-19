@@ -60,11 +60,23 @@ async function postReads(ids, method) {
 export function markRead(ids) { return postReads(ids, "POST"); }
 export function unmarkRead(ids) { return postReads(ids, "DELETE"); }
 
+// 清除全部已读（保留兼容入口）
 export async function clearAllReads() {
   const r = await fetch("/api/reads", {
     method: "DELETE",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ all: true }),
+  });
+  if (!r.ok) throw new Error(`请求失败 ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+// 按资讯日期清除近 days 天的已读标记（恢复为未读），返回 { cleared }
+export async function clearReadsSince(days) {
+  const r = await fetch("/api/reads", {
+    method: "DELETE",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ days }),
   });
   if (!r.ok) throw new Error(`请求失败 ${r.status}: ${await r.text()}`);
   return r.json();
