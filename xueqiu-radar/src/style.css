@@ -149,12 +149,65 @@ input:focus, select:focus { border-color: var(--accent); }
   letter-spacing: 0.5px;
 }
 
+/* 阅读进度条：跨设备已读状态的开关与批量操作 */
+.readbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+  padding: 8px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.readbar .rchk {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.readbar .rchk input { accent-color: var(--green); cursor: pointer; width: 15px; height: 15px; }
+.readbar .rstat { color: var(--muted); }
+.readbar .rstat b { color: var(--green); font-variant-numeric: tabular-nums; }
+.readbar .rbtn {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 5px 11px;
+}
+.readbar .rbtn + .rbtn { margin-left: 0; }
+
 .clue {
   border-left: 3px solid var(--border);
   padding: 10px 14px;
   margin: 8px 0;
   background: var(--panel);
   border-radius: 0 10px 10px 0;
+  transition: opacity 0.25s ease, border-color 0.25s ease;
+}
+/* 已读：整卡淡出但不移除（不触发列表重排/跳动），满 10 天后随清理自然消失 */
+.clue.read { opacity: 0.42; border-left-color: var(--green); }
+.clue.read .text { color: var(--muted); }
+
+/* 单条已读按钮 */
+.clue .head .read-toggle {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 1px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.clue .head .read-toggle:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
+.clue .head .read-toggle.done {
+  color: var(--green);
+  border-color: rgba(52, 211, 153, 0.5);
+  background: rgba(52, 211, 153, 0.1);
 }
 .clue .head {
   display: flex;

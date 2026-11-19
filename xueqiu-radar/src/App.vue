@@ -1,11 +1,31 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from "vue";
-import { fetchRounds, fetchCluesPage } from "./api.js";
+import { ref, onMounted, onUnmounted, computed, nextTick } from "vue";
+import {
+  fetchRounds, fetchCluesPage, markRead, unmarkRead, clearAllReads,
+} from "./api.js";
 
 const rounds = ref([]);
 const clues = ref([]);
 const loading = ref(false);
 const error = ref("");
+
+// ── 已读进度（跨设备：状态存服务端 D1，按 clue_id 共享）──────────
+// 两个开关是「本机阅读偏好」，存 localStorage；已读本身不存本地。
+const PREFS_KEY = "xr3_read_prefs";
+function loadPrefs() {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; }
+}
+const savedPrefs = loadPrefs();
+const hideRead = ref(savedPrefs.hideRead !== false);   // 默认隐藏已读
+const autoMark = ref(savedPrefs.autoMark !== false);   // 默认滚动自动已读
+const readTotal = ref(0);                              // 服务端已读总数
+function savePrefs() {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({
+      hideRead: hideRead.value, autoMark: autoMark.value,
+    }));
+  } catch { /* 隐私模式下忽略 */ }
+}
 
 // 分页状态（整页替换模式：页码 + 上一页/下一页 + 首页/末页 + 跳页）
 const total = ref(0);
@@ -107,6 +127,8 @@ onUnmounted(() => {
   window.removeEventListener("scroll", onScroll);
   window.removeEventListener("popstate", onPopState);
   clearTimeout(searchTimer);
+  teardownObserver();
+  flushPendingReads(); // 离开前把还没提交的已读补发掉
 });
 
 // 返回顶部浮动按钮：滚动超过阈值才显示
@@ -125,6 +147,7 @@ const currentParams = computed(() => ({
   order: asc.value ? "asc" : "desc",
   sort: sort.value,
   section: sectionFilter.value,
+  unread: hideRead.value,   // 隐藏已读 → 服务端过滤，分页计数也跟着变
   limit: PAGE,
 }));
 
@@ -139,16 +162,141 @@ async function loadPage(withRounds = false) {
       rounds.value = r || [];
       clues.value = pg.clues || [];
       total.value = pg.total || 0;
+      readTotal.value = pg.read_total || readTotal.value;
     } else {
       const pg = await fetchCluesPage(params);
       clues.value = pg.clues || [];
       total.value = pg.total || 0;
+      readTotal.value = pg.read_total || readTotal.value;
     }
+    // 每次换页后重建滚动观察器：新卡片进入视野停留 2 秒即自动标记已读
+    await nextTick();
+    setupReadObserver();
   } catch (e) {
     error.value = e.message;
   } finally {
     loading.value = false;
   }
+}
+
+// ── 滚动自动已读 ──────────────────────────────────────────────
+// 关键点：标记只改前端样式 + 攒批发服务端，绝不重新拉列表 ——
+// 否则滚动过程中列表突然缩短会让页面跳动、甚至找不到刚才看到的位置。
+let readObserver = null;
+const readTimers = new Map();     // clue_id -> setTimeout（停留计时）
+const pendingReads = new Set();   // 攒批待提交
+let flushTimer = null;
+const DWELL_MS = 2000;            // 停留 2 秒才算读过（快速划过不算）
+
+function setupReadObserver() {
+  if (readObserver) { readObserver.disconnect(); readObserver = null; }
+  for (const t of readTimers.values()) clearTimeout(t);
+  readTimers.clear();
+  if (!autoMark.value) return;
+  if (typeof IntersectionObserver === "undefined") return;
+  readObserver = new IntersectionObserver((entries) => {
+    for (const en of entries) {
+      const el = en.target;
+      const cid = el.getAttribute("data-cid");
+      if (!cid || el.dataset.read === "1") continue;
+      if (en.isIntersecting) {
+        if (readTimers.has(cid)) continue;
+        readTimers.set(cid, setTimeout(() => {
+          readTimers.delete(cid);
+          markOneLocally(cid);
+        }, DWELL_MS));
+      } else {
+        const t = readTimers.get(cid);
+        if (t) { clearTimeout(t); readTimers.delete(cid); }
+      }
+    }
+  }, { threshold: 0.55 });
+  document.querySelectorAll(".clue[data-cid]").forEach((el) => readObserver.observe(el));
+}
+function teardownObserver() {
+  if (readObserver) { readObserver.disconnect(); readObserver = null; }
+  for (const t of readTimers.values()) clearTimeout(t);
+  readTimers.clear();
+}
+
+// 前端立即灰显 + 攒批，900ms 内的多次标记合并成一次请求
+function markOneLocally(cid) {
+  const c = clues.value.find((x) => String(x.clue_id) === cid);
+  if (!c || c.is_read) return;
+  c.is_read = 1;
+  const el = document.querySelector(`.clue[data-cid="${cid}"]`);
+  if (el) el.dataset.read = "1";
+  pendingReads.add(cid);
+  readTotal.value++;
+  if (!flushTimer) flushTimer = setTimeout(flushPendingReads, 900);
+}
+async function flushPendingReads() {
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  if (!pendingReads.size) return;
+  const ids = [...pendingReads];
+  pendingReads.clear();
+  try {
+    await markRead(ids);
+  } catch (e) {
+    // 标记失败不打断阅读；下次加载会从服务端重新取回真实状态
+    console.warn("[已读] 批量标记失败", e);
+  }
+}
+
+// 单条：点「已读 / 未读」按钮
+async function toggleOne(c) {
+  const cid = String(c.clue_id);
+  const toRead = !c.is_read;
+  c.is_read = toRead ? 1 : 0;
+  const el = document.querySelector(`.clue[data-cid="${cid}"]`);
+  if (el) el.dataset.read = toRead ? "1" : "0";
+  readTotal.value += toRead ? 1 : -1;
+  try {
+    if (toRead) await markRead([cid]);
+    else await unmarkRead([cid]);
+  } catch (e) {
+    console.warn("[已读] 单条切换失败", e);
+  }
+}
+
+// 整页：把当前页全部标已读。隐藏模式下随后重拉 → 直接进入下一批未读
+async function markPageRead() {
+  const ids = clues.value.filter((c) => !c.is_read).map((c) => String(c.clue_id));
+  if (!ids.length) return;
+  const fresh = ids.filter((id) => !pendingReads.has(id));
+  for (const c of clues.value) c.is_read = 1;
+  pendingReads.clear();
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  readTotal.value += fresh.length;
+  try {
+    await markRead(ids);
+    if (hideRead.value) await loadPage();
+    else setupReadObserver();
+  } catch (e) {
+    console.warn("[已读] 整页标记失败", e);
+  }
+}
+
+async function clearAllRead() {
+  if (!window.confirm("确定清除所有已读标记吗？所有设备上的阅读进度都会重置。")) return;
+  try {
+    await clearAllReads();
+    readTotal.value = 0;
+    pendingReads.clear();
+    await loadPage();
+  } catch (e) {
+    console.warn("[已读] 清空失败", e);
+  }
+}
+
+function onReadPrefChange() {
+  savePrefs();
+  flushPendingReads();
+  loadPage();
+}
+function onAutoMarkChange() {
+  savePrefs();
+  setupReadObserver();
 }
 
 // 深链页码越界（比如数据被清理后 ?page=50 已不存在）→ 自动落到最后一页
@@ -350,6 +498,19 @@ function origUrl(c) {
       >{{ t.label }}</button>
     </div>
 
+    <!-- 阅读进度条：已读跨设备同步（存服务端），支持滚动自动标记 / 整页 / 单条 -->
+    <div class="readbar">
+      <label class="rchk" title="勾选后已读资讯从列表消失（服务端过滤，翻页计数同步）；换设备也生效">
+        <input type="checkbox" v-model="hideRead" @change="onReadPrefChange"> 隐藏已读
+      </label>
+      <label class="rchk" title="卡片在视野中停留 2 秒即自动标记已读，快速划过不算">
+        <input type="checkbox" v-model="autoMark" @change="onAutoMarkChange"> 滚动自动已读
+      </label>
+      <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
+      <button class="rbtn" @click="markPageRead" :disabled="loading || !clues.length" title="把当前页全部标记为已读">本页全标已读</button>
+      <button class="rbtn" @click="clearAllRead" :disabled="loading || !readTotal" title="清空所有设备上的已读进度">重置已读</button>
+    </div>
+
     <div class="filters">
       <input v-model="search" @input="onFilterInput" placeholder="搜索正文 / 作者" />
       <input v-model="stockFilter" @input="onFilterInput" placeholder="按标的筛选（如 澜起科技）" />
@@ -365,13 +526,24 @@ function origUrl(c) {
     <div v-if="loading" class="loading">加载中…</div>
     <div v-else-if="error" class="error">错误：{{ error }}</div>
     <div v-else-if="!total" class="empty">
-      <template v-if="hasActiveFilter">当前筛选条件下暂无数据，试试切换板块或清空筛选条件。</template>
+      <template v-if="hideRead && !hasActiveFilter">
+        近 10 天的资讯都已读完 ✓（已标记 {{ readTotal }} 条）。<br>
+        取消勾选「隐藏已读」可回看，或点「重置已读」重新开始。
+      </template>
+      <template v-else-if="hasActiveFilter">当前筛选条件下暂无数据，试试切换板块或清空筛选条件。</template>
       <template v-else>暂无数据。请先让上传工具运行一轮并开启上传（--upload 指定 Worker 地址）。</template>
     </div>
     <div v-else>
       <div v-for="[day, items] in timeline" :key="day">
         <div class="day-divider">{{ dayLabel(day) }}</div>
-        <div v-for="c in items" :key="c.round_id + '_' + c.clue_id" class="clue">
+        <div
+          v-for="c in items"
+          :key="c.round_id + '_' + c.clue_id"
+          class="clue"
+          :class="{ read: !!c.is_read }"
+          :data-cid="String(c.clue_id)"
+          :data-read="c.is_read ? '1' : '0'"
+        >
           <div class="head">
             <span class="time" :title="c.time_str">{{ relTime(c) }}</span>
             <span class="who">
@@ -388,6 +560,12 @@ function origUrl(c) {
               class="hit"
               :title="'该线索被 ' + c.hit_count + ' 轮抓取到（全局去重后仅存一份）'"
             >{{ hitLabel(c) }}</span>
+            <button
+              class="read-toggle"
+              :class="{ done: !!c.is_read }"
+              @click.stop="toggleOne(c)"
+              :title="c.is_read ? '取消已读' : '标记为已读'"
+            >{{ c.is_read ? "✓ 已读" : "○ 已读" }}</button>
           </div>
 
           <div class="text">{{ c.text }}</div>

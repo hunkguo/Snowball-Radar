@@ -5,10 +5,14 @@
  *   1) POST /api/ingest   —— 油猴脚本上传 { meta, candidates, comments }，鉴权后写入 D1
  *   2) GET  /api/rounds   —— 轮次列表（倒序，支持分页）
  *   3) GET  /api/clues    —— 线索（按 ts 时间排序，支持分页 + 标的/关键词/分数/板块筛选）
- *                            板块筛选：section=recommend(推荐/关注) | hot(热门) | topic(热点话题)
- *   4) POST /api/cleanup  —— 手动触发清理（token 鉴权），删 10 天前数据
- *   5) 每日 Cron 自动清理 10 天前数据
- *   6) 其余路径            —— 交给 ASSETS 托管 Vue 前台（SPA）
+ *                            板块筛选：section=recommend(推荐/关注) | hot(热门) | follow(关注) | topic(热点话题)
+ *                            unread=1 —— 只看未读（跨设备已读状态存 D1）
+ *   4) GET  /api/reads    —— 取全部已读 clue_id（前端统计 / 跨设备同步）
+ *   5) POST /api/reads    —— 批量标记已读 { ids:[...] }
+ *   6) DELETE /api/reads  —— 取消已读 { ids:[...] } 或清空 { all:true }
+ *   7) POST /api/cleanup  —— 手动触发清理（token 鉴权），删 10 天前数据
+ *   8) 每日 Cron 自动清理 10 天前数据
+ *   9) 其余路径            —— 交给 ASSETS 托管 Vue 前台（SPA）
  *
  * 绑定：env.DB (D1)、env.INGEST_TOKEN (secret)、env.ASSETS
  */
@@ -322,14 +326,17 @@ function parseQuery(url) {
   // section 筛选："" = 全部 | "recommend" = 推荐 | "hot" = 热门 | "follow" = 关注 | "topic" = 热点话题(无 section)
   const rawSection = (url.searchParams.get("section") || "").trim();
   const section = ["recommend", "hot", "follow", "topic"].includes(rawSection) ? rawSection : "";
-  return { limit, offset, order, stock, q, minScore, sort, section };
+  // 只看未读：前端打开「隐藏已读」后带上，服务端用 NOT EXISTS 过滤（计数与分页同步生效）
+  const unread = url.searchParams.get("unread") === "1";
+  return { limit, offset, order, stock, q, minScore, sort, section, unread };
 }
 
 // 组装 WHERE 与绑定参数
-function buildWhere({ stock, q, minScore, round, section }) {
+function buildWhere({ stock, q, minScore, round, section, unread }) {
   const where = [];
   const binds = [];
   if (round) { where.push("round_id = ?"); binds.push(round); }
+  if (unread) { where.push("NOT EXISTS (SELECT 1 FROM reads r WHERE r.clue_id = clues.clue_id)"); }
   if (section === "topic") {
     // 热点话题来源（hashtag 引擎）不写 section，统一归为「话题」
     where.push("(section IS NULL OR section = '')");
@@ -361,9 +368,9 @@ async function handleRounds(env, url) {
 }
 
 async function handleClues(env, url) {
-  const { limit, offset, order, stock, q, minScore, sort, section } = parseQuery(url);
+  const { limit, offset, order, stock, q, minScore, sort, section, unread } = parseQuery(url);
   const round = url.searchParams.get("round") || "";
-  const { clause, binds } = buildWhere({ stock, q, minScore, round, section });
+  const { clause, binds } = buildWhere({ stock, q, minScore, round, section, unread });
 
   const { results: t } = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM clues ${clause}`
@@ -375,21 +382,89 @@ async function handleClues(env, url) {
     ? "jev_value DESC, ts DESC"
     : `ts ${order}, score DESC`;
 
+  // 每条线索附带 is_read（当前设备组共享的已读状态），供前端灰显/打勾
   const { results } = await env.DB.prepare(
-    `SELECT * FROM clues ${clause} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
+    `SELECT clues.*, EXISTS(SELECT 1 FROM reads r WHERE r.clue_id = clues.clue_id) AS is_read
+       FROM clues ${clause} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
   ).bind(...binds, limit, offset).all();
   const clues = (results || []).map((r) => ({
     ...r,
     tags: safeJson(r.tags, []),
     stocks: safeJson(r.stocks, []),
   }));
+  const { results: rt } = await env.DB.prepare("SELECT COUNT(*) AS n FROM reads").all();
+  const readTotal = (rt && rt[0] && rt[0].n) || 0;
   return json({
     clues,
     total,
+    read_total: readTotal,
     limit,
     offset,
     has_more: offset + limit < total,
   });
+}
+
+// ────────────────────────────────────────────────────────────
+// 已读状态：跨设备共享（存服务端 D1，不按设备区分）。
+// GET  /api/reads          → { ids:[...], total }  全量已读 id（前端统计/导出）
+// POST /api/reads          → { ids:[...] } 批量标记，INSERT OR IGNORE 幂等
+// DELETE /api/reads        → { ids:[...] } 取消指定 / { all:true } 清空全部
+// 说明：这是「阅读进度」而非抓取数据，不设 token 鉴权——任何打开页面的人
+//       都应有标记能力；若将来对外开放，可在外层加轻量 token。
+// ────────────────────────────────────────────────────────────
+async function handleReadsGet(env) {
+  const { results } = await env.DB.prepare("SELECT clue_id FROM reads ORDER BY read_at DESC").all();
+  const ids = (results || []).map((r) => String(r.clue_id));
+  return json({ ids, total: ids.length });
+}
+
+async function handleReadsWrite(env, request) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid json" }, 400);
+  }
+  const method = request.method;
+  const now = Date.now();
+
+  if (method === "DELETE" && body && body.all === true) {
+    const r = await env.DB.prepare("DELETE FROM reads").run();
+    return json({ ok: true, cleared: (r && r.meta && r.meta.changes) || 0 });
+  }
+
+  const ids = Array.isArray(body && body.ids)
+    ? [...new Set(body.ids.map(String).filter(Boolean))].slice(0, 5000)
+    : [];
+  if (!ids.length) return json({ ok: true, changed: 0 });
+
+  const stmts = [];
+  const IN_CHUNK = 100;
+  if (method === "POST") {
+    for (let i = 0; i < ids.length; i += IN_CHUNK) {
+      const part = ids.slice(i, i + IN_CHUNK);
+      const rows = part.map((id) =>
+        `(? , ${now})`
+      ).join(",");
+      // 用多值 INSERT + INSERT OR IGNORE，幂等且省往返
+      stmts.push(env.DB.prepare(
+        `INSERT OR IGNORE INTO reads (clue_id, read_at) VALUES ${rows}`
+      ).bind(...part));
+    }
+  } else if (method === "DELETE") {
+    for (let i = 0; i < ids.length; i += IN_CHUNK) {
+      const part = ids.slice(i, i + IN_CHUNK);
+      const ph = part.map(() => "?").join(",");
+      stmts.push(env.DB.prepare(`DELETE FROM reads WHERE clue_id IN (${ph})`).bind(...part));
+    }
+  } else {
+    return json({ error: "method not allowed" }, 405);
+  }
+
+  for (let i = 0; i < stmts.length; i += BATCH_LIMIT) {
+    await env.DB.batch(stmts.slice(i, i + BATCH_LIMIT));
+  }
+  return json({ ok: true, changed: ids.length });
 }
 
 // 清理 KEEP_DAYS 天前「入库」的数据
@@ -409,6 +484,10 @@ async function cleanup(env) {
     `DELETE FROM clues WHERE ${timeExpr} < ?`
   ).bind(cutoffMs).run();
   const delRounds = await env.DB.prepare("DELETE FROM rounds WHERE created_at > 0 AND created_at < ?").bind(cutoffMs).run();
+  // 同步删掉已不在 clues 里的孤立已读标记，避免 reads 表无限增长
+  const delReads = await env.DB.prepare(
+    "DELETE FROM reads WHERE clue_id NOT IN (SELECT clue_id FROM clues)"
+  ).run();
   return {
     ok: true,
     keep_days: KEEP_DAYS,
@@ -417,6 +496,7 @@ async function cleanup(env) {
     deleted: {
       clues: (delClues && delClues.meta && delClues.meta.changes) || 0,
       rounds: (delRounds && delRounds.meta && delRounds.meta.changes) || 0,
+      reads: (delReads && delReads.meta && delReads.meta.changes) || 0,
     },
   };
 }
@@ -455,6 +535,13 @@ export default {
 
       if (path === "/api/rounds") return await handleRounds(env, url);
       if (path === "/api/clues") return await handleClues(env, url);
+      if (path === "/api/reads") {
+        if (request.method === "GET") return await handleReadsGet(env);
+        if (request.method === "POST" || request.method === "DELETE") {
+          return await handleReadsWrite(env, request);
+        }
+        return json({ error: "method not allowed" }, 405);
+      }
       // 去重探针：客户端批量问「这批 clue_id 里哪些已在库」，
       // 拿到后只上传新线索 → 大幅缩小请求体与 D1 写入量
       if (path === "/api/exists") {
