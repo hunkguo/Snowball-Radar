@@ -29,14 +29,14 @@ function savePrefs() {
   } catch { /* 隐私模式下忽略 */ }
 }
 
-// 分页状态（整页替换模式：页码 + 上一页/下一页 + 首页/末页 + 跳页）
+// 分页状态（整页替换模式：上一页/下一页 + 少量页码 + 跳页）
 const total = ref(0);
 const page = ref(1);
 const PAGE = 50;
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)));
-// 页码序列：以当前页为中心取 7 个连续页码（贴边时自动补齐，始终满 7 个），
-// 首末页常驻，缺口用 … 省略。68 页时首页显示 1 2 3 4 5 6 7 … 68，一眼可选。
-const PAGE_WINDOW = 7;
+// 页码序列：以当前页为中心取 5 个连续页码（贴边时自动补齐，始终满 5 个），
+// 首末页常驻，缺口用 … 省略；再配合「跳至 N 页」一步直达，按钮少但不丢失定位能力。
+const PAGE_WINDOW = 5;
 const pageList = computed(() => {
   const tp = totalPages.value;
   const cur = Math.min(Math.max(1, page.value), tp);
@@ -340,8 +340,6 @@ async function goPage(p) {
 }
 function prevPage() { goPage(page.value - 1); }
 function nextPage() { goPage(page.value + 1); }
-function firstPage() { goPage(1); }
-function lastPage() { goPage(totalPages.value); }
 function doJump() {
   const n = parseInt(jumpTo.value, 10);
   if (!Number.isFinite(n)) { jumpTo.value = ""; return; }
@@ -540,7 +538,6 @@ function origUrl(c) {
         <input type="checkbox" v-model="autoMark" @change="onAutoMarkChange"> 滚动自动已读
       </label>
       <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
-      <button class="rbtn" @click="markPageRead" :disabled="loading || !clues.length" title="把当前页全部标记为已读">本页全标已读</button>
       <span class="rclear" title="按资讯日期恢复近 N 天的已读，方便重读这几天的评论">
         清除
         <select v-model.number="clearDays" @change="savePrefs">
@@ -626,7 +623,6 @@ function origUrl(c) {
       </div>
 
       <div class="pager" v-if="total > 0">
-        <button class="pg-btn nav" :disabled="page <= 1 || loading" @click="firstPage" title="回到第一页">« 首页</button>
         <button class="pg-btn nav" :disabled="page <= 1 || loading" @click="prevPage">‹ 上一页</button>
         <span class="pg-nums">
           <button
@@ -638,7 +634,6 @@ function origUrl(c) {
           >{{ p }}</button>
         </span>
         <button class="pg-btn nav" :disabled="page >= totalPages || loading" @click="nextPage">下一页 ›</button>
-        <button class="pg-btn nav" :disabled="page >= totalPages || loading" @click="lastPage" title="跳到最后一页">末页 »</button>
         <span class="pg-jump">
           跳至
           <input
@@ -650,7 +645,10 @@ function origUrl(c) {
           <button class="pg-btn" :disabled="loading" @click="doJump">Go</button>
         </span>
       </div>
-      <div class="pg-caption" v-if="total > 0">第 {{ page }} / {{ totalPages }} 页 · 每页 {{ PAGE }} 条 · 共 {{ total }} 条</div>
+      <div class="pg-caption" v-if="total > 0">
+        第 {{ page }} / {{ totalPages }} 页 · 每页 {{ PAGE }} 条 · 共 {{ total }} 条
+        <button class="rbtn pg-mark" @click="markPageRead" :disabled="loading || !clues.length" title="读完这一页，点一下把这页全部标为已读">本页全标已读</button>
+      </div>
     </div>
 
     <button class="to-top" v-show="showToTop" @click="scrollToTop" aria-label="返回顶部" title="返回顶部">↑</button>
