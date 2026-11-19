@@ -16,6 +16,7 @@ export async function fetchRounds() {
 //   sort: "ts"(默认，按时间) | "jev"(按 Jev 价值分降序)
 //   section: ""(全部) | "recommend"(推荐) | "hot"(热门) | "follow"(关注) | "topic"(热点话题)
 //   unread:  true = 只看未读（服务端按 reads 表过滤，跨设备同步）
+//   favorite:true = 只看收藏（服务端按 favorites 表过滤；收藏模式下自动忽略 unread）
 // 返回: { clues, total, has_more, limit, offset }
 export async function fetchCluesPage(params = {}) {
   const p = new URLSearchParams();
@@ -25,7 +26,8 @@ export async function fetchCluesPage(params = {}) {
   if (params.order) p.set("order", params.order);
   if (params.sort) p.set("sort", params.sort);
   if (params.section) p.set("section", params.section);
-  if (params.unread) p.set("unread", "1");
+  if (params.unread && !params.favorite) p.set("unread", "1");
+  if (params.favorite) p.set("favorite", "1");
   if (params.round) p.set("round", params.round);
   if (params.limit != null) p.set("limit", String(params.limit));
   if (params.offset != null) p.set("offset", String(params.offset));
@@ -34,6 +36,7 @@ export async function fetchCluesPage(params = {}) {
     clues: data.clues || [],
     total: data.total || 0,
     read_total: data.read_total || 0,
+    fav_total: data.fav_total || 0,
     has_more: !!data.has_more,
     limit: data.limit || 50,
     offset: data.offset || 0,
@@ -63,6 +66,35 @@ export function unmarkRead(ids) { return postReads(ids, "DELETE"); }
 // 清除全部已读（保留兼容入口）
 export async function clearAllReads() {
   const r = await fetch("/api/reads", {
+    method: "DELETE",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ all: true }),
+  });
+  if (!r.ok) throw new Error(`请求失败 ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+// 收藏状态（跨设备共享，存服务端 D1，与已读同构）
+export async function fetchFavoriteIds() {
+  const data = await getJson("/api/favorites");
+  return { ids: data.ids || [], total: data.total || 0 };
+}
+
+async function postFavorites(ids, method) {
+  const r = await fetch("/api/favorites", {
+    method,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: ids.map(String) }),
+  });
+  if (!r.ok) throw new Error(`请求失败 ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export function markFavorite(ids) { return postFavorites(ids, "POST"); }
+export function unmarkFavorite(ids) { return postFavorites(ids, "DELETE"); }
+
+export async function clearAllFavorites() {
+  const r = await fetch("/api/favorites", {
     method: "DELETE",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ all: true }),

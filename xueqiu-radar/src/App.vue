@@ -1,7 +1,8 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed, nextTick } from "vue";
 import {
-  fetchRounds, fetchCluesPage, markRead, unmarkRead, clearAllReads, clearReadsSince,
+  fetchRounds, fetchCluesPage, markRead, clearAllReads, clearReadsSince,
+  markFavorite, unmarkFavorite,
 } from "./api.js";
 
 const rounds = ref([]);
@@ -19,6 +20,8 @@ const savedPrefs = loadPrefs();
 const hideRead = ref(savedPrefs.hideRead !== false);   // 默认隐藏已读
 const autoMark = ref(savedPrefs.autoMark !== false);   // 默认滚动自动已读
 const readTotal = ref(0);                              // 服务端已读总数
+const favTotal = ref(0);                               // 服务端收藏总数
+const favOnly = ref(false);                            // 只看收藏（收藏模式下已读也照常显示）
 const CLEAR_DAYS = [1, 3, 5, 7];
 const clearDays = ref(CLEAR_DAYS.includes(savedPrefs.clearDays) ? savedPrefs.clearDays : 3); // 清除范围（近 N 天资讯）
 function savePrefs() {
@@ -76,7 +79,7 @@ const SECTION_TABS = [
 ];
 
 // ── URL 状态（刷新/分享/前进后退都能定位到同一页）──────────────
-// 所有视图状态写进 query string：?page=3&section=hot&q=xx&stock=xx&min=7&sort=jev&order=asc
+// 所有视图状态写进 query string：?page=3&section=hot&q=xx&stock=xx&min=7&sort=jev&order=asc&fav=1
 // 为什么不用「/p/3」这种伪静态路径：本站是 SPA + 静态资源，路径要靠 fallback 兜底，
 // assets 路由一变就 404；query 参数零依赖，也不会被 CDN 当静态文件缓存。
 const VALID_SECTIONS = ["", "recommend", "hot", "follow", "topic"];
@@ -92,6 +95,7 @@ function readUrlState() {
   minScore.value = VALID_MINS.includes(min) ? min : 0;
   sort.value = sp.get("sort") === "jev" ? "jev" : "ts";
   asc.value = sp.get("order") === "asc";
+  favOnly.value = sp.get("fav") === "1";
   const p = parseInt(sp.get("page") || "", 10);
   page.value = Number.isFinite(p) && p > 0 ? p : 1;
 }
@@ -105,6 +109,7 @@ function writeUrlState(mode = "replace") {
   if (minScore.value) sp.set("min", String(minScore.value));
   if (sort.value !== "ts") sp.set("sort", sort.value);
   if (asc.value) sp.set("order", "asc");
+  if (favOnly.value) sp.set("fav", "1");
   const qs = sp.toString();
   const next = location.pathname + (qs ? "?" + qs : "");
   if (next === location.pathname + location.search) return;
@@ -149,7 +154,9 @@ const currentParams = computed(() => ({
   order: asc.value ? "asc" : "desc",
   sort: sort.value,
   section: sectionFilter.value,
-  unread: hideRead.value,   // 隐藏已读 → 服务端过滤，分页计数也跟着变
+  // 收藏模式忽略「隐藏已读」：已读的收藏也要显示（服务端也会强制忽略 unread）
+  unread: hideRead.value && !favOnly.value,
+  favorite: favOnly.value,
   limit: PAGE,
 }));
 
@@ -165,11 +172,13 @@ async function loadPage(withRounds = false) {
       clues.value = pg.clues || [];
       total.value = pg.total || 0;
       readTotal.value = pg.read_total || readTotal.value;
+      favTotal.value = pg.fav_total || favTotal.value;
     } else {
       const pg = await fetchCluesPage(params);
       clues.value = pg.clues || [];
       total.value = pg.total || 0;
       readTotal.value = pg.read_total || readTotal.value;
+      favTotal.value = pg.fav_total || favTotal.value;
     }
     // 每次换页后重建滚动观察器：新卡片进入视野停留 2 秒即自动标记已读
     await nextTick();
@@ -245,19 +254,21 @@ async function flushPendingReads() {
   }
 }
 
-// 单条：点「已读 / 未读」按钮
-async function toggleOne(c) {
+// 单条收藏：点卡片右上角的 ☆ / ★（收藏状态跨设备共享，存服务端）
+async function toggleFav(c) {
   const cid = String(c.clue_id);
-  const toRead = !c.is_read;
-  c.is_read = toRead ? 1 : 0;
-  const el = document.querySelector(`.clue[data-cid="${cid}"]`);
-  if (el) el.dataset.read = toRead ? "1" : "0";
-  readTotal.value += toRead ? 1 : -1;
+  const toFav = !c.is_fav;
+  c.is_fav = toFav ? 1 : 0;                 // 立即反馈，不重拉列表
+  favTotal.value += toFav ? 1 : -1;
+  if (favTotal.value < 0) favTotal.value = 0;
   try {
-    if (toRead) await markRead([cid]);
-    else await unmarkRead([cid]);
+    if (toFav) await markFavorite([cid]);
+    else await unmarkFavorite([cid]);
   } catch (e) {
-    console.warn("[已读] 单条切换失败", e);
+    console.warn("[收藏] 单条切换失败", e);
+    c.is_fav = toFav ? 0 : 1;               // 失败回滚
+    favTotal.value += toFav ? -1 : 1;
+    window.alert("收藏操作失败，请稍后重试");
   }
 }
 
@@ -461,7 +472,7 @@ function hitLabel(c) {
 
 // 是否有任何生效中的筛选（用于区分「无数据」与「筛选后无数据」两种空态）
 const hasActiveFilter = computed(() =>
-  !!(sectionFilter.value || search.value.trim() || stockFilter.value.trim() || minScore.value)
+  !!(favOnly.value || sectionFilter.value || search.value.trim() || stockFilter.value.trim() || minScore.value)
 );
 
 // 按「日期」分段（时间线视觉分隔，不做任何关联推算）
@@ -538,13 +549,22 @@ function origUrl(c) {
         <option :value="12">分数 ≥ 12</option>
         <option :value="15">分数 ≥ 15</option>
       </select>
+      <button
+        class="fav-filter"
+        :class="{ active: favOnly }"
+        @click="favOnly = !favOnly; onFilterChange()"
+        :title="favOnly ? '当前只看收藏（已读的收藏也会显示），点击取消' : '只看收藏的资讯，不受已读/隐藏已读影响'"
+      >★ 只看收藏</button>
       <span class="count" title="只保留最近 10 天入库的线索；旧数据每天 00:00 自动清理，所以总数是滚动的、不是历史累计">近 10 天 {{ total }} 条</span>
     </div>
 
     <div v-if="loading" class="loading">加载中…</div>
     <div v-else-if="error" class="error">错误：{{ error }}</div>
     <div v-else-if="!total" class="empty">
-      <template v-if="hideRead && !hasActiveFilter">
+      <template v-if="favOnly">
+        还没有收藏的资讯。点资讯右上角的 ☆ 收藏，之后即使已读也能在「只看收藏」里找到。
+      </template>
+      <template v-else-if="hideRead && !hasActiveFilter">
         近 10 天的资讯都已读完 ✓（已标记 {{ readTotal }} 条）。<br>
         取消勾选「隐藏已读」可回看，或用「清除 → 近 N 天 → 恢复未读」重读某几天。
       </template>
@@ -558,7 +578,7 @@ function origUrl(c) {
           v-for="c in items"
           :key="c.round_id + '_' + c.clue_id"
           class="clue"
-          :class="{ read: !!c.is_read }"
+          :class="{ read: !!c.is_read, fav: !!c.is_fav }"
           :data-cid="String(c.clue_id)"
           :data-read="c.is_read ? '1' : '0'"
         >
@@ -579,11 +599,11 @@ function origUrl(c) {
               :title="'该线索被 ' + c.hit_count + ' 轮抓取到（全局去重后仅存一份）'"
             >{{ hitLabel(c) }}</span>
             <button
-              class="read-toggle"
-              :class="{ done: !!c.is_read }"
-              @click.stop="toggleOne(c)"
-              :title="c.is_read ? '取消已读' : '标记为已读'"
-            >{{ c.is_read ? "✓ 已读" : "○ 已读" }}</button>
+              class="fav-toggle"
+              :class="{ done: !!c.is_fav }"
+              @click.stop="toggleFav(c)"
+              :title="c.is_fav ? '取消收藏' : '收藏这条（跨设备保留，已读后也能在「只看收藏」找到）'"
+            >{{ c.is_fav ? "★ 已收藏" : "☆ 收藏" }}</button>
           </div>
 
           <div class="text">{{ c.text }}</div>
@@ -640,6 +660,7 @@ function origUrl(c) {
         <input type="checkbox" v-model="autoMark" @change="onAutoMarkChange"> 滚动自动已读
       </label>
       <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
+      <span class="rstat">收藏 <b>{{ favTotal }}</b> 条</span>
       <button class="rbtn pg-mark" @click="markPageRead" :disabled="loading || !clues.length" title="读完这一页，点一下把这页全部标为已读">本页全标已读</button>
       <span class="rclear" title="按资讯日期恢复近 N 天的已读，方便重读这几天的评论">
         清除

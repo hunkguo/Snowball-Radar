@@ -95,6 +95,25 @@ input:focus, select:focus { border-color: var(--accent); }
   flex-wrap: wrap;
   margin: 12px 0;
 }
+/* 收藏筛选：与已读状态正交，打开时即便已读也显示 */
+.filters .fav-filter {
+  font-size: 13px;
+  padding: 0 12px;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.filters .fav-filter:hover { border-color: var(--amber); color: var(--amber); }
+.filters .fav-filter.active {
+  color: #06283d;
+  background: var(--amber);
+  border-color: var(--amber);
+  font-weight: 700;
+}
 
 /* 板块筛选：推荐/关注 · 热门 · 热点话题 */
 .section-tabs {
@@ -225,9 +244,11 @@ input:focus, select:focus { border-color: var(--accent); }
 /* 已读：整卡淡出但不移除（不触发列表重排/跳动），满 10 天后随清理自然消失 */
 .clue.read { opacity: 0.42; border-left-color: var(--green); }
 .clue.read .text { color: var(--muted); }
+/* 收藏的卡片用琥珀色左边框标记（优先于已读的绿色） */
+.clue.fav { border-left-color: var(--amber); }
 
-/* 单条已读按钮 */
-.clue .head .read-toggle {
+/* 单条收藏按钮（已读按钮已移除，阅读状态由滚动自动标记） */
+.clue .head .fav-toggle {
   margin-left: auto;
   font-size: 11px;
   padding: 1px 9px;
@@ -237,11 +258,11 @@ input:focus, select:focus { border-color: var(--accent); }
   color: var(--muted);
   white-space: nowrap;
 }
-.clue .head .read-toggle:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
-.clue .head .read-toggle.done {
-  color: var(--green);
-  border-color: rgba(52, 211, 153, 0.5);
-  background: rgba(52, 211, 153, 0.1);
+.clue .head .fav-toggle:hover:not(:disabled) { border-color: var(--amber); color: var(--amber); }
+.clue .head .fav-toggle.done {
+  color: var(--amber);
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(251, 191, 36, 0.1);
 }
 .clue .head {
   display: flex;
