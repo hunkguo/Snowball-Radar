@@ -173,15 +173,24 @@ input:focus, select:focus { border-color: var(--accent); }
 .readbar .rchk input { accent-color: var(--green); cursor: pointer; width: 15px; height: 15px; }
 .readbar .rstat { color: var(--muted); }
 .readbar .rstat b { color: var(--green); font-variant-numeric: tabular-nums; }
-.readbar .rbtn {
+.rbtn {
   font-size: 12px;
   padding: 5px 11px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s, background 0.15s;
 }
-.readbar > .rbtn:first-of-type { margin-left: auto; }
+.rbtn:hover:not(:disabled) { border-color: var(--accent); background: var(--panel-2); }
+.rbtn:disabled { opacity: 0.45; cursor: not-allowed; }
 .readbar .rclear {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  margin-left: auto;
   color: var(--muted);
 }
 .readbar .rclear select {
@@ -425,12 +434,19 @@ input:focus, select:focus { border-color: var(--accent); }
 .pager .pg-jump input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .pager .pg-jump input { -moz-appearance: textfield; appearance: textfield; }
 .pg-caption {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 14px;
   text-align: center;
   color: var(--muted);
   font-size: 12px;
   margin: 2px 0 30px;
   font-variant-numeric: tabular-nums;
 }
+/* 「本页全标已读」放在读完的位置：翻页条正下方 */
+.pg-caption .pg-mark { color: var(--green); }
 
 /* 返回顶部浮动按钮 */
 .to-top {
