@@ -207,6 +207,13 @@ input:focus, select:focus { border-color: var(--accent); }
   color: var(--muted);
   border-color: var(--border);
 }
+.readbar-top { margin: 12px 0; }
+/* 底部阅读操作条：紧跟分页，读完一页就在这儿标记/恢复 */
+.readbar-bottom {
+  margin: 10px 0 30px;
+  justify-content: center;
+}
+.readbar-bottom .pg-mark { color: var(--green); }
 
 .clue {
   border-left: 3px solid var(--border);
@@ -442,11 +449,9 @@ input:focus, select:focus { border-color: var(--accent); }
   text-align: center;
   color: var(--muted);
   font-size: 12px;
-  margin: 2px 0 30px;
   font-variant-numeric: tabular-nums;
+  margin: 2px 0 0;
 }
-/* 「本页全标已读」放在读完的位置：翻页条正下方 */
-.pg-caption .pg-mark { color: var(--green); }
 
 /* 返回顶部浮动按钮 */
 .to-top {
