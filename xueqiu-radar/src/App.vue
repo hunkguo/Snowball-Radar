@@ -529,16 +529,6 @@ function origUrl(c) {
       >{{ t.label }}</button>
     </div>
 
-    <!-- 阅读开关（顶部）：只放影响当前列表的两个偏好 -->
-    <div class="readbar readbar-top">
-      <label class="rchk" title="勾选后已读资讯从列表消失（服务端过滤，翻页计数同步）；换设备也生效">
-        <input type="checkbox" v-model="hideRead" @change="onReadPrefChange"> 隐藏已读
-      </label>
-      <label class="rchk" title="卡片在视野中停留 2 秒即自动标记已读，快速划过不算">
-        <input type="checkbox" v-model="autoMark" @change="onAutoMarkChange"> 滚动自动已读
-      </label>
-    </div>
-
     <div class="filters">
       <input v-model="search" @input="onFilterInput" placeholder="搜索正文 / 作者" />
       <input v-model="stockFilter" @input="onFilterInput" placeholder="按标的筛选（如 澜起科技）" />
@@ -641,8 +631,14 @@ function origUrl(c) {
       </div>
     </div>
 
-    <!-- 阅读操作（底部）：读完顺手标已读、查看进度、按日期恢复未读；全部读完时也要能看到清除入口 -->
+    <!-- 阅读操作（底部）：开关 + 标记 + 进度 + 清除，全部读完时也要能看到入口 -->
     <div class="readbar readbar-bottom" v-if="!loading && !error">
+      <label class="rchk" title="勾选后已读资讯从列表消失（服务端过滤，翻页计数同步）；换设备也生效">
+        <input type="checkbox" v-model="hideRead" @change="onReadPrefChange"> 隐藏已读
+      </label>
+      <label class="rchk" title="卡片在视野中停留 2 秒即自动标记已读，快速划过不算">
+        <input type="checkbox" v-model="autoMark" @change="onAutoMarkChange"> 滚动自动已读
+      </label>
       <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
       <button class="rbtn pg-mark" @click="markPageRead" :disabled="loading || !clues.length" title="读完这一页，点一下把这页全部标为已读">本页全标已读</button>
       <span class="rclear" title="按资讯日期恢复近 N 天的已读，方便重读这几天的评论">
