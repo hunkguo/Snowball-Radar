@@ -207,7 +207,6 @@ input:focus, select:focus { border-color: var(--accent); }
   color: var(--muted);
   border-color: var(--border);
 }
-.readbar-top { margin: 12px 0; }
 /* 底部阅读操作条：紧跟分页，读完一页就在这儿标记/恢复 */
 .readbar-bottom {
   margin: 10px 0 30px;
