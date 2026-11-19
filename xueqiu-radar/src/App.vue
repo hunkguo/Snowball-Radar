@@ -529,23 +529,14 @@ function origUrl(c) {
       >{{ t.label }}</button>
     </div>
 
-    <!-- 阅读进度条：已读跨设备同步（存服务端），支持滚动自动标记 / 整页 / 单条 -->
-    <div class="readbar">
+    <!-- 阅读开关（顶部）：只放影响当前列表的两个偏好 -->
+    <div class="readbar readbar-top">
       <label class="rchk" title="勾选后已读资讯从列表消失（服务端过滤，翻页计数同步）；换设备也生效">
         <input type="checkbox" v-model="hideRead" @change="onReadPrefChange"> 隐藏已读
       </label>
       <label class="rchk" title="卡片在视野中停留 2 秒即自动标记已读，快速划过不算">
         <input type="checkbox" v-model="autoMark" @change="onAutoMarkChange"> 滚动自动已读
       </label>
-      <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
-      <span class="rclear" title="按资讯日期恢复近 N 天的已读，方便重读这几天的评论">
-        清除
-        <select v-model.number="clearDays" @change="savePrefs">
-          <option v-for="d in CLEAR_DAYS" :key="d" :value="d">近 {{ d }} 天</option>
-        </select>
-        <button class="rbtn" @click="clearReadRange" :disabled="loading || !readTotal">恢复未读</button>
-        <button class="rbtn rbtn-minor" @click="clearAllRead" :disabled="loading || !readTotal" title="重置全部已读（量大，慎用）">全部</button>
-      </span>
     </div>
 
     <div class="filters">
@@ -647,8 +638,21 @@ function origUrl(c) {
       </div>
       <div class="pg-caption" v-if="total > 0">
         第 {{ page }} / {{ totalPages }} 页 · 每页 {{ PAGE }} 条 · 共 {{ total }} 条
-        <button class="rbtn pg-mark" @click="markPageRead" :disabled="loading || !clues.length" title="读完这一页，点一下把这页全部标为已读">本页全标已读</button>
       </div>
+    </div>
+
+    <!-- 阅读操作（底部）：读完顺手标已读、查看进度、按日期恢复未读；全部读完时也要能看到清除入口 -->
+    <div class="readbar readbar-bottom" v-if="!loading && !error">
+      <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
+      <button class="rbtn pg-mark" @click="markPageRead" :disabled="loading || !clues.length" title="读完这一页，点一下把这页全部标为已读">本页全标已读</button>
+      <span class="rclear" title="按资讯日期恢复近 N 天的已读，方便重读这几天的评论">
+        清除
+        <select v-model.number="clearDays" @change="savePrefs">
+          <option v-for="d in CLEAR_DAYS" :key="d" :value="d">近 {{ d }} 天</option>
+        </select>
+        <button class="rbtn" @click="clearReadRange" :disabled="loading || !readTotal">恢复未读</button>
+        <button class="rbtn rbtn-minor" @click="clearAllRead" :disabled="loading || !readTotal" title="重置全部已读（量大，慎用）">全部</button>
+      </span>
     </div>
 
     <button class="to-top" v-show="showToTop" @click="scrollToTop" aria-label="返回顶部" title="返回顶部">↑</button>
