@@ -7,9 +7,11 @@
  *   3) GET  /api/clues    —— 线索（按 ts 时间排序，支持分页 + 标的/关键词/分数/板块筛选）
  *                            板块筛选：section=recommend(推荐/关注) | hot(热门) | follow(关注) | topic(热点话题)
  *                            unread=1 —— 只看未读（跨设备已读状态存 D1）
+ *                            favorite=1 —— 只看收藏（忽略 unread，已读也照常显示）
  *   4) GET  /api/reads    —— 取全部已读 clue_id（前端统计 / 跨设备同步）
  *   5) POST /api/reads    —— 批量标记已读 { ids:[...] }
  *   6) DELETE /api/reads  —— 取消已读 { ids:[...] } / 按资讯日期清近N天 { days:N } / 清空 { all:true }
+ *   6b) GET/POST/DELETE /api/favorites —— 收藏列表 / 批量收藏 / 取消收藏（与 reads 同构）
  *   7) POST /api/cleanup  —— 手动触发清理（token 鉴权），删 10 天前数据
  *   8) 每日 Cron 自动清理 10 天前数据
  *   9) 其余路径            —— 交给 ASSETS 托管 Vue 前台（SPA）
@@ -328,15 +330,21 @@ function parseQuery(url) {
   const section = ["recommend", "hot", "follow", "topic"].includes(rawSection) ? rawSection : "";
   // 只看未读：前端打开「隐藏已读」后带上，服务端用 NOT EXISTS 过滤（计数与分页同步生效）
   const unread = url.searchParams.get("unread") === "1";
-  return { limit, offset, order, stock, q, minScore, sort, section, unread };
+  // 只看收藏：收藏模式下必须忽略未读过滤（已读的收藏也要能看）
+  const favorite = url.searchParams.get("favorite") === "1";
+  return { limit, offset, order, stock, q, minScore, sort, section, unread, favorite };
 }
 
-// 组装 WHERE 与绑定参数
-function buildWhere({ stock, q, minScore, round, section, unread }) {
+// 组装 WHERE 与绑定参数；favorite 打开时强制忽略 unread
+function buildWhere({ stock, q, minScore, round, section, unread, favorite }) {
   const where = [];
   const binds = [];
   if (round) { where.push("round_id = ?"); binds.push(round); }
-  if (unread) { where.push("NOT EXISTS (SELECT 1 FROM reads r WHERE r.clue_id = clues.clue_id)"); }
+  if (favorite) {
+    where.push("EXISTS (SELECT 1 FROM favorites f WHERE f.clue_id = clues.clue_id)");
+  } else if (unread) {
+    where.push("NOT EXISTS (SELECT 1 FROM reads r WHERE r.clue_id = clues.clue_id)");
+  }
   if (section === "topic") {
     // 热点话题来源（hashtag 引擎）不写 section，统一归为「话题」
     where.push("(section IS NULL OR section = '')");
@@ -368,9 +376,9 @@ async function handleRounds(env, url) {
 }
 
 async function handleClues(env, url) {
-  const { limit, offset, order, stock, q, minScore, sort, section, unread } = parseQuery(url);
+  const { limit, offset, order, stock, q, minScore, sort, section, unread, favorite } = parseQuery(url);
   const round = url.searchParams.get("round") || "";
-  const { clause, binds } = buildWhere({ stock, q, minScore, round, section, unread });
+  const { clause, binds } = buildWhere({ stock, q, minScore, round, section, unread, favorite });
 
   const { results: t } = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM clues ${clause}`
@@ -382,9 +390,11 @@ async function handleClues(env, url) {
     ? "jev_value DESC, ts DESC"
     : `ts ${order}, score DESC`;
 
-  // 每条线索附带 is_read（当前设备组共享的已读状态），供前端灰显/打勾
+  // 每条线索附带 is_read / is_fav（跨设备共享状态），供前端灰显、打星
   const { results } = await env.DB.prepare(
-    `SELECT clues.*, EXISTS(SELECT 1 FROM reads r WHERE r.clue_id = clues.clue_id) AS is_read
+    `SELECT clues.*,
+            EXISTS(SELECT 1 FROM reads r WHERE r.clue_id = clues.clue_id) AS is_read,
+            EXISTS(SELECT 1 FROM favorites f WHERE f.clue_id = clues.clue_id) AS is_fav
        FROM clues ${clause} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
   ).bind(...binds, limit, offset).all();
   const clues = (results || []).map((r) => ({
@@ -394,10 +404,13 @@ async function handleClues(env, url) {
   }));
   const { results: rt } = await env.DB.prepare("SELECT COUNT(*) AS n FROM reads").all();
   const readTotal = (rt && rt[0] && rt[0].n) || 0;
+  const { results: ft } = await env.DB.prepare("SELECT COUNT(*) AS n FROM favorites").all();
+  const favTotal = (ft && ft[0] && ft[0].n) || 0;
   return json({
     clues,
     total,
     read_total: readTotal,
+    fav_total: favTotal,
     limit,
     offset,
     has_more: offset + limit < total,
@@ -412,13 +425,17 @@ async function handleClues(env, url) {
 // 说明：这是「阅读进度」而非抓取数据，不设 token 鉴权——任何打开页面的人
 //       都应有标记能力；若将来对外开放，可在外层加轻量 token。
 // ────────────────────────────────────────────────────────────
-async function handleReadsGet(env) {
-  const { results } = await env.DB.prepare("SELECT clue_id FROM reads ORDER BY read_at DESC").all();
+async function handleMarkGet(env, table, timeCol) {
+  const { results } = await env.DB.prepare(`SELECT clue_id FROM ${table} ORDER BY ${timeCol} DESC`).all();
   const ids = (results || []).map((r) => String(r.clue_id));
   return json({ ids, total: ids.length });
 }
 
-async function handleReadsWrite(env, request) {
+async function handleReadsGet(env) { return handleMarkGet(env, "reads", "read_at"); }
+async function handleFavoritesGet(env) { return handleMarkGet(env, "favorites", "fav_at"); }
+
+// 已读 / 收藏共用的批量写：表名与时间列由调用方内部指定（不接受用户输入，无注入风险）
+async function handleMarkWrite(env, request, table, timeCol) {
   let body;
   try {
     body = await request.json();
@@ -429,7 +446,7 @@ async function handleReadsWrite(env, request) {
   const now = Date.now();
 
   if (method === "DELETE" && body && body.all === true) {
-    const r = await env.DB.prepare("DELETE FROM reads").run();
+    const r = await env.DB.prepare(`DELETE FROM ${table}`).run();
     return json({ ok: true, cleared: (r && r.meta && r.meta.changes) || 0 });
   }
 
@@ -441,7 +458,7 @@ async function handleReadsWrite(env, request) {
     const days = Math.min(365, Math.max(1, parseInt(body.days, 10)));
     const cutoffSec = Math.floor(Date.now() / 1000) - days * 86400;
     const r = await env.DB.prepare(
-      "DELETE FROM reads WHERE clue_id IN (SELECT clue_id FROM clues WHERE ts > 0 AND ts >= ?)"
+      `DELETE FROM ${table} WHERE clue_id IN (SELECT clue_id FROM clues WHERE ts > 0 AND ts >= ?)`
     ).bind(cutoffSec).run();
     return json({ ok: true, days, cleared: (r && r.meta && r.meta.changes) || 0 });
   }
@@ -461,14 +478,14 @@ async function handleReadsWrite(env, request) {
       ).join(",");
       // 用多值 INSERT + INSERT OR IGNORE，幂等且省往返
       stmts.push(env.DB.prepare(
-        `INSERT OR IGNORE INTO reads (clue_id, read_at) VALUES ${rows}`
+        `INSERT OR IGNORE INTO ${table} (clue_id, ${timeCol}) VALUES ${rows}`
       ).bind(...part));
     }
   } else if (method === "DELETE") {
     for (let i = 0; i < ids.length; i += IN_CHUNK) {
       const part = ids.slice(i, i + IN_CHUNK);
       const ph = part.map(() => "?").join(",");
-      stmts.push(env.DB.prepare(`DELETE FROM reads WHERE clue_id IN (${ph})`).bind(...part));
+      stmts.push(env.DB.prepare(`DELETE FROM ${table} WHERE clue_id IN (${ph})`).bind(...part));
     }
   } else {
     return json({ error: "method not allowed" }, 405);
@@ -479,6 +496,9 @@ async function handleReadsWrite(env, request) {
   }
   return json({ ok: true, changed: ids.length });
 }
+
+const handleReadsWrite = (env, request) => handleMarkWrite(env, request, "reads", "read_at");
+const handleFavoritesWrite = (env, request) => handleMarkWrite(env, request, "favorites", "fav_at");
 
 // 清理 KEEP_DAYS 天前「入库」的数据
 // ⚠️ 两个历史坑，别再踩：
@@ -497,9 +517,12 @@ async function cleanup(env) {
     `DELETE FROM clues WHERE ${timeExpr} < ?`
   ).bind(cutoffMs).run();
   const delRounds = await env.DB.prepare("DELETE FROM rounds WHERE created_at > 0 AND created_at < ?").bind(cutoffMs).run();
-  // 同步删掉已不在 clues 里的孤立已读标记，避免 reads 表无限增长
+  // 同步删掉已不在 clues 里的孤立已读/收藏标记，避免表无限增长
   const delReads = await env.DB.prepare(
     "DELETE FROM reads WHERE clue_id NOT IN (SELECT clue_id FROM clues)"
+  ).run();
+  const delFavorites = await env.DB.prepare(
+    "DELETE FROM favorites WHERE clue_id NOT IN (SELECT clue_id FROM clues)"
   ).run();
   return {
     ok: true,
@@ -510,6 +533,7 @@ async function cleanup(env) {
       clues: (delClues && delClues.meta && delClues.meta.changes) || 0,
       rounds: (delRounds && delRounds.meta && delRounds.meta.changes) || 0,
       reads: (delReads && delReads.meta && delReads.meta.changes) || 0,
+      favorites: (delFavorites && delFavorites.meta && delFavorites.meta.changes) || 0,
     },
   };
 }
@@ -552,6 +576,13 @@ export default {
         if (request.method === "GET") return await handleReadsGet(env);
         if (request.method === "POST" || request.method === "DELETE") {
           return await handleReadsWrite(env, request);
+        }
+        return json({ error: "method not allowed" }, 405);
+      }
+      if (path === "/api/favorites") {
+        if (request.method === "GET") return await handleFavoritesGet(env);
+        if (request.method === "POST" || request.method === "DELETE") {
+          return await handleFavoritesWrite(env, request);
         }
         return json({ error: "method not allowed" }, 405);
       }
