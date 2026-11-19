@@ -9,7 +9,7 @@
  *                            unread=1 —— 只看未读（跨设备已读状态存 D1）
  *   4) GET  /api/reads    —— 取全部已读 clue_id（前端统计 / 跨设备同步）
  *   5) POST /api/reads    —— 批量标记已读 { ids:[...] }
- *   6) DELETE /api/reads  —— 取消已读 { ids:[...] } 或清空 { all:true }
+ *   6) DELETE /api/reads  —— 取消已读 { ids:[...] } / 按资讯日期清近N天 { days:N } / 清空 { all:true }
  *   7) POST /api/cleanup  —— 手动触发清理（token 鉴权），删 10 天前数据
  *   8) 每日 Cron 自动清理 10 天前数据
  *   9) 其余路径            —— 交给 ASSETS 托管 Vue 前台（SPA）
@@ -408,7 +408,7 @@ async function handleClues(env, url) {
 // 已读状态：跨设备共享（存服务端 D1，不按设备区分）。
 // GET  /api/reads          → { ids:[...], total }  全量已读 id（前端统计/导出）
 // POST /api/reads          → { ids:[...] } 批量标记，INSERT OR IGNORE 幂等
-// DELETE /api/reads        → { ids:[...] } 取消指定 / { all:true } 清空全部
+// DELETE /api/reads        → { ids:[...] } 取消指定 / { days:N } 按资讯日期清近N天 / { all:true } 清空全部
 // 说明：这是「阅读进度」而非抓取数据，不设 token 鉴权——任何打开页面的人
 //       都应有标记能力；若将来对外开放，可在外层加轻量 token。
 // ────────────────────────────────────────────────────────────
@@ -431,6 +431,19 @@ async function handleReadsWrite(env, request) {
   if (method === "DELETE" && body && body.all === true) {
     const r = await env.DB.prepare("DELETE FROM reads").run();
     return json({ ok: true, cleared: (r && r.meta && r.meta.changes) || 0 });
+  }
+
+  // 按「资讯日期」清近 N 天：把这些天资讯的已读标记恢复为未读，方便重读。
+  // cutoff 用资讯自身时间 clues.ts（秒），不是标记时间 read_at —— 用户的心智是
+  // "重看这几天的资讯"；且避免"很久前标记、但资讯很新"的边界歧义。
+  // 通过子查询按 clue_id 关联，顺带跳过已被 10 天清理删掉的孤立标记。
+  if (method === "DELETE" && body && Number.isFinite(Number(body.days)) && Number(body.days) > 0) {
+    const days = Math.min(365, Math.max(1, parseInt(body.days, 10)));
+    const cutoffSec = Math.floor(Date.now() / 1000) - days * 86400;
+    const r = await env.DB.prepare(
+      "DELETE FROM reads WHERE clue_id IN (SELECT clue_id FROM clues WHERE ts > 0 AND ts >= ?)"
+    ).bind(cutoffSec).run();
+    return json({ ok: true, days, cleared: (r && r.meta && r.meta.changes) || 0 });
   }
 
   const ids = Array.isArray(body && body.ids)
