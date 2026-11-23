@@ -497,3 +497,29 @@ input:focus, select:focus { border-color: var(--accent); }
 }
 .to-top:hover { transform: translateY(-2px); border: none; background: var(--accent); }
 .to-top:active { transform: translateY(0); }
+
+/* 底部版本标识：一眼确认线上是否最新代码 */
+.app-version {
+  text-align: center;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 0 26px;
+  opacity: 0.75;
+}
+.app-version code {
+  color: var(--accent);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 5px;
+  font-size: 11px;
+}
+.app-version .v-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  margin-right: 5px;
+  vertical-align: middle;
+}

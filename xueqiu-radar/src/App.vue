@@ -259,6 +259,10 @@ function teardownObserver() {
   readTimers.clear();
 }
 
+// 构建版本：Vite 在打包时注入 git commit 与构建时间，页面底部展示
+const BUILD_HASH = typeof __BUILD_HASH__ !== "undefined" ? __BUILD_HASH__ : "dev";
+const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : "-";
+
 // 诊断入口：浏览器控制台执行 __xrReadDiag() 可看自动已读为何没生效
 if (typeof window !== "undefined") {
   window.__xrReadDiag = () => ({
@@ -710,6 +714,10 @@ function origUrl(c) {
         <button class="rbtn" @click="clearReadRange" :disabled="loading || !readTotal">恢复未读</button>
         <button class="rbtn rbtn-minor" @click="clearAllRead" :disabled="loading || !readTotal" title="重置全部已读（量大，慎用）">全部</button>
       </span>
+    </div>
+
+    <div class="app-version" title="构建时烧入的 git commit 与构建时间；对比仓库最新提交即可判断是否最新代码">
+      <span class="v-dot"></span>代码版本 <code>{{ BUILD_HASH }}</code> · 构建于 {{ BUILD_TIME }}
     </div>
 
     <button class="to-top" v-show="showToTop" @click="scrollToTop" aria-label="返回顶部" title="返回顶部">↑</button>
