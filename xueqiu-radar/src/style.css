@@ -239,13 +239,14 @@ input:focus, select:focus { border-color: var(--accent); }
   margin: 8px 0;
   background: var(--panel);
   border-radius: 0 10px 10px 0;
-  transition: opacity 0.25s ease, border-color 0.25s ease;
+  transition: border-color 0.25s ease;
 }
-/* 已读：整卡淡出但不移除（不触发列表重排/跳动），满 10 天后随清理自然消失 */
-.clue.read { opacity: 0.42; border-left-color: var(--green); }
-.clue.read .text { color: var(--muted); }
+/* 已读：正文保持原色、不淡化（避免读一半看不清），只用左边框 + 头部小标记提示 */
+.clue.read { border-left-color: var(--green); }
 /* 收藏的卡片用琥珀色左边框标记（优先于已读的绿色） */
 .clue.fav { border-left-color: var(--amber); }
+/* 已读小标记：轻量提示，不影响正文阅读 */
+.clue .head .read-flag { font-size: 11px; color: var(--green); white-space: nowrap; }
 
 /* 单条收藏按钮（已读按钮已移除，阅读状态由滚动自动标记） */
 .clue .head .fav-toggle {

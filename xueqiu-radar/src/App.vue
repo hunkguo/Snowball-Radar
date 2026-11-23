@@ -197,9 +197,10 @@ async function loadPage(withRounds = false) {
 let readObserver = null;
 let scanTimer = null;             // scroll 兜底扫描的节流计时
 const readTimers = new Map();     // clue_id -> setTimeout（停留计时）
+const readSeen = new Set();       // 停留够 DWELL_MS、确认看过的卡片（尚未滚出视野，先不标已读）
 const pendingReads = new Set();   // 攒批待提交
 let flushTimer = null;
-const DWELL_MS = 2000;            // 停留 2 秒才算读过（快速划过不算）
+const DWELL_MS = 2000;            // 停留 2 秒确认看过（快速划过不算）
 
 // 卡片是否"真的看到了"：露出至少 40% 或 180px（取较小者）。
 // 不再依赖单一 intersectionRatio>=0.55 —— Firefox 下长卡片可能永远到不了 0.55。
@@ -210,25 +211,35 @@ function enoughVisible(el) {
   const visible = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
   return visible >= Math.min(180, r.height * 0.4);
 }
+// 停留够只记录"看过"，不立刻标已读 —— 正在读的卡片绝不出现已读样式。
 function armRead(cid) {
-  if (readTimers.has(cid)) return;
+  if (readTimers.has(cid) || readSeen.has(cid)) return;
   readTimers.set(cid, setTimeout(() => {
     readTimers.delete(cid);
-    markOneLocally(cid);
+    readSeen.add(cid);
   }, DWELL_MS));
 }
 function disarmRead(cid) {
   const t = readTimers.get(cid);
   if (t) { clearTimeout(t); readTimers.delete(cid); }
 }
-// 扫描所有卡片：可见则起计时，离开则取消。IO 回调和 scroll 都走这里，
-// 即使某些浏览器/隐私设置下 IO 回调不触发，滚动兜底也能完成标记。
+// 扫描：可见则起计时；已看过且整张卡片从顶部滚出视野（说明往下翻过去了）才标已读。
+// IO 回调和 scroll 兜底都走这里，即使某些浏览器 IO 回调不触发也能完成标记。
 function scanVisibleCards() {
   for (const el of document.querySelectorAll(".clue[data-cid]")) {
     if (el.dataset.read === "1") continue;
     const cid = el.getAttribute("data-cid");
-    if (cid && enoughVisible(el)) armRead(cid);
-    else if (cid) disarmRead(cid);
+    if (!cid) continue;
+    if (enoughVisible(el)) {
+      armRead(cid);
+    } else {
+      disarmRead(cid);
+      // bottom < 0：整张卡片已在视口上方，用户是往下滚过去的 = 读完了
+      if (el.getBoundingClientRect().bottom < 0 && readSeen.has(cid)) {
+        readSeen.delete(cid);
+        markOneLocally(cid);
+      }
+    }
   }
 }
 function scheduleScan() {
@@ -241,6 +252,7 @@ function setupReadObserver() {
   if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
   for (const t of readTimers.values()) clearTimeout(t);
   readTimers.clear();
+  readSeen.clear();
   if (!autoMark.value) return;
   // 多阈值保证元素进出视口时都会回调；具体是否标记由 enoughVisible 自己算，
   // Safari / Firefox / Chrome 的 threshold 细节差异被抹平。
@@ -257,6 +269,7 @@ function teardownObserver() {
   if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
   for (const t of readTimers.values()) clearTimeout(t);
   readTimers.clear();
+  readSeen.clear();
 }
 
 // 构建版本：Vite 在打包时注入 git commit 与构建时间，页面底部展示
@@ -270,6 +283,7 @@ if (typeof window !== "undefined") {
     intersectionObserver: typeof IntersectionObserver !== "undefined",
     cards: document.querySelectorAll(".clue[data-cid]").length,
     pending: [...readTimers.keys()],
+    seen: [...readSeen],
     readTotal: readTotal.value,
   });
 }
@@ -322,6 +336,7 @@ async function markPageRead() {
   if (!ids.length) return;
   const fresh = ids.filter((id) => !pendingReads.has(id));
   for (const c of clues.value) c.is_read = 1;
+  readSeen.clear();
   pendingReads.clear();
   if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
   readTotal.value += fresh.length;
@@ -642,6 +657,7 @@ function origUrl(c) {
               class="hit"
               :title="'该线索被 ' + c.hit_count + ' 轮抓取到（全局去重后仅存一份）'"
             >{{ hitLabel(c) }}</span>
+            <span v-if="c.is_read" class="read-flag" title="读过并已滚过；正文保持原色，方便回看">✓ 已读</span>
             <button
               class="fav-toggle"
               :class="{ done: !!c.is_fav }"
@@ -700,7 +716,7 @@ function origUrl(c) {
       <label class="rchk" title="勾选后已读资讯从列表消失（服务端过滤，翻页计数同步）；换设备也生效">
         <input type="checkbox" v-model="hideRead" @change="onReadPrefChange"> 隐藏已读
       </label>
-      <label class="rchk" title="卡片在视野中停留 2 秒即自动标记已读，快速划过不算">
+      <label class="rchk" title="看过的卡片往下滚出视野后才标已读，正在读的不会变色；快速划过不算">
         <input type="checkbox" v-model="autoMark" @change="onAutoMarkChange"> 滚动自动已读
       </label>
       <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
