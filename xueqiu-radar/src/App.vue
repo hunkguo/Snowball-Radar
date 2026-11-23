@@ -24,10 +24,48 @@ const favTotal = ref(0);                               // 服务端收藏总数
 const favOnly = ref(false);                            // 只看收藏（收藏模式下已读也照常显示）
 const CLEAR_DAYS = [1, 3, 5, 7];
 const clearDays = ref(CLEAR_DAYS.includes(savedPrefs.clearDays) ? savedPrefs.clearDays : 3); // 清除范围（近 N 天资讯）
+
+// ── 护眼主题 + 休息提醒（本机偏好，存 localStorage）────────────
+// theme: "eye"(护眼暖色·默认) | "dark"(深色)；restReminder: 每 20 分钟提醒一次
+const theme = ref(savedPrefs.theme === "dark" ? "dark" : "eye");
+const restReminder = ref(savedPrefs.restReminder !== false); // 默认开启
+const showRestBanner = ref(false);
+let restTimer = null;
+const REST_INTERVAL_MS = 20 * 60 * 1000; // 20 分钟
+
+function applyTheme() {
+  if (typeof document !== "undefined") document.documentElement.dataset.theme = theme.value;
+}
+function toggleTheme() {
+  theme.value = theme.value === "eye" ? "dark" : "eye";
+  applyTheme();
+  savePrefs();
+}
+function onRestPrefChange() {
+  savePrefs();
+  setupRestTimer();
+  if (!restReminder.value) showRestBanner.value = false;
+}
+function setupRestTimer() {
+  if (restTimer) { clearInterval(restTimer); restTimer = null; }
+  if (!restReminder.value) return;
+  // 页面不可见（切到别的标签 / 锁屏）时不计时，回到前台重新计时，避免后台空弹
+  restTimer = setInterval(() => {
+    if (typeof document !== "undefined" && document.visibilityState === "visible") {
+      showRestBanner.value = true;
+    }
+  }, REST_INTERVAL_MS);
+}
+function dismissRest() {
+  showRestBanner.value = false;
+  setupRestTimer(); // 关掉后重新开始 20 分钟计时
+}
+
 function savePrefs() {
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify({
       hideRead: hideRead.value, autoMark: autoMark.value, clearDays: clearDays.value,
+      theme: theme.value, restReminder: restReminder.value,
     }));
   } catch { /* 隐私模式下忽略 */ }
 }
@@ -123,6 +161,8 @@ function onPopState() {
 }
 
 onMounted(async () => {
+  applyTheme();      // 应用护眼/深色主题（index.html 已预设，保持一致）
+  setupRestTimer();  // 启动 20 分钟休息提醒
   readUrlState();
   await loadPage(true);
   await clampPage();
@@ -134,6 +174,7 @@ onUnmounted(() => {
   window.removeEventListener("scroll", onScroll);
   window.removeEventListener("popstate", onPopState);
   clearTimeout(searchTimer);
+  if (restTimer) { clearInterval(restTimer); restTimer = null; }
   teardownObserver();
   flushPendingReads(); // 离开前把还没提交的已读补发掉
 });
@@ -586,7 +627,19 @@ function origUrl(c) {
           :title="asc ? '当前旧在前（时间升序），点击改为新在前' : '当前新在前（时间倒序），点击改为旧在前'"
         >{{ asc ? "旧在前 ↑" : "新在前 ↓" }}</button>
         <button @click="reload">刷新</button>
+        <button
+          class="theme-toggle"
+          @click="toggleTheme"
+          :title="theme === 'eye' ? '当前护眼暖色主题，点击切换深色' : '当前深色主题，点击切换护眼暖色'"
+        ><span class="theme-icon">{{ theme === "eye" ? "◐" : "◑" }}</span>{{ theme === "eye" ? "护眼" : "深色" }}</button>
       </div>
+    </div>
+
+    <!-- 休息提醒横幅：每 20 分钟柔和提示一次，可关闭且立即重计时 -->
+    <div v-if="showRestBanner" class="rest-banner" role="status">
+      <span class="rest-icon">◕</span>
+      <span class="rest-text">已经连续阅读 20 分钟了，<b>抬头看看远处 20 秒</b>，眨眨眼，让眼睛休息一下。</span>
+      <button class="rest-close" @click="dismissRest">知道了</button>
     </div>
 
     <!-- 板块筛选：推荐/关注 · 热门 · 热点话题（服务端按 section 过滤） -->
@@ -718,6 +771,9 @@ function origUrl(c) {
       </label>
       <label class="rchk" title="看过的卡片往下滚出视野后才标已读，正在读的不会变色；快速划过不算">
         <input type="checkbox" v-model="autoMark" @change="onAutoMarkChange"> 滚动自动已读
+      </label>
+      <label class="rchk" title="每 20 分钟弹出一次柔和的休息提醒（页面不可见时不计时），保护眼睛">
+        <input type="checkbox" v-model="restReminder" @change="onRestPrefChange"> 休息提醒
       </label>
       <span class="rstat">已读 <b>{{ readTotal }}</b> 条</span>
       <span class="rstat">收藏 <b>{{ favTotal }}</b> 条</span>

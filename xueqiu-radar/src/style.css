@@ -11,6 +11,21 @@
   --amber: #fbbf24;
 }
 
+/* 护眼暖色主题（默认）：低蓝光米黄纸底 + 深褐字，非纯黑白，静态背景 */
+:root[data-theme="eye"] {
+  --bg: #efe8d9;
+  --panel: #faf7ef;
+  --panel-2: #f1ebdd;
+  --border: #d9cfba;
+  --text: #3b3529;
+  --muted: #766c58;
+  --accent: #8a5a2b;
+  --green: #4f8a5c;
+  --red: #bb5149;
+  --amber: #a9791f;
+}
+:root[data-theme="eye"] .clue .text { line-height: 1.8; }
+
 * { box-sizing: border-box; }
 
 html, body {
@@ -523,4 +538,42 @@ input:focus, select:focus { border-color: var(--accent); }
   background: var(--green);
   margin-right: 5px;
   vertical-align: middle;
+}
+
+/* 主题切换按钮 */
+.theme-toggle {
+  white-space: nowrap;
+}
+.theme-toggle .theme-icon { margin-right: 4px; }
+
+/* 休息提醒：柔和横幅，从顶部滑入，不遮挡阅读区主体 */
+.rest-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+  animation: restSlide 0.35s ease-out;
+}
+.rest-banner .rest-icon { font-size: 16px; }
+.rest-banner .rest-text b { color: var(--accent); }
+.rest-banner .rest-close {
+  padding: 3px 12px;
+  font-size: 12px;
+}
+@keyframes restSlide {
+  from { transform: translateY(-100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rest-banner { animation: none; }
 }

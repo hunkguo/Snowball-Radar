@@ -4,6 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>股票评论雷达 · 线索台</title>
+    <!-- 首屏防闪烁：在样式加载前按本地偏好设好主题（默认护眼暖色） -->
+    <script>
+      (function () {
+        try {
+          var p = JSON.parse(localStorage.getItem("xr3_read_prefs") || "{}");
+          document.documentElement.dataset.theme = p.theme === "dark" ? "dark" : "eye";
+        } catch (e) {
+          document.documentElement.dataset.theme = "eye";
+        }
+      })();
+    </script>
     <!-- Google tag (gtag.js) -->
     <script async src="https://www.googletagmanager.com/gtag/js?id=G-V7QYN8NLZ4"></script>
     <script>
