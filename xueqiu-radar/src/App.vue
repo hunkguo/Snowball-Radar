@@ -142,6 +142,7 @@ onUnmounted(() => {
 const showToTop = ref(false);
 function onScroll() {
   showToTop.value = (window.scrollY || window.pageYOffset || 0) > 400;
+  scheduleScan(); // 滚动兜底：即使 IO 回调因浏览器差异没来，也能标已读
 }
 function scrollToTop() {
   window.scrollTo({ top: 0, behavior: "smooth" });
@@ -194,40 +195,79 @@ async function loadPage(withRounds = false) {
 // 关键点：标记只改前端样式 + 攒批发服务端，绝不重新拉列表 ——
 // 否则滚动过程中列表突然缩短会让页面跳动、甚至找不到刚才看到的位置。
 let readObserver = null;
+let scanTimer = null;             // scroll 兜底扫描的节流计时
 const readTimers = new Map();     // clue_id -> setTimeout（停留计时）
 const pendingReads = new Set();   // 攒批待提交
 let flushTimer = null;
 const DWELL_MS = 2000;            // 停留 2 秒才算读过（快速划过不算）
 
+// 卡片是否"真的看到了"：露出至少 40% 或 180px（取较小者）。
+// 不再依赖单一 intersectionRatio>=0.55 —— Firefox 下长卡片可能永远到不了 0.55。
+function enoughVisible(el) {
+  const r = el.getBoundingClientRect();
+  if (r.height <= 0) return false;
+  const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+  const visible = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+  return visible >= Math.min(180, r.height * 0.4);
+}
+function armRead(cid) {
+  if (readTimers.has(cid)) return;
+  readTimers.set(cid, setTimeout(() => {
+    readTimers.delete(cid);
+    markOneLocally(cid);
+  }, DWELL_MS));
+}
+function disarmRead(cid) {
+  const t = readTimers.get(cid);
+  if (t) { clearTimeout(t); readTimers.delete(cid); }
+}
+// 扫描所有卡片：可见则起计时，离开则取消。IO 回调和 scroll 都走这里，
+// 即使某些浏览器/隐私设置下 IO 回调不触发，滚动兜底也能完成标记。
+function scanVisibleCards() {
+  for (const el of document.querySelectorAll(".clue[data-cid]")) {
+    if (el.dataset.read === "1") continue;
+    const cid = el.getAttribute("data-cid");
+    if (cid && enoughVisible(el)) armRead(cid);
+    else if (cid) disarmRead(cid);
+  }
+}
+function scheduleScan() {
+  if (scanTimer) return;
+  scanTimer = setTimeout(() => { scanTimer = null; scanVisibleCards(); }, 180);
+}
+
 function setupReadObserver() {
   if (readObserver) { readObserver.disconnect(); readObserver = null; }
+  if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
   for (const t of readTimers.values()) clearTimeout(t);
   readTimers.clear();
   if (!autoMark.value) return;
-  if (typeof IntersectionObserver === "undefined") return;
-  readObserver = new IntersectionObserver((entries) => {
-    for (const en of entries) {
-      const el = en.target;
-      const cid = el.getAttribute("data-cid");
-      if (!cid || el.dataset.read === "1") continue;
-      if (en.isIntersecting) {
-        if (readTimers.has(cid)) continue;
-        readTimers.set(cid, setTimeout(() => {
-          readTimers.delete(cid);
-          markOneLocally(cid);
-        }, DWELL_MS));
-      } else {
-        const t = readTimers.get(cid);
-        if (t) { clearTimeout(t); readTimers.delete(cid); }
-      }
-    }
-  }, { threshold: 0.55 });
-  document.querySelectorAll(".clue[data-cid]").forEach((el) => readObserver.observe(el));
+  // 多阈值保证元素进出视口时都会回调；具体是否标记由 enoughVisible 自己算，
+  // Safari / Firefox / Chrome 的 threshold 细节差异被抹平。
+  if (typeof IntersectionObserver !== "undefined") {
+    readObserver = new IntersectionObserver(() => scanVisibleCards(), {
+      threshold: [0, 0.1, 0.25, 0.5, 0.75],
+    });
+    document.querySelectorAll(".clue[data-cid]").forEach((el) => readObserver.observe(el));
+  }
+  scanVisibleCards(); // 首屏已进入视野的卡片立即开始计时
 }
 function teardownObserver() {
   if (readObserver) { readObserver.disconnect(); readObserver = null; }
+  if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
   for (const t of readTimers.values()) clearTimeout(t);
   readTimers.clear();
+}
+
+// 诊断入口：浏览器控制台执行 __xrReadDiag() 可看自动已读为何没生效
+if (typeof window !== "undefined") {
+  window.__xrReadDiag = () => ({
+    autoMark: autoMark.value,
+    intersectionObserver: typeof IntersectionObserver !== "undefined",
+    cards: document.querySelectorAll(".clue[data-cid]").length,
+    pending: [...readTimers.keys()],
+    readTotal: readTotal.value,
+  });
 }
 
 // 前端立即灰显 + 攒批，900ms 内的多次标记合并成一次请求
